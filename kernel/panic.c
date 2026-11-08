@@ -6,6 +6,7 @@
 #include "devices.h"
 #include "interrupts.h"
 #include "io.h"
+#include "vga.h"
 
 static const char *const exc_names[32] = {
     "Divide Error", "Debug", "NMI", "Breakpoint", "Overflow",
@@ -20,6 +21,7 @@ static const char *const exc_names[32] = {
 static void fatal_begin(void)
 {
     cpu_cli();
+    vga_force_text();                     /* out of the graphics desktop */
     con_attach();                         /* take the screen back from any VM */
     con_set_window(0, CON_ROWS - 1);
     con_set_attr(FATAL_ATTR);

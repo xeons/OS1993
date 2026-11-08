@@ -11,6 +11,7 @@
 #include "sched.h"
 #include "serial.h"
 #include "v86.h"
+#include "vga.h"
 #include "vm.h"
 
 const struct bootinfo *g_bootinfo;
@@ -22,8 +23,10 @@ static struct bootinfo boot_copy;   /* the original lives in VM memory */
 #define OK_ATTR     ATTR(C_LGREEN, C_BLACK)
 #define INFO_ATTR   ATTR(C_YELLOW, C_BLACK)
 
-#define SC_N 0x31
-#define SC_X 0x2D
+#define SC_N   0x31
+#define SC_X   0x2D
+#define SC_G   0x22
+#define SC_ESC 0x01
 
 #define RECURSIVE_PD ((volatile uint32_t *)0xFFFFF000)
 
@@ -32,7 +35,8 @@ static void draw_frame(void)
     con_fill_row(0, TITLE_ATTR, ' ');
     con_write_at(0, 2, TITLE_ATTR, "OS1993 Virtual Machine Manager  Version " OS1993_VERSION);
     con_fill_row(CON_ROWS - 1, STATUS_ATTR, ' ');
-    con_write_at(CON_ROWS - 1, 2, STATUS_ATTR, "N = new DOS session   Alt+Tab = switch   X = exit to MS-DOS");
+    con_write_at(CON_ROWS - 1, 1, STATUS_ATTR, "N=DOS session  G=graphics  Alt+Tab=switch  X=exit");
+    con_fill_row(1, TEXT_ATTR, ' ');
     con_set_window(2, CON_ROWS - 3);
     con_set_attr(TEXT_ATTR);
     con_clear();
@@ -135,6 +139,8 @@ void kmain(const struct bootinfo *bi)
     vm_finish_init();
     dosmgr_started();
     ok("DOS shared between VMs (DOSMGR)");
+    vga_init();
+    ok("VGA driver (text and 640x480x16 graphics)");
 
     kprintf("\n");
     kprintf("  Arena           %6u KB  physical %p, mapped at %p\n",
@@ -167,6 +173,12 @@ void kmain(const struct bootinfo *bi)
         int sc = keyboard_read();
         if (sc == SC_N) {
             new_session();
+        } else if (sc == SC_G && !vga_console_gfx()) {
+            if (vga_gfx_enter())
+                desktop_draw();
+        } else if (sc == SC_ESC && vga_console_gfx()) {
+            vga_gfx_leave();
+            con_show_cursor(0);
         } else if (sc == SC_X) {
             if (vm_count() == 0)
                 break;

@@ -25,6 +25,7 @@ are for later stages.
 | `make qemu-test` | headless FreeDOS run of the same checks as `make test`        |
 | `make qemu-emm386` | FreeDOS with JEMM386: the loader must refuse to start       |
 | `make qemu-sessions` | types into two concurrent DOS sessions via QEMU's monitor |
+| `make qemu-vga`  | VGA driver: checks desktop pixels with QEMU screendumps, and pixel-identical restores after switching to a text DOS session and back |
 
 There are two test machines because they catch different bugs:
 
@@ -186,6 +187,28 @@ Not handled yet: programs that switch to protected mode themselves (DOS
 extenders, a real HIMEM's block moves). The VM is stopped with a message.
 That needs VCPI/DPMI.
 
+## VGA
+
+Press **G** in the VMM console for a 640×480×16 demo desktop and **Esc**
+to go back. It exercises the driver; the real GUI will be ring-3 code in
+the System VM.
+
+- **`kernel/vga.c`, the VDD.** Owns the VGA hardware. Modes are set by the
+  VGA BIOS (INT 10h from the System VM), as Windows did, and the resulting
+  register set is captured: misc output, sequencer, CRTC, graphics and
+  attribute controllers, DAC palette. Switching the screen from the desktop
+  to a text DOS session saves the four 38 KB planes, restores the boot text
+  registers and the font in plane 2, and copies in the session's text
+  buffer. Switching back restores the planes and registers exactly.
+- **`kernel/gfx.c`, the display driver.** Planar mode-12h drawing: fills,
+  lines and pixels through the Set/Reset and Bit Mask registers (one write
+  updates all four planes), and 8×16 text using the VGA BIOS font from
+  INT 10h AX=1130h. It needs only VGA port access and a pointer to
+  A000:0000, so it can move into the ring-3 GUI as its `VGA.DRV`.
+
+Limitations: DOS sessions must stay in text mode. A DOS program switching
+its VM to graphics isn't virtualized yet. Mono adapters get text only.
+
 ## Source layout
 
 ```
@@ -199,6 +222,7 @@ kernel/v86test.c dosshell.c              DOS calls from the kernel, DOS sessions
 kernel/vm.c sched.c switch.asm           VMs, address spaces, focus; threads
 kernel/vmtest.c                          multi-VM self-test
 kernel/dosmgr.c                          one DOS shared by all VMs
+kernel/vga.c gfx.c desktop.c             VGA state (VDD), drawing, demo desktop
 kernel/gdt.c idt.c pic.c timer.c keyboard.c console.c serial.c kprintf.c panic.c
 kernel/include/          headers; bootinfo.h is shared with the loader
 kernel/linker.ld         links at 0x80000000, header first
@@ -230,7 +254,11 @@ tools/                   check386.sh, check-test.sh
 5. **More virtual devices (VxD-style).** The PIC, keyboard and text display
    are done. Still to do: the PIT (programs that reprogram the timer), CRTC
    ports for background VMs, graphics modes, mouse, serial and printer ports.
-6. **Graphics.** VGA 640×480×16 driver, mouse, window manager, GUI shell.
+6. **Graphics and GUI.** Done: the VGA driver. Next: ring-3 support (user
+   segments, LDT for the System VM, a system-call interface into the VMM,
+   a loader for the GUI binary). Then a mouse driver and the GUI itself,
+   running as ring-3 protected-mode code in the System VM like Windows
+   3.x's USER/GDI.
 7. **Win16-style API layer.** 16-bit protected-mode apps in ring 3 with LDTs,
    built with Open Watcom.
 8. **Coexisting with EMM386** through VCPI/GEMMIS, and acting as a DPMI host.

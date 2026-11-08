@@ -9,6 +9,7 @@
 #include "mm.h"
 #include "sched.h"
 #include "v86.h"
+#include "vga.h"
 #include "vm.h"
 
 #define PTE_V86   (PTE_P | PTE_W | PTE_U)
@@ -379,6 +380,8 @@ void vm_set_focus(struct vm *target)
         for (unsigned i = 0; i < VM_VIDEO_PAGES; i++)
             memcpy(phys_to_virt(old->video[i]), real + i * PAGE_SIZE, PAGE_SIZE);
         map_video(old, false);
+    } else if (vga_console_gfx()) {
+        vga_console_suspend();                      /* save the desktop, text mode */
     } else {
         con_detach();                               /* console to its shadow */
     }
@@ -389,6 +392,8 @@ void vm_set_focus(struct vm *target)
             memcpy(real + i * PAGE_SIZE, phys_to_virt(target->video[i]), PAGE_SIZE);
         map_video(target, true);
         set_cursor_from_bda(target);
+    } else if (vga_console_gfx()) {
+        vga_console_resume();                       /* the desktop, exactly */
     } else {
         con_attach();
     }
@@ -472,6 +477,7 @@ void vm_restore_dos(void)
     if (!ready)
         return;
     vm_set_focus(NULL);
+    vga_force_text();                               /* DOS gets a text screen */
     map_video(system_vm, true);                     /* identity again */
     vm_switch_to(system_vm);                        /* its PT 0 and instance data */
     tlb_flush();

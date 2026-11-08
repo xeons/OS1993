@@ -24,6 +24,9 @@ void klog(const char *fmt, ...);   /* COM1 only */
 __attribute__((noreturn))
 void panic(const char *fmt, ...);
 
+/* desktop.c -- VGA driver demo */
+void desktop_draw(void);
+
 /* vmm.c */
 __attribute__((noreturn))
 void kernel_shutdown(uint8_t exit_code);
