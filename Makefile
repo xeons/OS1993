@@ -1,6 +1,6 @@
 # OS1993 -- build with modern tools, run on a 1993 machine.
 #
-#   make            build build/OS1993.COM and build/VMM.BIN
+#   make            build build/OS1993.COM, build/VMM.BIN and build/GUI.BIN
 #   make run        boot it in DOSBox-X (386, 16 MB, HIMEM-style XMS)
 #   make test       headless DOSBox-X run; checks the full round trip to DOS
 #   make check386   verify the kernel contains no post-386 instructions
@@ -31,6 +31,12 @@ LDFLAGS := -T kernel/linker.ld -nostdlib -ffreestanding \
            -Wl,--build-id=none -Wl,--no-warn-rwx-segments -Wl,-Map,$(BUILD)/vmm.map
 NASMFLAGS_K := -f elf32 -g -Ikernel/include/
 
+USER_CFLAGS := $(filter-out -Ikernel/include,$(CFLAGS)) -Iuser -Ikernel/include
+USER_LDFLAGS := -T user/user.ld -nostdlib -ffreestanding \
+           -Wl,--build-id=none -Wl,--no-warn-rwx-segments -Wl,-Map,$(BUILD)/gui.map
+# The GUI links the kernel's display driver unchanged: it runs in ring 3.
+USER_OBJ   := $(BUILD)/user/crt0.o $(BUILD)/user/gui.o $(BUILD)/user/lib.o $(BUILD)/user/gfx.o
+
 KERNEL_C   := $(wildcard kernel/*.c)
 KERNEL_ASM := $(wildcard kernel/*.asm)
 KERNEL_OBJ := $(patsubst kernel/%.asm,$(BUILD)/kernel/%.o,$(KERNEL_ASM)) \
@@ -38,7 +44,7 @@ KERNEL_OBJ := $(patsubst kernel/%.asm,$(BUILD)/kernel/%.o,$(KERNEL_ASM)) \
 
 .PHONY: all run test check386 qemu qemu-test qemu-emm386 qemu-sessions qemu-vga clean
 
-all: $(BUILD)/OS1993.COM $(BUILD)/VMM.BIN
+all: $(BUILD)/OS1993.COM $(BUILD)/VMM.BIN $(BUILD)/GUI.BIN
 
 $(BUILD)/OS1993.COM: loader/os1993.asm | $(BUILD)
 	$(NASM) -f bin -o $@ -l $(BUILD)/os1993.lst $<
@@ -55,7 +61,22 @@ $(BUILD)/kernel/%.o: kernel/%.c | $(BUILD)/kernel
 $(BUILD)/kernel/%.o: kernel/%.asm kernel/include/selectors.inc | $(BUILD)/kernel
 	$(NASM) $(NASMFLAGS_K) -o $@ $<
 
-$(BUILD) $(BUILD)/kernel:
+$(BUILD)/GUI.BIN: $(BUILD)/gui.elf
+	$(OBJCOPY) -O binary $< $@
+
+$(BUILD)/gui.elf: $(USER_OBJ) user/user.ld
+	$(CC) $(USER_LDFLAGS) -o $@ $(USER_OBJ)
+
+$(BUILD)/user/%.o: user/%.c | $(BUILD)/user
+	$(CC) $(USER_CFLAGS) -c -o $@ $<
+
+$(BUILD)/user/gfx.o: kernel/gfx.c | $(BUILD)/user
+	$(CC) $(USER_CFLAGS) -c -o $@ $<
+
+$(BUILD)/user/%.o: user/%.asm | $(BUILD)/user
+	$(NASM) -f elf32 -g -o $@ $<
+
+$(BUILD) $(BUILD)/kernel $(BUILD)/user:
 	mkdir -p $@
 
 DOSBOX_ARGS := -conf test/dosbox-x.conf -fastlaunch \
@@ -103,10 +124,11 @@ qemu-sessions: all
 qemu-vga: all
 	@tools/qemu-vga-test.py
 
-check386: $(BUILD)/vmm.elf
-	@tools/check386.sh $(OBJDUMP) $<
+check386: $(BUILD)/vmm.elf $(BUILD)/gui.elf
+	@tools/check386.sh $(OBJDUMP) $(BUILD)/vmm.elf
+	@tools/check386.sh $(OBJDUMP) $(BUILD)/gui.elf
 
 clean:
 	rm -rf $(BUILD)
 
--include $(KERNEL_OBJ:.o=.d)
+-include $(KERNEL_OBJ:.o=.d) $(USER_OBJ:.o=.d)

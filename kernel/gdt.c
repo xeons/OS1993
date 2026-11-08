@@ -3,9 +3,11 @@
  *
  *   0x08  ring 0 code, flat
  *   0x10  ring 0 data, flat
- *   0x18  TSS: ESP0 for traps out of V86 mode, plus the I/O permission bitmap
+ *   0x18  TSS: ESP0 for traps out of V86 mode and ring 3, I/O permission bitmap
+ *   0x20  ring 3 code, flat  (selector 0x23 with RPL 3)
+ *   0x28  ring 3 data, flat  (selector 0x2B)
  *
- * Planned: ring-3 code/data for protected-mode apps, LDTs for the Win16 layer.
+ * Ring-3 segments cover all 4 GB; paging keeps user code out of kernel pages.
  */
 #include "gdt.h"
 #include "kernel.h"
@@ -19,7 +21,7 @@ struct gdt_entry {
     uint8_t  base_hi;
 } __attribute__((packed));
 
-static struct gdt_entry gdt[4];
+static struct gdt_entry gdt[6];
 struct tss kernel_tss;
 
 static void gdt_set(int i, uint32_t base, uint32_t limit, uint8_t access, uint8_t flags)
@@ -37,6 +39,8 @@ void gdt_init(void)
     gdt_set(0, 0, 0, 0, 0);
     gdt_set(KCODE_SEL >> 3, 0, 0xFFFFF, 0x9A, 0xC0);   /* ring 0 code, flat 4G */
     gdt_set(KDATA_SEL >> 3, 0, 0xFFFFF, 0x92, 0xC0);   /* ring 0 data, flat 4G */
+    gdt_set(UCODE_SEL >> 3, 0, 0xFFFFF, 0xFA, 0xC0);   /* ring 3 code, flat 4G */
+    gdt_set(UDATA_SEL >> 3, 0, 0xFFFFF, 0xF2, 0xC0);   /* ring 3 data, flat 4G */
 
     /* All ports allowed by default (bitmap zeroed in .bss); the terminating
      * byte past the bitmap must have all bits set. */

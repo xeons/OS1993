@@ -27,6 +27,7 @@ struct thread {
     const char *name;
     void      (*entry)(void *);
     void       *arg;
+    bool        user;           /* runs ring-3 code: TSS.ESP0 = kstack top */
 };
 
 extern struct thread *current;

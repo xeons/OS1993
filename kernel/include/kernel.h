@@ -24,8 +24,9 @@ void klog(const char *fmt, ...);   /* COM1 only */
 __attribute__((noreturn))
 void panic(const char *fmt, ...);
 
-/* desktop.c -- VGA driver demo */
-void desktop_draw(void);
+/* vmm.c */
+struct vm;
+struct vm *dos_new_session(void);       /* start a DOS session VM, focused */
 
 /* vmm.c */
 __attribute__((noreturn))

@@ -8,6 +8,7 @@
  */
 #include "kernel.h"
 #include "io.h"
+#include "gdt.h"
 #include "mm.h"
 #include "sched.h"
 #include "vm.h"
@@ -112,6 +113,8 @@ void schedule(void)
     struct thread *prev = current;
     current = next;
     vm_switch_to(next->vm);                 /* PDE 0 and TSS.ESP0 */
+    if (next->user)                         /* traps from ring 3 land here */
+        kernel_tss.esp0 = (uint32_t)(uintptr_t)next->stack + THREAD_STACK;
     switch_context(&prev->esp, next->esp);
 }
 

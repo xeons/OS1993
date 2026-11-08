@@ -2,6 +2,7 @@
 ; kernel/isr.asm -- interrupt and exception entry stubs
 ;
 ; Vectors 00h-1Fh: CPU exceptions.  20h-2Fh: hardware IRQ 0-15 (PIC remapped).
+; 30h: system calls from ring 3.
 ; Every stub builds a struct regs (kernel/include/interrupts.h) and calls
 ; interrupt_dispatch(struct regs *).
 ; =============================================================================
@@ -15,7 +16,7 @@
         section .text
 
 %assign i 0
-%rep 48
+%rep 49
 isr_stub_%[i]:
 %if (i == 8) || (i == 10) || (i == 11) || (i == 12) || (i == 13) || (i == 14) || (i == 17)
         ; CPU already pushed an error code
@@ -52,7 +53,7 @@ isr_common:
         global  isr_stub_table
 isr_stub_table:
 %assign i 0
-%rep 48
+%rep 49
         dd      isr_stub_%[i]
 %assign i i+1
 %endrep

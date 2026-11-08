@@ -85,3 +85,31 @@ idt_load:
 boot_stack:
         resb    16384
 boot_stack_top:
+
+        section .text
+
+; void user_enter(uint32_t eip, uint32_t esp, uint32_t ebx) -- never returns
+; IRET to ring 3: flat user segments, interrupts on, IOPL 0 (port access
+; is decided by the TSS I/O bitmap), EBX = argument for the program.
+        global  user_enter
+user_enter:
+        mov     ecx, [esp + 4]          ; eip
+        mov     edx, [esp + 8]          ; esp
+        mov     ebx, [esp + 12]         ; argument
+        mov     ax, UDATA_SEL
+        mov     ds, ax
+        mov     es, ax
+        mov     fs, ax
+        mov     gs, ax
+        push    dword UDATA_SEL         ; ss
+        push    edx                     ; esp
+        push    dword 0x00000202        ; eflags: IF
+        push    dword UCODE_SEL         ; cs
+        push    ecx                     ; eip
+        xor     eax, eax
+        xor     ecx, ecx
+        xor     edx, edx
+        xor     esi, esi
+        xor     edi, edi
+        xor     ebp, ebp
+        iretd

@@ -11,6 +11,7 @@
 #include "sched.h"
 #include "serial.h"
 #include "v86.h"
+#include "user.h"
 #include "vga.h"
 #include "vm.h"
 
@@ -26,7 +27,6 @@ static struct bootinfo boot_copy;   /* the original lives in VM memory */
 #define SC_N   0x31
 #define SC_X   0x2D
 #define SC_G   0x22
-#define SC_ESC 0x01
 
 #define RECURSIVE_PD ((volatile uint32_t *)0xFFFFF000)
 
@@ -82,7 +82,7 @@ static void show_vm_line(void)
     con_write_at(CON_ROWS - 2, 0, INFO_ATTR, line);
 }
 
-static void new_session(void)
+struct vm *dos_new_session(void)
 {
     static int serial;
     char name[16];
@@ -90,12 +90,24 @@ static void new_session(void)
     struct vm *vm = vm_create(name, dos_session_body, NULL);
     if (!vm) {
         kprintf("  Cannot start another DOS session: out of memory or VM slots.\n");
-        return;
+        return NULL;
     }
     kprintf("  Started %s in VM %d. Alt+Tab returns here; EXIT ends it.\n", vm->name, vm->id);
     vm_set_focus(vm);
     keyboard_forward(vm);
     vm_start(vm);
+    return vm;
+}
+
+/* G: the ring-3 GUI on the graphics screen */
+static void start_gui(void)
+{
+    if (!vga_gfx_enter())
+        return;
+    if (user_start("GUI.BIN", UINFO_GRAPHICS) != 0) {
+        vga_gfx_leave();
+        kprintf("  Cannot start GUI.BIN (see the debug log).\n");
+    }
 }
 
 void kmain(const struct bootinfo *bi)
@@ -153,6 +165,7 @@ void kmain(const struct bootinfo *bi)
     bool test = bi->flags & BI_FLAG_TEST;
     uint32_t limit = 0;
     if (test) {
+        user_selftest();
         vm_selftest();
         dos_shell_selftest();
         dos_concurrency_selftest();
@@ -161,6 +174,7 @@ void kmain(const struct bootinfo *bi)
     }
     kprintf("\n");
 
+    bool gui_was_running = false;
     for (;;) {
         char line[40];
         uint32_t t = timer_ticks();
@@ -170,15 +184,18 @@ void kmain(const struct bootinfo *bi)
         vm_reap();
         show_vm_line();
 
-        int sc = keyboard_read();
-        if (sc == SC_N) {
-            new_session();
-        } else if (sc == SC_G && !vga_console_gfx()) {
-            if (vga_gfx_enter())
-                desktop_draw();
-        } else if (sc == SC_ESC && vga_console_gfx()) {
+        if (gui_was_running && !user_running()) {   /* the GUI ended */
+            gui_was_running = false;
             vga_gfx_leave();
             con_show_cursor(0);
+            kprintf("  The GUI ended (result %d).\n", user_result());
+        }
+        int sc = user_running() ? -1 : keyboard_read();    /* the GUI reads keys itself */
+        if (sc == SC_N) {
+            dos_new_session();
+        } else if (sc == SC_G) {
+            start_gui();
+            gui_was_running = user_running();
         } else if (sc == SC_X) {
             if (vm_count() == 0)
                 break;

@@ -15,4 +15,4 @@ if [ -n "$hits" ]; then
     echo "$hits" | cut -f2- | head -20
     exit 1
 fi
-echo "check386: OK -- kernel is clean 386 code"
+echo "check386: OK -- $(basename "$elf") is clean 386 code"

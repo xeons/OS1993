@@ -4,6 +4,7 @@
 #include <stdint.h>
 
 #define IRQ_BASE 0x20        /* PIC remapped to vectors 20h-2Fh */
+#define SYSCALL_VECTOR 0x30  /* INT 30h: ring-3 calls into the VMM */
 
 /* Stack frame built by kernel/isr.asm. */
 struct regs {

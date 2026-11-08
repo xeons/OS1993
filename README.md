@@ -17,7 +17,7 @@ are for later stages.
 
 | Command          | What it does                                                  |
 |------------------|---------------------------------------------------------------|
-| `make`           | builds `build/OS1993.COM` (loader) and `build/VMM.BIN` (kernel) |
+| `make`           | builds `build/OS1993.COM` (loader), `build/VMM.BIN` (kernel) and `build/GUI.BIN` (ring-3 GUI) |
 | `make run`       | boots it in DOSBox-X: 386, 16 MB, XMS, no EMS                 |
 | `make test`      | headless round trip DOS → VMM → DOS, checked automatically    |
 | `make check386`  | fails if the kernel contains any post-386 or FPU instruction  |
@@ -187,11 +187,40 @@ Not handled yet: programs that switch to protected mode themselves (DOS
 extenders, a real HIMEM's block moves). The VM is stopped with a message.
 That needs VCPI/DPMI.
 
+## Ring 3: the GUI's home
+
+The GUI will be 32-bit flat protected-mode code running in ring 3 in the
+System VM, as Windows 3.x ran its protected-mode code there. The
+infrastructure is in place (`kernel/user.c`, `user/`):
+
+- **Segments.** Ring-3 flat code and data descriptors (selectors 23h/2Bh).
+  Isolation comes from paging: user pages have the U bit, kernel pages don't.
+- **Address space.** The image is linked at `0040_0000`, above the V86
+  area. The stack ends at `7FFF_0000`, and an info block plus the 8×16 font
+  sit at `7FFF_0000`. The VGA window (A0000) is mapped at `7FF0_0000`, so
+  the display driver draws directly. VGA ports are open in the TSS I/O
+  bitmap.
+- **Loader.** `GUI.BIN` (header `GUI3`, entry, file size, memory size) is
+  read through DOS by the System VM from the directory `VMM.BIN` came
+  from, into zeroed user pages. A ring-3 thread then IRETs into it, with
+  TSS.ESP0 set to that thread's kernel stack on every switch.
+- **System calls.** `INT 30h` through a DPL-3 gate. EAX selects the
+  function: exit, print to the debug log, ticks, yield, wait for the next
+  tick, read a key, start a DOS session. User pointers are checked.
+- **Faults.** An exception in ring 3 kills the program with a log line; the
+  rest of the system carries on.
+
+**G** in the VMM console loads `GUI.BIN`, the demo desktop now running in
+ring 3. It links the very same `kernel/gfx.c` display driver, unchanged.
+**N** there asks the VMM for a DOS session, and **Esc** exits back to the
+text console. In test mode the same binary is run twice as a self-test:
+executing `CLI` must be killed with #GP, and writing kernel memory must be
+killed with #PF.
+
 ## VGA
 
-Press **G** in the VMM console for a 640×480×16 demo desktop and **Esc**
-to go back. It exercises the driver; the real GUI will be ring-3 code in
-the System VM.
+The VGA driver is split into a kernel VDD and a display driver that runs in
+ring 3.
 
 - **`kernel/vga.c`, the VDD.** Owns the VGA hardware. Modes are set by the
   VGA BIOS (INT 10h from the System VM), as Windows did, and the resulting
@@ -204,7 +233,7 @@ the System VM.
   lines and pixels through the Set/Reset and Bit Mask registers (one write
   updates all four planes), and 8×16 text using the VGA BIOS font from
   INT 10h AX=1130h. It needs only VGA port access and a pointer to
-  A000:0000, so it can move into the ring-3 GUI as its `VGA.DRV`.
+  A000:0000, and is linked into the ring-3 GUI as its `VGA.DRV`.
 
 Limitations: DOS sessions must stay in text mode. A DOS program switching
 its VM to graphics isn't virtualized yet. Mono adapters get text only.
@@ -222,7 +251,9 @@ kernel/v86test.c dosshell.c              DOS calls from the kernel, DOS sessions
 kernel/vm.c sched.c switch.asm           VMs, address spaces, focus; threads
 kernel/vmtest.c                          multi-VM self-test
 kernel/dosmgr.c                          one DOS shared by all VMs
-kernel/vga.c gfx.c desktop.c             VGA state (VDD), drawing, demo desktop
+kernel/vga.c gfx.c                       VGA state (VDD), planar drawing
+kernel/user.c                            ring-3 loader, INT 30h system calls
+user/                                    GUI.BIN: ring-3 desktop (crt0, gui.c)
 kernel/gdt.c idt.c pic.c timer.c keyboard.c console.c serial.c kprintf.c panic.c
 kernel/include/          headers; bootinfo.h is shared with the loader
 kernel/linker.ld         links at 0x80000000, header first
@@ -254,11 +285,11 @@ tools/                   check386.sh, check-test.sh
 5. **More virtual devices (VxD-style).** The PIC, keyboard and text display
    are done. Still to do: the PIT (programs that reprogram the timer), CRTC
    ports for background VMs, graphics modes, mouse, serial and printer ports.
-6. **Graphics and GUI.** Done: the VGA driver. Next: ring-3 support (user
-   segments, LDT for the System VM, a system-call interface into the VMM,
-   a loader for the GUI binary). Then a mouse driver and the GUI itself,
-   running as ring-3 protected-mode code in the System VM like Windows
-   3.x's USER/GDI.
+6. **Graphics and GUI.** Done: the VGA driver and ring-3 support (flat
+   user segments, INT 30h system calls, `GUI.BIN` loader, fault
+   isolation). Next: a mouse driver (PS/2 on IRQ 12, virtualized like the
+   keyboard), then the GUI itself in ring 3: a window manager, an event
+   queue and a Program Manager-style shell.
 7. **Win16-style API layer.** 16-bit protected-mode apps in ring 3 with LDTs,
    built with Open Watcom.
 8. **Coexisting with EMM386** through VCPI/GEMMIS, and acting as a DPMI host.

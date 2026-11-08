@@ -8,6 +8,8 @@
 #define KCODE_SEL 0x08
 #define KDATA_SEL 0x10
 #define TSS_SEL   0x18
+#define UCODE_SEL 0x23      /* ring 3 code (index 4, RPL 3) */
+#define UDATA_SEL 0x2B      /* ring 3 data (index 5, RPL 3) */
 
 struct dtr {                 /* operand of LGDT / LIDT */
     uint16_t limit;

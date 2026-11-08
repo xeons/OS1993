@@ -317,9 +317,11 @@ struct vm *vm_get(int id)
     return (id >= 0 && id < VM_MAX && vms[id].state != VM_FREE) ? &vms[id] : NULL;
 }
 
+/* Ring-3 threads (the GUI) have no VM of their own; they belong to the
+ * System VM, as Windows' protected-mode code did. */
 struct vm *vm_current(void)
 {
-    return current ? current->vm : system_vm;
+    return current && current->vm ? current->vm : system_vm;
 }
 
 void vm_switch_to(struct vm *vm)

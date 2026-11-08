@@ -125,7 +125,7 @@ def main():
     wait_log("VGA driver (text")
     time.sleep(0.5)
 
-    key("g"); wait_log("VGA: desktop drawn")
+    key("g"); wait_log("GUI: desktop drawn")
     a = shot("desktop")
     check(a[:2] == (640, 480), f"desktop is 640x480 (got {a[0]}x{a[1]})")
     check(near(pixel(a, 5, 5), EGA[3]), "desktop background is cyan")

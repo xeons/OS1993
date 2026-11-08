@@ -4,6 +4,7 @@
 #include "sched.h"
 #include "v86.h"
 #include "vm.h"
+#include "user.h"
 
 struct idt_entry {
     uint16_t off_lo;
@@ -14,11 +15,12 @@ struct idt_entry {
 } __attribute__((packed));
 
 #define IDT_INT_GATE32 0x8E      /* present, DPL 0, 32-bit interrupt gate */
+#define IDT_USER_GATE32 0xEE     /* present, DPL 3: callable with INT from ring 3 */
 
 static struct idt_entry idt[256];
 static irq_handler_t irq_handlers[16];
 
-extern const uint32_t isr_stub_table[48];
+extern const uint32_t isr_stub_table[49];
 
 static void idt_set(int vec, uint32_t handler, uint8_t flags)
 {
@@ -33,6 +35,7 @@ void idt_init(void)
 {
     for (int i = 0; i < 48; i++)
         idt_set(i, isr_stub_table[i], IDT_INT_GATE32);
+    idt_set(SYSCALL_VECTOR, isr_stub_table[48], IDT_USER_GATE32);
 
     static struct dtr idtr;
     idtr.limit = sizeof idt - 1;
@@ -59,13 +62,24 @@ void irq_uninstall(unsigned irq)
 void interrupt_dispatch(struct regs *r)
 {
     bool from_v86 = r->eflags & EFLAGS_VM;
+    bool from_user = !from_v86 && (r->cs & 3) == 3;
     if (from_v86)
         vm_check("on entry from V86");
+
+    if (r->int_no == SYSCALL_VECTOR) {
+        if (!from_user)
+            panic("System call from ring 0.");
+        syscall_dispatch(r);
+        sched_preempt();
+        return;
+    }
 
     if (r->int_no < IRQ_BASE) {
         if (from_v86) {
             v86_exception(r);           /* the V86 monitor */
             vm_check("returning to V86 after a trap");
+        } else if (from_user) {
+            user_fault(r);              /* kills the ring-3 program */
         } else {
             panic_exception(r);
         }

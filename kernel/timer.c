@@ -11,6 +11,7 @@
 #include "io.h"
 #include "sched.h"
 #include "vm.h"
+#include "user.h"
 
 #define BDA_TICKS     0x46C
 #define BDA_MIDNIGHT  0x470
@@ -23,6 +24,7 @@ static void timer_irq(struct regs *r)
     (void)r;
     ticks++;
     sched_tick();
+    user_tick();
     if (vm_timer_tick())
         return;                 /* shared with every VM (vm.c) */
     uint32_t t = LOWMEM32(BDA_TICKS) + 1;
