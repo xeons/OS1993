@@ -15,6 +15,7 @@ expect() {  # file pattern description
 
 echo "OS1993 test results:"
 expect "$build/SERIAL.LOG" "kernel entered"                 "kernel reached kmain"
+expect "$build/SERIAL.LOG" "memory self-test passed"        "memory manager self-test"
 expect "$build/SERIAL.LOG" "returning to DOS (exit code 0)" "kernel shut down cleanly"
 expect "$build/LOADER.LOG" "Exit code 00"                   "loader returned to DOS"
 

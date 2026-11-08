@@ -31,6 +31,15 @@ void serial_putc(char c)
     outb(COM1, (uint8_t)c);
 }
 
+/* Wait until the transmitter (FIFO and shift register) is empty. */
+void serial_flush(void)
+{
+    if (!present)
+        return;
+    for (int spin = 0; spin < 1000000 && !(inb(COM1 + 5) & 0x40); spin++)
+        ;
+}
+
 void serial_puts(const char *s)
 {
     while (*s)

@@ -53,6 +53,13 @@ void panic_exception(const struct regs *r)
             r->ds & 0xFFFF, r->es & 0xFFFF, r->fs & 0xFFFF, r->gs & 0xFFFF,
             r->eflags, r->err_code);
     kprintf("     CR0=%08X  CR2=%08X  CR3=%08X\n", read_cr0(), read_cr2(), read_cr3());
+    if (r->int_no == 14) {
+        kprintf("\n     Page fault: %s %08X in %s mode (%s).\n",
+                (r->err_code & 2) ? "write to" : "read from",
+                read_cr2(),
+                (r->err_code & 4) ? "user" : "kernel",
+                (r->err_code & 1) ? "protection violation" : "page not present");
+    }
     fatal_end();
 }
 

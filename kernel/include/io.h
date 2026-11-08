@@ -21,6 +21,20 @@ static inline void io_wait(void) { outb(0x80, 0); }
 static inline void cpu_cli(void) { __asm__ volatile("cli" ::: "memory"); }
 static inline void cpu_sti(void) { __asm__ volatile("sti" ::: "memory"); }
 
+/* Disable interrupts, returning the previous EFLAGS for irq_restore(). */
+static inline uint32_t irq_save(void)
+{
+    uint32_t flags;
+    __asm__ volatile("pushfl\n\tpopl %0\n\tcli" : "=r"(flags) : : "memory");
+    return flags;
+}
+
+static inline void irq_restore(uint32_t flags)
+{
+    if (flags & 0x200)                   /* EFLAGS.IF */
+        cpu_sti();
+}
+
 /* Enable interrupts and halt until the next one, atomically. */
 static inline void cpu_idle(void) { __asm__ volatile("sti; hlt" ::: "memory"); }
 

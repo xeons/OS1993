@@ -7,6 +7,7 @@
 #include "gdt.h"
 #include "interrupts.h"
 #include "io.h"
+#include "mm.h"
 #include "serial.h"
 
 const struct bootinfo *g_bootinfo;
@@ -53,6 +54,7 @@ void kernel_shutdown(uint8_t exit_code)
     cpu_cli();
     pic_mask_all();
     klog("VMM: returning to DOS (exit code %u)\n", exit_code);
+    serial_flush();
     exit_to_dos(g_bootinfo, exit_code);
 }
 
@@ -77,19 +79,26 @@ void kmain(const struct bootinfo *bi)
     ok("8259 PICs remapped to vectors 20h-2Fh");
     check_paging(bi);
     ok("Paging (recursive page directory)");
+    pmm_init(bi);
+    heap_init();
+    ok("Page frame allocator and kernel heap");
     timer_init();
     keyboard_init();
     cpu_sti();
     ok("Timer and keyboard interrupts");
+    mm_selftest();
+    ok("Memory manager self-test");
 
-    uint32_t tables = bi->free_offset - bi->kernel_size;
+    struct heap_stats hs;
+    heap_get_stats(&hs);
     kprintf("\n");
-    kprintf("  XMS block       %6u KB\n", bi->xms_kb);
     kprintf("  Arena           %6u KB  physical %p, mapped at %p\n",
             bi->arena_size / 1024, bi->arena_phys, bi->arena_virt);
-    kprintf("  Kernel          %6u KB\n", bi->kernel_size / 1024);
-    kprintf("  Page tables     %6u KB\n", tables / 1024);
-    kprintf("  Free            %6u KB\n", (bi->arena_size - bi->free_offset) / 1024);
+    kprintf("  Kernel + tables %6u KB\n", bi->free_offset / 1024);
+    kprintf("  Free frames     %6u KB  (%u of %u pages)\n",
+            pmm_free_pages() * 4, pmm_free_pages(), pmm_total_pages());
+    kprintf("  Kernel heap     %6u KB  mapped at %p, %u KB in use\n",
+            hs.mapped / 1024, KHEAP_BASE, hs.used / 1024);
     kprintf("\n");
 
     bool test = bi->flags & BI_FLAG_TEST;

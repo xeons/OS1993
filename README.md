@@ -47,6 +47,27 @@ Kernel debug output goes to COM1; under DOSBox-X it lands in
 
 Arena layout: `[kernel image + bss][page directory][PT 0–4MB][arena PTs][free …]`
 
+## Kernel address space
+
+| Linear range              | Use                                                     |
+|---------------------------|---------------------------------------------------------|
+| `00000000–003FFFFF`       | identity: DOS, BIOS, video RAM (the future V86 machine) |
+| `80000000–83FFFFFF`       | XMS arena, direct mapped: kernel, then PMM frames       |
+| `C0000000–CFFFFFFF`       | kernel heap (`kmalloc`), grown on demand                |
+| `D0000000–FFBFFFFF`       | free for future kernel mappings                         |
+| `FFC00000–FFFFFFFF`       | recursive window: page tables; directory at `FFFFF000`  |
+
+Memory manager (`kernel/include/mm.h`):
+- `pmm.c` is a bitmap frame allocator over the arena. It panics on double
+  frees and on frees of kernel frames.
+- `paging.c` provides `vmm_map`/`vmm_unmap`/`vmm_translate` through the
+  recursive mapping. TLB flushes reload CR3, because `invlpg` is a 486
+  instruction.
+- `heap.c` is `kmalloc`/`kfree`: first fit with boundary tags, coalescing,
+  freed memory poisoned to 0xDD, and a full consistency checker
+  (`heap_check`).
+- `mmtest.c` is a self-test of all three that runs on every boot.
+
 ## Source layout
 
 ```
@@ -54,6 +75,7 @@ loader/os1993.asm        real-mode loader (.COM)
 kernel/entry.asm         VMM.BIN header, _start, exit_to_dos, gdt/idt load
 kernel/isr.asm           exception + IRQ stubs → interrupt_dispatch()
 kernel/vmm.c             kmain
+kernel/pmm.c paging.c heap.c mmtest.c   memory manager
 kernel/gdt.c idt.c pic.c timer.c keyboard.c console.c serial.c kprintf.c panic.c
 kernel/include/          headers; bootinfo.h is shared with the loader
 kernel/linker.ld         links at 0x80000000, header first
@@ -71,8 +93,9 @@ tools/                   check386.sh, check-test.sh
 
 ## Roadmap
 
-1. **Physical and virtual memory manager.** Page frame allocator over the
-   arena, kernel heap, page fault handler.
+1. ~~**Memory manager.**~~ Done: frame allocator, paging API, kernel heap.
+   Still to do: demand paging and a double-fault task gate, which would make
+   a kernel stack guard page safe.
 2. **TSS + V86 monitor.** Run the DOS that started us as the first virtual
    machine, the "System VM": reflect interrupts into it, emulate `CLI`/`STI`,
    `IN`/`OUT` and `INT` through #GP.
