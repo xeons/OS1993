@@ -8,7 +8,10 @@
  *   80000000-83FFFFFF  XMS arena, direct mapped (phys_to_virt). Kernel image,
  *                      boot page tables, then frames handed out by the PMM.
  *   C0000000-CFFFFFFF  kernel heap (kmalloc), grown page by page
- *   D0000000-FFBFFFFF  free for future kernel mappings
+ *   D0000000-D010FFFF  kernel window on physical 0-1 MB + HMA (KLOW): the
+ *                      real video RAM and the System VM's memory, whatever
+ *                      VM's page table is currently in PDE 0
+ *   D0110000-FFBFFFFF  free for future kernel mappings
  *   FFC00000-FFFFFFFF  recursive window: all page tables; PD at FFFFF000
  */
 #ifndef OS1993_MM_H
@@ -38,6 +41,9 @@
 
 #define KHEAP_BASE   0xC0000000u
 #define KHEAP_LIMIT  0xD0000000u
+#define KLOW_BASE    0xD0000000u
+#define KLOW_SIZE    0x00110000u
+#define KLOW(pa)     ((void *)(uintptr_t)(KLOW_BASE + (uint32_t)(pa)))
 #define PT_WINDOW    0xFFC00000u
 #define PD_WINDOW    0xFFFFF000u
 
@@ -47,13 +53,14 @@ uint32_t pmm_alloc(void);               /* physical address, 0 if exhausted */
 void     pmm_free(uint32_t phys);
 uint32_t pmm_total_pages(void);
 uint32_t pmm_free_pages(void);
-void    *phys_to_virt(uint32_t phys);   /* arena or low 4 MB, else NULL */
+void    *phys_to_virt(uint32_t phys);   /* arena or KLOW window, else NULL */
 
 /* paging.c -- the current page directory, via the recursive mapping */
 int      vmm_map(uint32_t va, uint32_t pa, uint32_t flags);  /* 0, or <0 */
 uint32_t vmm_unmap(uint32_t va);        /* returns old frame, 0 if none */
 bool     vmm_translate(uint32_t va, uint32_t *pa);
 void     tlb_flush(void);
+void     klow_init(void);               /* map the KLOW window */
 
 #define VMM_ENOMEM  (-1)
 #define VMM_EEXIST  (-2)

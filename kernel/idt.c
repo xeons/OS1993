@@ -1,7 +1,9 @@
 #include "kernel.h"
 #include "gdt.h"
 #include "interrupts.h"
+#include "sched.h"
 #include "v86.h"
+#include "vm.h"
 
 struct idt_entry {
     uint16_t off_lo;
@@ -73,9 +75,10 @@ void interrupt_dispatch(struct regs *r)
         if (irq_handlers[irq])
             irq_handlers[irq](r);
         else
-            vpic_hw_irq(irq);
+            vm_hw_irq(irq);
         pic_eoi(irq);
         if (from_v86)
             v86_deliver(r);
+        sched_preempt();            /* after the EOI: may switch threads */
     }
 }

@@ -75,3 +75,10 @@ bool vmm_translate(uint32_t va, uint32_t *pa)
         *pa = (PTE(va) & PAGE_MASK) | (va & ~PAGE_MASK);
     return true;
 }
+
+void klow_init(void)
+{
+    for (uint32_t pa = 0; pa < KLOW_SIZE; pa += PAGE_SIZE)
+        if (vmm_map(KLOW_BASE + pa, pa, PTE_W) != 0)
+            panic("klow_init: cannot map %08X.", pa);
+}

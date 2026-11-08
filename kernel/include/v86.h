@@ -1,5 +1,6 @@
 /*
- * v86.h -- the V86 monitor: running real-mode DOS/BIOS code from the VMM.
+ * v86.h -- the V86 monitor: running real-mode DOS/BIOS code in a VM.
+ * All calls act on the VM of the calling thread (vm_current()).
  */
 #ifndef OS1993_V86_H
 #define OS1993_V86_H
@@ -9,6 +10,8 @@
 
 #include "bootinfo.h"
 #include "interrupts.h"
+
+struct vm;
 
 #define EFLAGS_CF   0x00000001u
 #define EFLAGS_TF   0x00000100u
@@ -33,8 +36,8 @@ struct v86_frame {
 };
 
 /* v86entry.asm */
-int  v86_enter(const struct v86_frame *f);
-__attribute__((noreturn)) void v86_leave(int rc);
+int  v86_enter(const struct v86_frame *f, uint32_t *save_esp);
+__attribute__((noreturn)) void v86_leave(int rc, uint32_t saved_esp);
 
 void v86_init(const struct bootinfo *bi);
 void v86_selftest(const struct bootinfo *bi);   /* v86test.c */
@@ -47,7 +50,7 @@ int  v86_call_far(uint16_t seg, uint16_t off, struct v86_regs *r);
 const char *v86_last_error(void);
 uint32_t v86_delivered(uint8_t vec);    /* hardware IRQs reflected, by vector */
 
-/* Conventional memory the kernel can use for V86 call buffers. */
+/* Conventional memory for V86 call buffers (in every VM, same address). */
 uint16_t v86_buf_seg(void);
 uint16_t v86_buf_off(void);
 uint16_t v86_buf_size(void);
@@ -60,20 +63,12 @@ static inline void *v86_ptr(uint16_t seg, uint16_t off)
 void v86_exception(struct regs *r);
 void v86_deliver(struct regs *r);
 
-/* vpic.c -- virtual 8259 pair as seen by the VM */
-void vpic_init(uint8_t mask1, uint8_t mask2);
-bool vpic_raise(unsigned irq);          /* request; false if already pending/off */
-void vpic_hw_irq(unsigned irq);         /* VM-owned hardware IRQ arrived */
-int  vpic_ack(void);                    /* vector to deliver now, or -1 */
-bool vpic_has_deliverable(void);
-bool vpic_port(uint16_t port);
-uint8_t vpic_in(uint16_t port);
-void vpic_out(uint16_t port, uint8_t val);
-void vpic_reset_in_service(void);
-void vpic_reclaim(unsigned irq);       /* forget VM state for an IRQ the kernel takes */
-
 /* dosshell.c */
-void dos_shell(void);
+int  dos_exec_shell(const char *args, uint8_t *exit_code);
+void dos_session_body(struct vm *vm);   /* interactive COMMAND.COM */
 void dos_shell_selftest(void);
+
+/* vmtest.c */
+void vm_selftest(void);
 
 #endif

@@ -80,7 +80,7 @@ void *phys_to_virt(uint32_t phys)
 {
     if (phys - base_phys < npages * PAGE_SIZE)
         return (void *)(uintptr_t)(base_virt + (phys - base_phys));
-    if (phys < 0x00400000u)
-        return (void *)(uintptr_t)phys;     /* identity-mapped low 4 MB */
+    if (phys < KLOW_SIZE)
+        return KLOW(phys);                  /* independent of the VM in PDE 0 */
     return NULL;
 }

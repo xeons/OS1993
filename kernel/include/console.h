@@ -23,5 +23,8 @@ void con_puts(const char *s);
 void con_write_at(int row, int col, uint8_t attr, const char *s);
 void con_fill_row(int row, uint8_t attr, char c);
 void con_show_cursor(int on);
+void con_use_klow(void);        /* reach video RAM through the KLOW window */
+void con_detach(void);          /* a VM takes the screen: draw into a shadow */
+void con_attach(void);          /* back on screen: restore from the shadow */
 
 #endif

@@ -1,14 +1,14 @@
 /*
- * dosshell.c -- run COMMAND.COM inside the DOS VM.
+ * dosshell.c -- run COMMAND.COM inside a VM.
  *
- * The kernel EXECs %COMSPEC% through INT 21h AX=4B00h from V86 mode. While
- * the shell runs, the keyboard IRQ belongs to the VM (reflected to the BIOS
- * INT 9 handler) and the screen is the shell's; EXIT returns to the kernel.
+ * dos_exec_shell() EXECs %COMSPEC% through INT 21h AX=4B00h in the calling
+ * thread's VM. A DOS session VM (key N in the VMM) is just a VM whose body
+ * runs an interactive shell; EXIT ends the VM.
  */
 #include "kernel.h"
-#include "console.h"
-#include "devices.h"
+#include "sched.h"
 #include "v86.h"
+#include "vm.h"
 
 #define TEST_FILE "V86TEST.TXT"
 
@@ -32,7 +32,7 @@ static bool find_comspec(char *out, size_t size)
 
 /* EXEC %COMSPEC% with the given command tail (e.g. "/C DIR"). Returns 0 and
  * the shell's exit code, a DOS error code (>0), or -1 if the VM crashed. */
-static int exec_shell(const char *args, uint8_t *exit_code)
+int dos_exec_shell(const char *args, uint8_t *exit_code)
 {
     uint16_t seg = v86_buf_seg(), buf = v86_buf_off();
     char *path = v86_ptr(seg, buf);                 /* buf+0:   program path */
@@ -57,7 +57,7 @@ static int exec_shell(const char *args, uint8_t *exit_code)
 
     pb[0] = 0;                                      /* inherit environment */
     pb[1] = (uint16_t)(buf + 128); pb[2] = seg;     /* command tail */
-    pb[3] = 0x5C; pb[4] = seg;                      /* FCB 1 (our PSP's) */
+    pb[3] = 0x5C; pb[4] = seg;                      /* FCB 1 (the PSP's) */
     pb[5] = 0x6C; pb[6] = seg;                      /* FCB 2 */
 
     struct v86_regs r = { .eax = 0x4B00, .edx = buf, .ds = seg,
@@ -74,41 +74,49 @@ static int exec_shell(const char *args, uint8_t *exit_code)
     return 0;
 }
 
-/* Interactive DOS prompt in the VM. */
-void dos_shell(void)
+/* Body of a DOS session VM: a fresh text screen and an interactive shell. */
+void dos_session_body(struct vm *vm)
 {
-    struct v86_regs r = { .eax = 0x0003 };          /* BIOS: reset text mode */
+    struct v86_regs r = { .eax = 0x0003 };          /* BIOS: set text mode */
     v86_int(0x10, &r);
-    con_show_cursor(1);
 
-    keyboard_release();
     uint8_t code = 0;
-    int rc = exec_shell("", &code);
-    keyboard_claim();
-
-    con_show_cursor(0);
-    if (rc < 0)
-        klog("VMM: DOS shell VM stopped: %s\n", v86_last_error());
-    else if (rc > 0)
-        klog("VMM: EXEC of COMMAND.COM failed, DOS error %d\n", rc);
+    vm->result = dos_exec_shell("", &code);
+    if (vm->result < 0)
+        klog("VMM: DOS session in VM %d stopped: %s\n", vm->id, v86_last_error());
+    else if (vm->result > 0)
+        klog("VMM: EXEC of COMMAND.COM in VM %d failed, DOS error %d\n", vm->id, vm->result);
     else
-        klog("VMM: DOS shell exited (code %u)\n", code);
+        klog("VMM: DOS session in VM %d ended\n", vm->id);
 }
 
-/* Automated check: have COMMAND.COM write a file, then read it back. */
+static void shell_test_body(struct vm *vm)
+{
+    uint8_t code = 0;
+    vm->result = dos_exec_shell("/C ECHO V86 OK>" TEST_FILE, &code);
+}
+
+/* Automated check: COMMAND.COM in a new VM writes a file, and the System VM
+ * reads it back through DOS. */
 void dos_shell_selftest(void)
 {
-    uint16_t seg = v86_buf_seg(), buf = v86_buf_off();
-    uint8_t code = 0;
+    struct vm *vm = vm_create("Shell test", shell_test_body, NULL);
+    if (!vm)
+        panic("Cannot create a VM for the COMMAND.COM test.");
+    vm_start(vm);
+    while (vm->state != VM_FINISHED)
+        sched_wait();
+    int rc = vm->result;
+    char err[96];
+    memcpy(err, vm->error, sizeof err);
+    vm_reap();
 
-    keyboard_release();
-    int rc = exec_shell("/C ECHO V86 OK>" TEST_FILE, &code);
-    keyboard_claim();
     if (rc < 0)
-        panic("COMMAND.COM crashed in the VM: %s", v86_last_error());
+        panic("COMMAND.COM crashed in its VM: %s", err);
     if (rc > 0)
         panic("EXEC of COMMAND.COM failed, DOS error %d.", rc);
 
+    uint16_t seg = v86_buf_seg(), buf = v86_buf_off();
     memcpy(v86_ptr(seg, buf), TEST_FILE, sizeof TEST_FILE);
     struct v86_regs r = { .eax = 0x3D00, .edx = buf, .ds = seg };
     if (v86_int(0x21, &r) != 0 || (r.flags & EFLAGS_CF))
@@ -128,6 +136,6 @@ void dos_shell_selftest(void)
 
     if (!good)
         panic(TEST_FILE " written by the shell has the wrong contents.");
-    kprintf("  COMMAND.COM ran in the VM and wrote " TEST_FILE ".\n");
+    kprintf("  COMMAND.COM ran in its own VM and wrote " TEST_FILE ".\n");
     klog("VMM: DOS shell test passed\n");
 }

@@ -54,6 +54,7 @@ Arena layout: `[kernel image + bss][page directory][PT 0–4MB][arena PTs][free 
 | `00000000–003FFFFF`       | identity: DOS, BIOS, video RAM (the future V86 machine) |
 | `80000000–83FFFFFF`       | XMS arena, direct mapped: kernel, then PMM frames       |
 | `C0000000–CFFFFFFF`       | kernel heap (`kmalloc`), grown on demand                |
+| `D0000000–D010FFFF`       | kernel window on physical 0–1 MB + HMA (`KLOW`)         |
 | `D0000000–FFBFFFFF`       | free for future kernel mappings                         |
 | `FFC00000–FFFFFFFF`       | recursive window: page tables; directory at `FFFFF000`  |
 
@@ -90,8 +91,40 @@ the VMM (`kernel/v86.c`, `kernel/vpic.c`):
   real-mode code on the kernel's behalf. The return address is an `ARPL`
   instruction, which is invalid in V86 mode, so its #UD tells the monitor
   the call is done. This is the technique Win386 used.
-- **DOS prompt.** Press **D** in the VMM to EXEC `%COMSPEC%` inside the VM:
-  a live DOS prompt running in V86 mode. `EXIT` returns to the VMM.
+
+## Multiple virtual machines
+
+As in Windows 3.1's 386 Enhanced mode, the **System VM** is the DOS that
+started OS1993 (the VMM console runs in it). Press **N** for a new **DOS
+session**, a separate VM running `%COMSPEC%`. **Alt+Tab** cycles between
+the console and the sessions, and `EXIT` ends a session.
+
+- **Address spaces** (`kernel/vm.c`). At boot, the VMM snapshots
+  conventional memory and the HMA. Each new VM gets private copies (its own
+  IVT, BIOS data, DOS data, MCB chain and programs) and its own page table
+  for 0–4 MB. Switching VMs swaps page-directory entry 0. ROM, UMB and
+  adapter space are shared. A session costs about 740 KB.
+- **Scheduler** (`kernel/sched.c`). One kernel thread per VM, preemptive
+  round robin with ~110 ms slices, switched only at the end of an interrupt.
+  A VM that executes `HLT` blocks until an interrupt is raised for it.
+- **Virtual PIC per VM.** Timer ticks go to every VM, and a VM that misses
+  a tick gets its BIOS clock advanced directly. Other device IRQs go to the
+  System VM.
+- **Virtual keyboard (VKD)** (`kernel/keyboard.c`). The kernel owns IRQ 1.
+  Scancodes go to the focused VM's virtual 8042 (ports 60h/64h trap), so a
+  VM only ever sees its own keys.
+- **Virtual display (VDD).** Only the focused VM's B800 pages map to real
+  video RAM. Background VMs draw into private buffers, and focus switches
+  copy the buffers and restore the cursor. The console draws into a shadow
+  buffer while a VM has the screen.
+
+**Known limitation: DOS is not yet serialized between VMs.** Each VM has
+its own copy of DOS's memory, but the disk is shared, and there is no DOS
+critical section like Win386's DOSMGR. Under DOSBox-X this matters even
+more: its DOS and COMMAND.COM are emulator built-ins (C++, not real DOS
+code), so two sessions sitting at a prompt at the same time can break
+DOSBox's internal state. One interactive session at a time is safe. Real
+MS-DOS or FreeDOS under QEMU/Bochs is the next step.
 
 Not handled yet: programs that switch to protected mode themselves (DOS
 extenders, a real HIMEM's block moves). The VM is stopped with a message.
@@ -106,7 +139,9 @@ kernel/isr.asm           exception + IRQ stubs → interrupt_dispatch()
 kernel/vmm.c             kmain
 kernel/pmm.c paging.c heap.c mmtest.c   memory manager
 kernel/v86.c v86entry.asm vpic.c         V86 monitor and virtual PIC
-kernel/v86test.c dosshell.c              DOS calls from the kernel, DOS prompt
+kernel/v86test.c dosshell.c              DOS calls from the kernel, DOS sessions
+kernel/vm.c sched.c switch.asm           VMs, address spaces, focus; threads
+kernel/vmtest.c                          multi-VM self-test
 kernel/gdt.c idt.c pic.c timer.c keyboard.c console.c serial.c kprintf.c panic.c
 kernel/include/          headers; bootinfo.h is shared with the loader
 kernel/linker.ld         links at 0x80000000, header first
@@ -129,12 +164,17 @@ tools/                   check386.sh, check-test.sh
    a kernel stack guard page safe.
 2. ~~**TSS + V86 monitor.**~~ Done: DOS runs as a V86 VM, the kernel calls
    DOS and BIOS through it, and the DOS prompt runs inside it.
-3. **DOS services from protected mode.** Call `INT 21h` inside the System VM
+3. ~~**Multiple VMs.**~~ Done: private address spaces, preemptive
+   scheduling, virtual keyboard and display, Alt+Tab focus switching.
+   Next: a DOS critical section (DOSMGR-style instancing of DOS's
+   swappable data area) and a QEMU + FreeDOS test setup.
+4. **DOS services from protected mode.** Call `INT 21h` inside the System VM
    for file I/O, behind a `fs_*` interface so a native FAT driver can replace
    it later (as 32-bit File Access did in Windows for Workgroups 3.11).
-4. **Virtual devices (VxD-style).** Virtual PIC, timer, keyboard, and display,
-   so several DOS VMs can share the hardware. Preemptive scheduling between VMs.
-5. **Graphics.** VGA 640×480×16 driver, mouse, window manager, GUI shell.
-6. **Win16-style API layer.** 16-bit protected-mode apps in ring 3 with LDTs,
+5. **More virtual devices (VxD-style).** The PIC, keyboard and text display
+   are done. Still to do: the PIT (programs that reprogram the timer), CRTC
+   ports for background VMs, graphics modes, mouse, serial and printer ports.
+6. **Graphics.** VGA 640×480×16 driver, mouse, window manager, GUI shell.
+7. **Win16-style API layer.** 16-bit protected-mode apps in ring 3 with LDTs,
    built with Open Watcom.
-7. **Coexisting with EMM386** through VCPI/GEMMIS, and acting as a DPMI host.
+8. **Coexisting with EMM386** through VCPI/GEMMIS, and acting as a DPMI host.

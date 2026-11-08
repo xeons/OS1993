@@ -20,6 +20,7 @@ static const char *const exc_names[32] = {
 static void fatal_begin(void)
 {
     cpu_cli();
+    con_attach();                         /* take the screen back from any VM */
     con_set_window(0, CON_ROWS - 1);
     con_set_attr(FATAL_ATTR);
     con_clear();

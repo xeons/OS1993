@@ -1,12 +1,20 @@
 /*
  * console.c -- 80x25 text-mode console, written straight to video RAM.
  * Works on colour (B800h) and monochrome (B000h) adapters.
+ *
+ * When a VM has the focus the console keeps drawing into a shadow buffer,
+ * which is copied back to the screen when the console gets the focus again.
  */
 #include "console.h"
 #include "io.h"
 #include "kernel.h"
+#include "mm.h"
 
-static volatile uint16_t *vram;
+static volatile uint16_t *vram;             /* where we draw right now */
+static volatile uint16_t *real_vram;
+static uint16_t shadow[CON_COLS * CON_ROWS];
+static bool attached = true;
+static bool cursor_on = true;
 static uint16_t crtc;
 static int mono;
 static int cur_row, cur_col;
@@ -22,6 +30,8 @@ static uint8_t fix_attr(uint8_t a)
 
 static void update_cursor(void)
 {
+    if (!attached)
+        return;
     uint16_t pos = (uint16_t)(cur_row * CON_COLS + cur_col);
     outb(crtc, 0x0E); outb(crtc + 1, pos >> 8);
     outb(crtc, 0x0F); outb(crtc + 1, pos & 0xFF);
@@ -30,14 +40,47 @@ static void update_cursor(void)
 void con_init(void)
 {
     mono = LOWMEM8(0x449) == 7;          /* BIOS data area: video mode */
-    vram = (volatile uint16_t *)(uintptr_t)(mono ? 0xB0000 : 0xB8000);
+    real_vram = (volatile uint16_t *)(uintptr_t)(mono ? 0xB0000 : 0xB8000);
+    vram = real_vram;
     crtc = mono ? 0x3B4 : 0x3D4;
+}
+
+void con_use_klow(void)
+{
+    real_vram = KLOW(mono ? 0xB0000 : 0xB8000);
+    if (attached)
+        vram = real_vram;
+}
+
+void con_detach(void)
+{
+    if (!attached)
+        return;
+    for (int i = 0; i < CON_COLS * CON_ROWS; i++)
+        shadow[i] = real_vram[i];
+    vram = shadow;
+    attached = false;
+}
+
+void con_attach(void)
+{
+    if (attached)
+        return;
+    for (int i = 0; i < CON_COLS * CON_ROWS; i++)
+        real_vram[i] = shadow[i];
+    vram = real_vram;
+    attached = true;
+    con_show_cursor(cursor_on);
+    update_cursor();
 }
 
 void con_set_attr(uint8_t attr) { cur_attr = attr; }
 
 void con_show_cursor(int on)
 {
+    cursor_on = on;
+    if (!attached)
+        return;
     outb(crtc, 0x0A);
     outb(crtc + 1, on ? 0x0D : 0x20);    /* bit 5 = cursor off */
     if (on) { outb(crtc, 0x0B); outb(crtc + 1, 0x0E); }

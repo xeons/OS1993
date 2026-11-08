@@ -34,7 +34,7 @@ F_GS    equ 60
 
         section .text
 
-; int v86_enter(const struct v86_frame *f)
+; int v86_enter(const struct v86_frame *f, uint32_t *save_esp)
         global  v86_enter
 v86_enter:
         push    ebp
@@ -43,7 +43,8 @@ v86_enter:
         push    edi
         pushfd
         cli
-        mov     [v86_kernel_esp], esp
+        mov     edx, [esp + 28]
+        mov     [edx], esp              ; this VM's saved kernel state
         mov     [kernel_tss + 4], esp   ; TSS.ESP0: traps from V86 land here
         mov     eax, [esp + 24]
         push    dword [eax + F_GS]      ; V86 IRET frame
@@ -64,11 +65,12 @@ v86_enter:
         mov     eax, [eax + F_EAX]
         iretd
 
-; void v86_leave(int rc) -- never returns; v86_enter() returns rc instead
+; void v86_leave(int rc, uint32_t saved_esp) -- never returns; the matching
+; v86_enter() returns rc instead
         global  v86_leave
 v86_leave:
         mov     eax, [esp + 4]
-        mov     esp, [v86_kernel_esp]
+        mov     esp, [esp + 8]
         mov     cx, KDATA_SEL
         mov     ds, cx
         mov     es, cx
@@ -80,8 +82,3 @@ v86_leave:
         pop     ebx
         pop     ebp
         ret
-
-        section .bss
-        alignb  4
-v86_kernel_esp:
-        resd    1
