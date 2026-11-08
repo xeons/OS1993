@@ -206,6 +206,7 @@ int user_start(const char *name, uint32_t flags)
     }
     u.thread->user = true;
     u.running = true;
+    mouse_set_delivery((flags & UINFO_GRAPHICS) != 0);
     klog("USER: started %s (%u bytes, entry %08X)\n", path, hdr.file_size, hdr.entry);
     thread_wake(u.thread);
     return 0;
@@ -224,6 +225,7 @@ void user_tick(void)
 __attribute__((noreturn))
 static void finish(int result)
 {
+    mouse_set_delivery(false);
     u.result = result;
     u.running = false;
     thread_exit();
@@ -265,6 +267,27 @@ void syscall_dispatch(struct regs *r)
         break;
     case SYS_GET_KEY:
         r->eax = vm_focus() == NULL ? (uint32_t)keyboard_read() : (uint32_t)-1;
+        break;
+    case SYS_GET_EVENT: {
+        struct user_event e = { 0 };
+        int sc = vm_focus() == NULL ? keyboard_read() : -1;
+        if (sc >= 0) {
+            e.type = EV_KEY;
+            e.key = (uint16_t)sc;
+        } else if (!mouse_get_event(&e)) {
+            r->eax = 0;
+            break;
+        }
+        if (!user_range_ok(r->ebx, sizeof e)) {
+            r->eax = (uint32_t)-1;
+            break;
+        }
+        memcpy((void *)(uintptr_t)r->ebx, &e, sizeof e);
+        r->eax = 1;
+        break;
+    }
+    case SYS_MOUSE:
+        r->eax = mouse_present();
         break;
     case SYS_NEW_SESSION: {
         struct vm *vm = dos_new_session();

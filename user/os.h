@@ -27,6 +27,8 @@ static inline void sys_yield(void)           { syscall3(SYS_YIELD, 0, 0, 0); }
 static inline void sys_wait_tick(void)       { syscall3(SYS_WAIT_TICK, 0, 0, 0); }
 static inline int  sys_get_key(void)         { return (int)syscall3(SYS_GET_KEY, 0, 0, 0); }
 static inline int  sys_new_session(void)     { return (int)syscall3(SYS_NEW_SESSION, 0, 0, 0); }
+static inline int  sys_get_event(struct user_event *e) { return (int)syscall3(SYS_GET_EVENT, (uint32_t)e, 0, 0); }
+static inline int  sys_mouse(void)           { return (int)syscall3(SYS_MOUSE, 0, 0, 0); }
 __attribute__((noreturn))
 static inline void sys_exit(int code)
 {

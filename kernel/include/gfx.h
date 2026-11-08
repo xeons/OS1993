@@ -30,5 +30,8 @@ void gfx_hline(struct gfx *g, int x, int y, int w, uint8_t color);
 void gfx_vline(struct gfx *g, int x, int y, int h, uint8_t color);
 void gfx_rect(struct gfx *g, int x, int y, int w, int h, uint8_t color);
 void gfx_text(struct gfx *g, int x, int y, const char *s, uint8_t fg, uint8_t bg);
+/* XOR a 1-bit image (rows of up to 16 pixels, MSB = leftmost) onto the
+ * screen, inverting the pixels under it; drawing it again erases it. */
+void gfx_xor_bitmap(struct gfx *g, int x, int y, const uint16_t *rows, int h);
 
 #endif

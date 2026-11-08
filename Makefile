@@ -9,6 +9,7 @@
 #   make qemu-emm386  OS1993 must refuse to run with JEMM386 loaded
 #   make qemu-sessions  type into two concurrent DOS sessions (QEMU sendkey)
 #   make qemu-vga   check the VGA driver with QEMU screendumps
+#   make qemu-mouse move and click the PS/2 mouse; drag the GUI's window
 #   make clean
 
 CC      := i686-elf-gcc
@@ -42,7 +43,7 @@ KERNEL_ASM := $(wildcard kernel/*.asm)
 KERNEL_OBJ := $(patsubst kernel/%.asm,$(BUILD)/kernel/%.o,$(KERNEL_ASM)) \
               $(patsubst kernel/%.c,$(BUILD)/kernel/%.o,$(KERNEL_C))
 
-.PHONY: all run test check386 qemu qemu-test qemu-emm386 qemu-sessions qemu-vga clean
+.PHONY: all run test check386 qemu qemu-test qemu-emm386 qemu-sessions qemu-vga qemu-mouse clean
 
 all: $(BUILD)/OS1993.COM $(BUILD)/VMM.BIN $(BUILD)/GUI.BIN
 
@@ -123,6 +124,9 @@ qemu-sessions: all
 
 qemu-vga: all
 	@tools/qemu-vga-test.py
+
+qemu-mouse: all
+	@tools/qemu-mouse-test.py
 
 check386: $(BUILD)/vmm.elf $(BUILD)/gui.elf
 	@tools/check386.sh $(OBJDUMP) $(BUILD)/vmm.elf

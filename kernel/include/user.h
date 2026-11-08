@@ -38,6 +38,20 @@ struct user_info {                      /* at USER_INFO, pointed to by EBX */
     uint32_t width, height;
 };
 
+/* An input event (SYS_GET_EVENT) */
+#define EV_KEY      1                   /* key: scancode */
+#define EV_MOUSE    2                   /* x, y: pointer position; buttons */
+#define MB_LEFT     0x01
+#define MB_RIGHT    0x02
+#define MB_MIDDLE   0x04
+
+struct user_event {
+    uint8_t  type;
+    uint8_t  buttons;
+    uint16_t key;
+    int16_t  x, y;
+};
+
 /* System calls: INT 30h, EAX = number, args in EBX, ECX, EDX; result in EAX */
 #define SYS_EXIT        0               /* EBX = exit code */
 #define SYS_PRINT       1               /* EBX = string, ECX = length */
@@ -46,6 +60,8 @@ struct user_info {                      /* at USER_INFO, pointed to by EBX */
 #define SYS_WAIT_TICK   4               /* sleep until the next timer tick */
 #define SYS_GET_KEY     5               /* -> scancode, or -1 */
 #define SYS_NEW_SESSION 6               /* start a DOS session -> VM id, or -1 */
+#define SYS_GET_EVENT   7               /* EBX = struct user_event * -> 1, or 0 */
+#define SYS_MOUSE       8               /* -> 1 if there is a mouse */
 
 #ifndef USER_SIDE                       /* kernel only */
 struct regs;

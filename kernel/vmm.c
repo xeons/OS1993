@@ -65,6 +65,7 @@ void kernel_shutdown(uint8_t exit_code)
 {
     cpu_cli();
     pic_mask_all();
+    mouse_shutdown();                   /* or DOS's keyboard would jam */
     vm_restore_dos();                   /* the original DOS memory and screen */
     klog("VMM: returning to DOS (exit code %u)\n", exit_code);
     serial_flush();
@@ -153,6 +154,8 @@ void kmain(const struct bootinfo *bi)
     ok("DOS shared between VMs (DOSMGR)");
     vga_init();
     ok("VGA driver (text and 640x480x16 graphics)");
+    mouse_init();
+    ok(mouse_present() ? "PS/2 mouse" : "PS/2 mouse (none found)");
 
     kprintf("\n");
     kprintf("  Arena           %6u KB  physical %p, mapped at %p\n",

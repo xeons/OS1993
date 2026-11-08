@@ -25,6 +25,7 @@ are for later stages.
 | `make qemu-test` | headless FreeDOS run of the same checks as `make test`        |
 | `make qemu-emm386` | FreeDOS with JEMM386: the loader must refuse to start       |
 | `make qemu-sessions` | types into two concurrent DOS sessions via QEMU's monitor |
+| `make qemu-mouse` | moves and clicks QEMU's PS/2 mouse via its monitor; checks the cursor and a window drag with screendumps |
 | `make qemu-vga`  | VGA driver: checks desktop pixels with QEMU screendumps, and pixel-identical restores after switching to a text DOS session and back |
 
 There are two test machines because they catch different bugs:
@@ -209,6 +210,7 @@ infrastructure is in place (`kernel/user.c`, `user/`):
   tick, read a key, start a DOS session. User pointers are checked.
 - **Faults.** An exception in ring 3 kills the program with a log line; the
   rest of the system carries on.
+- **Input.** `SYS_GET_EVENT` delivers keyboard and mouse events.
 
 **G** in the VMM console loads `GUI.BIN`, the demo desktop now running in
 ring 3. It links the very same `kernel/gfx.c` display driver, unchanged.
@@ -216,6 +218,28 @@ ring 3. It links the very same `kernel/gfx.c` display driver, unchanged.
 text console. In test mode the same binary is run twice as a self-test:
 executing `CLI` must be killed with #GP, and writing kernel memory must be
 killed with #PF.
+
+## Mouse
+
+`kernel/mouse.c` drives a PS/2 mouse on the 8042's auxiliary port (IRQ 12):
+
+- **Setup.** At boot it enables the aux port and its interrupt, then sends
+  "set defaults" and "enable streaming", waiting for each `FAh`
+  acknowledgement. No acknowledgement means no mouse, and the VMM carries on.
+- **Packets.** 3-byte packets resync on bit 3 of the first byte, use 9-bit
+  signed deltas, and drop overflows. The kernel keeps an absolute pointer
+  position clamped to 640×480, plus the buttons. The keyboard handler
+  checks the controller's "aux data" status bit, so a mouse byte arriving
+  on IRQ 1 isn't taken for a key.
+- **Delivery.** Events go to the ring-3 GUI while it has the screen.
+  `SYS_GET_EVENT` returns key and mouse events, and consecutive moves are
+  merged. DOS sessions get no mouse yet (that needs a virtual aux device
+  for a DOS mouse driver).
+- **Exit.** Before returning to DOS, streaming is stopped and the 8042
+  command byte restored. Otherwise mouse bytes would jam DOS's keyboard.
+
+The GUI draws an XOR arrow cursor (drawing it twice erases it, so it needs
+no save-under), and the demo window can be dragged by its title bar.
 
 ## VGA
 
@@ -253,6 +277,7 @@ kernel/vmtest.c                          multi-VM self-test
 kernel/dosmgr.c                          one DOS shared by all VMs
 kernel/vga.c gfx.c                       VGA state (VDD), planar drawing
 kernel/user.c                            ring-3 loader, INT 30h system calls
+kernel/mouse.c                           PS/2 mouse (IRQ 12)
 user/                                    GUI.BIN: ring-3 desktop (crt0, gui.c)
 kernel/gdt.c idt.c pic.c timer.c keyboard.c console.c serial.c kprintf.c panic.c
 kernel/include/          headers; bootinfo.h is shared with the loader
@@ -287,9 +312,11 @@ tools/                   check386.sh, check-test.sh
    ports for background VMs, graphics modes, mouse, serial and printer ports.
 6. **Graphics and GUI.** Done: the VGA driver and ring-3 support (flat
    user segments, INT 30h system calls, `GUI.BIN` loader, fault
-   isolation). Next: a mouse driver (PS/2 on IRQ 12, virtualized like the
-   keyboard), then the GUI itself in ring 3: a window manager, an event
-   queue and a Program Manager-style shell.
+   isolation) and the PS/2 mouse with a draggable demo window. Next: the
+   GUI itself in ring 3, meaning a window manager (overlapping windows,
+   z-order, clipping, redraw), an event queue per window, and a Program
+   Manager-style shell. A mouse for DOS sessions (virtual aux device) can
+   come later.
 7. **Win16-style API layer.** 16-bit protected-mode apps in ring 3 with LDTs,
    built with Open Watcom.
 8. **Coexisting with EMM386** through VCPI/GEMMIS, and acting as a DPMI host.

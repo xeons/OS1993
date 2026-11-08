@@ -36,6 +36,10 @@ static void console_put(uint8_t sc)
 static void keyboard_irq(struct regs *r)
 {
     (void)r;
+    if (inb(KBD_STATUS) & 0x20) {         /* a mouse byte, not a key */
+        mouse_byte(inb(KBD_DATA));
+        return;
+    }
     uint8_t sc = inb(KBD_DATA);
 
     if (sc == SC_ALT)                     alt_down = true;

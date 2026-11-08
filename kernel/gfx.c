@@ -122,3 +122,25 @@ void gfx_text(struct gfx *g, int x, int y, const char *s, uint8_t fg, uint8_t bg
         end();
     }
 }
+
+void gfx_xor_bitmap(struct gfx *g, int x, int y, const uint16_t *rows, int h)
+{
+    begin(0x0F);                        /* XOR with all-ones inverts */
+    gc(3, 0x18);                        /* function select: XOR */
+    int shift = x & 7, col = x >> 3;
+    for (int r = 0; r < h; r++) {
+        int row = y + r;
+        if (row < 0 || row >= g->height)
+            continue;
+        /* 16 pixels starting at a byte boundary - shift: up to 3 bytes */
+        uint32_t bits = (uint32_t)rows[r] << (8 - shift);
+        volatile uint8_t *p = g->fb + row * g->stride + col;
+        for (int b = 0; b < 3; b++) {
+            uint8_t m = (uint8_t)(bits >> (16 - 8 * b));
+            if (m && col + b >= 0 && col + b < g->stride)
+                put_masked(p + b, m);
+        }
+    }
+    gc(3, 0x00);
+    end();
+}
