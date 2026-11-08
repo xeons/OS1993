@@ -47,12 +47,21 @@ struct bootinfo {
     uint16_t gdtr_limit;   /* 46 loader GDTR, restore before returning       */
     uint32_t gdtr_base;    /* 48                                             */
     uint32_t xms_kb;       /* 52 size of the XMS block actually allocated    */
+    /* Offsets below are within the loader's segment (loader_base >> 4).   */
+    uint16_t v86_stub_off; /* 56 ARPL breakpoint ending kernel V86 calls     */
+    uint16_t v86_stack_top;/* 58 initial SP for kernel V86 calls             */
+    uint16_t kpath_off;    /* 60 ASCIIZ path the kernel was loaded from      */
+    uint16_t buf_off;      /* 62 conventional-memory transfer buffer ...     */
+    uint16_t buf_size;     /* 64 ... and its size in bytes                   */
+    uint8_t  pic1_mask;    /* 66 IRQ masks DOS had when we started           */
+    uint8_t  pic2_mask;    /* 67                                             */
 } __attribute__((packed));
 
 _Static_assert(__builtin_offsetof(struct bootinfo, return_off) == 36, "bootinfo layout");
 _Static_assert(__builtin_offsetof(struct bootinfo, gdtr_limit) == 46, "bootinfo layout");
 _Static_assert(__builtin_offsetof(struct bootinfo, xms_kb)     == 52, "bootinfo layout");
-_Static_assert(sizeof(struct bootinfo) == 56,                          "bootinfo layout");
+_Static_assert(__builtin_offsetof(struct bootinfo, pic1_mask)  == 66, "bootinfo layout");
+_Static_assert(sizeof(struct bootinfo) == 68,                          "bootinfo layout");
 
 /* Return to DOS through the loader. Never returns. (kernel/entry.asm) */
 __attribute__((noreturn))

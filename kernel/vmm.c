@@ -9,6 +9,7 @@
 #include "io.h"
 #include "mm.h"
 #include "serial.h"
+#include "v86.h"
 
 const struct bootinfo *g_bootinfo;
 
@@ -24,7 +25,7 @@ static void draw_frame(void)
     con_fill_row(0, TITLE_ATTR, ' ');
     con_write_at(0, 2, TITLE_ATTR, "OS1993 Virtual Machine Manager  Version " OS1993_VERSION);
     con_fill_row(CON_ROWS - 1, STATUS_ATTR, ' ');
-    con_write_at(CON_ROWS - 1, 2, STATUS_ATTR, "Press any key to return to MS-DOS");
+    con_write_at(CON_ROWS - 1, 2, STATUS_ATTR, "D = DOS prompt   Any other key = return to MS-DOS");
     con_set_window(2, CON_ROWS - 3);
     con_set_attr(TEXT_ATTR);
     con_clear();
@@ -88,6 +89,8 @@ void kmain(const struct bootinfo *bi)
     ok("Timer and keyboard interrupts");
     mm_selftest();
     ok("Memory manager self-test");
+    v86_init(bi);
+    ok("V86 monitor and virtual PIC");
 
     struct heap_stats hs;
     heap_get_stats(&hs);
@@ -100,11 +103,15 @@ void kmain(const struct bootinfo *bi)
     kprintf("  Kernel heap     %6u KB  mapped at %p, %u KB in use\n",
             hs.mapped / 1024, KHEAP_BASE, hs.used / 1024);
     kprintf("\n");
+    v86_selftest(bi);
+    kprintf("\n");
 
     bool test = bi->flags & BI_FLAG_TEST;
     uint32_t limit = 2 * TIMER_HZ_X10 / 10;  /* ~2 s in test mode */
-    if (test)
+    if (test) {
+        dos_shell_selftest();
         kprintf("  Test mode: returning to DOS automatically.\n");
+    }
 
     for (;;) {
         char line[40];
@@ -114,6 +121,12 @@ void kmain(const struct bootinfo *bi)
         con_write_at(CON_ROWS - 1, CON_COLS - 20, STATUS_ATTR, line);
 
         int sc = keyboard_read();
+        if (sc == 0x20) {                       /* 'D': DOS prompt in the VM */
+            dos_shell();
+            draw_frame();
+            kprintf("  Back from the DOS prompt.\n");
+            continue;
+        }
         if (sc >= 0 && !(sc & 0x80))
             break;
         if (test && t >= limit)

@@ -68,6 +68,35 @@ Memory manager (`kernel/include/mm.h`):
   (`heap_check`).
 - `mmtest.c` is a self-test of all three that runs on every boot.
 
+## The DOS virtual machine
+
+The DOS that started OS1993 keeps running, as a virtual 8086 machine under
+the VMM (`kernel/v86.c`, `kernel/vpic.c`):
+
+- **Entering and leaving V86 mode.** `v86_enter` (`v86entry.asm`) IRETs into
+  V86 mode with TSS.ESP0 pointing just below the kernel's saved state. Traps
+  out of V86 mode land there, and `v86_leave` unwinds them (setjmp/longjmp).
+- **Instruction emulation.** V86 code runs at IOPL 0, so `CLI`, `STI`,
+  `PUSHF`, `POPF`, `INT n`, `IRET` and `HLT` raise #GP and are emulated
+  against a virtual interrupt flag. CPU exceptions 0–7 are reflected to the
+  real-mode IVT, as on a real 8086.
+- **Ports.** The TSS I/O bitmap lets the VM drive hardware directly, except
+  the PIC ports 20h/21h/A0h/A1h, which trap to the virtual PIC.
+- **Virtual PIC.** IRQs without a kernel handler are reflected into DOS's
+  handlers at the BIOS vectors (08h/70h). Their EOIs are virtualized, and the
+  real IRQ stays masked until the VM acknowledges it. The timer is shared:
+  undelivered ticks are credited straight to the BIOS tick count.
+- **Kernel calls into DOS.** `v86_int(vec, &regs)` and `v86_call_far()` run
+  real-mode code on the kernel's behalf. The return address is an `ARPL`
+  instruction, which is invalid in V86 mode, so its #UD tells the monitor
+  the call is done. This is the technique Win386 used.
+- **DOS prompt.** Press **D** in the VMM to EXEC `%COMSPEC%` inside the VM:
+  a live DOS prompt running in V86 mode. `EXIT` returns to the VMM.
+
+Not handled yet: programs that switch to protected mode themselves (DOS
+extenders, a real HIMEM's block moves). The VM is stopped with a message.
+That needs VCPI/DPMI.
+
 ## Source layout
 
 ```
@@ -76,6 +105,8 @@ kernel/entry.asm         VMM.BIN header, _start, exit_to_dos, gdt/idt load
 kernel/isr.asm           exception + IRQ stubs → interrupt_dispatch()
 kernel/vmm.c             kmain
 kernel/pmm.c paging.c heap.c mmtest.c   memory manager
+kernel/v86.c v86entry.asm vpic.c         V86 monitor and virtual PIC
+kernel/v86test.c dosshell.c              DOS calls from the kernel, DOS prompt
 kernel/gdt.c idt.c pic.c timer.c keyboard.c console.c serial.c kprintf.c panic.c
 kernel/include/          headers; bootinfo.h is shared with the loader
 kernel/linker.ld         links at 0x80000000, header first
@@ -96,9 +127,8 @@ tools/                   check386.sh, check-test.sh
 1. ~~**Memory manager.**~~ Done: frame allocator, paging API, kernel heap.
    Still to do: demand paging and a double-fault task gate, which would make
    a kernel stack guard page safe.
-2. **TSS + V86 monitor.** Run the DOS that started us as the first virtual
-   machine, the "System VM": reflect interrupts into it, emulate `CLI`/`STI`,
-   `IN`/`OUT` and `INT` through #GP.
+2. ~~**TSS + V86 monitor.**~~ Done: DOS runs as a V86 VM, the kernel calls
+   DOS and BIOS through it, and the DOS prompt runs inside it.
 3. **DOS services from protected mode.** Call `INT 21h` inside the System VM
    for file I/O, behind a `fs_*` interface so a native FAT driver can replace
    it later (as 32-bit File Access did in Windows for Workgroups 3.11).

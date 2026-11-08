@@ -1,6 +1,7 @@
 #include "kernel.h"
 #include "gdt.h"
 #include "interrupts.h"
+#include "v86.h"
 
 struct idt_entry {
     uint16_t off_lo;
@@ -43,12 +44,26 @@ void irq_install(unsigned irq, irq_handler_t h)
     pic_unmask(irq);
 }
 
+void irq_uninstall(unsigned irq)
+{
+    irq_handlers[irq] = NULL;           /* the IRQ now belongs to the VM */
+}
+
+/*
+ * IRQs with a kernel handler belong to the kernel; all others are passed to
+ * the DOS VM through the virtual PIC. (A kernel handler may also share its
+ * IRQ with the VM by calling vpic_raise itself, as the timer does.)
+ */
 void interrupt_dispatch(struct regs *r)
 {
+    bool from_v86 = r->eflags & EFLAGS_VM;
+
     if (r->int_no < IRQ_BASE) {
-        /* Future: #GP from V86 mode goes to the V86 monitor, #PF to the
-         * pager. For now every exception is fatal. */
-        panic_exception(r);
+        if (from_v86)
+            v86_exception(r);           /* the V86 monitor */
+        else
+            panic_exception(r);
+        return;
     }
 
     unsigned irq = r->int_no - IRQ_BASE;
@@ -57,6 +72,10 @@ void interrupt_dispatch(struct regs *r)
             return;
         if (irq_handlers[irq])
             irq_handlers[irq](r);
+        else
+            vpic_hw_irq(irq);
         pic_eoi(irq);
+        if (from_v86)
+            v86_deliver(r);
     }
 }

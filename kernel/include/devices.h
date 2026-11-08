@@ -12,5 +12,7 @@ uint32_t timer_ticks(void);
 void keyboard_init(void);
 int  keyboard_read(void);            /* next scancode, or -1 */
 int  keyboard_poll_key(void);        /* interrupts off: wait for a key press */
+void keyboard_release(void);         /* hand the keyboard to the DOS VM */
+void keyboard_claim(void);           /* take it back */
 
 #endif

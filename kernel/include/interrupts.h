@@ -20,6 +20,7 @@ typedef void (*irq_handler_t)(struct regs *r);
 
 void idt_init(void);
 void irq_install(unsigned irq, irq_handler_t h);
+void irq_uninstall(unsigned irq);
 void interrupt_dispatch(struct regs *r);       /* called from isr.asm */
 
 /* pic.c */

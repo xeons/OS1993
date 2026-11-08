@@ -29,6 +29,9 @@
         global  _start
 _start:
         cli
+        push    dword 0x00000002        ; EFLAGS: clear IOPL and NT inherited
+        popfd                           ; from DOS (NT would turn IRET into a
+                                        ; task return)
         cld
         mov     edx, ebx                ; keep bootinfo pointer
         mov     edi, __bss_start        ; zero .bss (includes our stack)

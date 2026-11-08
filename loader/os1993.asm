@@ -60,6 +60,7 @@ start:
         mov     cx, bss_end - bss_start
         xor     al, al
         rep     stosb
+        mov     sp, loader_stack_top    ; own stack, so we can shrink to fit
         mov     dx, msg_banner
         call    print
 
@@ -74,6 +75,14 @@ start:
         mov     dx, err_v86
         jmp     die
 .real_mode:
+        ; Give conventional memory back to DOS: keep only our image + .bss.
+        ; Programs the kernel later runs in the DOS VM need the space.
+        mov     bx, bss_end
+        add     bx, 15
+        shr     bx, 4
+        mov     ah, 0x4A                ; resize memory block, ES = PSP
+        int     0x21
+
         call    parse_cmdline
         call    find_kernel_path
 
@@ -714,8 +723,15 @@ bi_return_sel   dw  SEL_CODE32          ; 40
 gdtr            dw  gdt_end - gdt - 1   ; 46
 gdtr_base       dd  0                   ; 48
 bi_xms_kb       dd  0                   ; 52
+bi_v86_stub     dw  v86_stub            ; 56 V86 breakpoint (ARPL) offset
+bi_v86_stack    dw  v86_stack_top       ; 58 V86 stack top offset
+bi_kpath        dw  kpath               ; 60 ASCIIZ path of VMM.BIN
+bi_buf_off      dw  buffer              ; 62 transfer buffer offset ...
+bi_buf_size     dw  CHUNK               ; 64 ... and size
+pic1_mask       db  0                   ; 66 DOS's IRQ masks
+pic2_mask       db  0                   ; 67
 bootinfo_end:
-%if bootinfo_end - bootinfo != 56
+%if bootinfo_end - bootinfo != 68
 %error "bootinfo layout drifted from bootinfo.h"
 %endif
 
@@ -735,6 +751,10 @@ gdt:    dq      0
         dw      0xFFFF, 0               ; 0x30 data16, 64K, loader based
         db      0, 0x92, 0x00, 0
 gdt_end:
+
+; Returning from a V86 call: ARPL is invalid in real/V86 mode, so it raises
+; #UD and the kernel's V86 monitor regains control (the Win386 technique).
+v86_stub        db  0x63, 0xC0          ; arpl ax, ax
 
 rm_idtr         dw  0x03FF
                 dd  0
@@ -769,11 +789,14 @@ xms_handle      resw 1
 fhandle         resw 1
 rm_ss           resw 1
 rm_sp           resw 1
-pic1_mask       resb 1
-pic2_mask       resb 1
 exit_code       resb 1
 KPATH_MAX       equ 128
 kpath           resb KPATH_MAX
         alignb  16
 buffer          resb CHUNK + 2
+        alignb  16
+v86_stack       resb 2048               ; stack for kernel-initiated V86 calls
+v86_stack_top:
+loader_stack    resb 1024
+loader_stack_top:
 bss_end:
