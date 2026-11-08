@@ -90,6 +90,7 @@ static void new_session(void)
     }
     kprintf("  Started %s in VM %d. Alt+Tab returns here; EXIT ends it.\n", vm->name, vm->id);
     vm_set_focus(vm);
+    keyboard_forward(vm);
     vm_start(vm);
 }
 

@@ -11,8 +11,9 @@ C:\> OS1993
 
 ## Building and running
 
-Requirements: `nasm`, `i686-elf-gcc` / `i686-elf-binutils`, `dosbox-x`
-(`qemu`, `bochs` and Open Watcom in `/opt/watcom` are for later stages).
+Requirements: `nasm`, `i686-elf-gcc` / `i686-elf-binutils`, `dosbox-x`,
+`qemu-system-i386`, `mtools`, `curl`. Bochs and Open Watcom (`/opt/watcom`)
+are for later stages.
 
 | Command          | What it does                                                  |
 |------------------|---------------------------------------------------------------|
@@ -20,6 +21,20 @@ Requirements: `nasm`, `i686-elf-gcc` / `i686-elf-binutils`, `dosbox-x`
 | `make run`       | boots it in DOSBox-X: 386, 16 MB, XMS, no EMS                 |
 | `make test`      | headless round trip DOS → VMM → DOS, checked automatically    |
 | `make check386`  | fails if the kernel contains any post-386 or FPU instruction  |
+| `make qemu`      | boots real FreeDOS 1.3 in QEMU (486, 16 MB, ISA PC); `OS1993` is in `C:\OS1993` |
+| `make qemu-test` | headless FreeDOS run of the same checks as `make test`        |
+| `make qemu-emm386` | FreeDOS with JEMM386: the loader must refuse to start       |
+
+There are two test machines because they catch different bugs:
+
+- **DOSBox-X** is fast and can emulate a strict 386, but its DOS and
+  COMMAND.COM are emulator built-ins written in C++.
+- **QEMU + FreeDOS** runs a real DOS kernel, FreeCOM, HIMEMX and JEMM386.
+  `tools/mkfreedos.sh` downloads the official FreeDOS 1.3 Lite image once
+  into `.cache/freedos` and checks its SHA-256. It then writes its own
+  `FDCONFIG.SYS`/`FDAUTO.BAT` and copies OS1993 onto the image with mtools.
+  The `isa-debug-exit` device lets an automated run power off QEMU. QEMU has
+  no 386 model, so it runs as a 486.
 
 Kernel debug output goes to COM1; under DOSBox-X it lands in
 `build/SERIAL.LOG`.
@@ -118,13 +133,16 @@ the console and the sessions, and `EXIT` ends a session.
   copy the buffers and restore the cursor. The console draws into a shadow
   buffer while a VM has the screen.
 
-**Known limitation: DOS is not yet serialized between VMs.** Each VM has
-its own copy of DOS's memory, but the disk is shared, and there is no DOS
-critical section like Win386's DOSMGR. Under DOSBox-X this matters even
-more: its DOS and COMMAND.COM are emulator built-ins (C++, not real DOS
-code), so two sessions sitting at a prompt at the same time can break
-DOSBox's internal state. One interactive session at a time is safe. Real
-MS-DOS or FreeDOS under QEMU/Bochs is the next step.
+**Known limitation: DOS is not yet shared between VMs.** Each VM has its
+own copy of DOS's memory, *including its disk buffers*, while the disk
+itself is shared. On real FreeDOS, a file written in one VM stays invisible
+to another until both flush their buffers. For now the VMM issues
+INT 21h AH=0Dh (disk reset) when a VM ends and before the System VM reads.
+Two VMs writing the same disk concurrently can still corrupt it. The proper
+fix is what Win386's DOSMGR did: one shared copy of DOS, a per-VM swap of
+its swappable data area, and a DOS critical section. Under DOSBox-X,
+whose DOS is an emulator built-in, keep to one interactive session at a
+time.
 
 Not handled yet: programs that switch to protected mode themselves (DOS
 extenders, a real HIMEM's block moves). The VM is stopped with a message.
@@ -166,8 +184,9 @@ tools/                   check386.sh, check-test.sh
    DOS and BIOS through it, and the DOS prompt runs inside it.
 3. ~~**Multiple VMs.**~~ Done: private address spaces, preemptive
    scheduling, virtual keyboard and display, Alt+Tab focus switching.
-   Next: a DOS critical section (DOSMGR-style instancing of DOS's
-   swappable data area) and a QEMU + FreeDOS test setup.
+   Next: share one copy of DOS between VMs with a DOS critical section
+   (DOSMGR-style instancing of DOS's swappable data area). This replaces
+   today's buffer flushes and makes concurrent DOS sessions safe.
 4. **DOS services from protected mode.** Call `INT 21h` inside the System VM
    for file I/O, behind a `fs_*` interface so a native FAT driver can replace
    it later (as 32-bit File Access did in Windows for Workgroups 3.11).

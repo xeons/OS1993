@@ -12,6 +12,8 @@
 
 #define TEST_FILE "V86TEST.TXT"
 
+static void dos_flush_buffers(void);
+
 static bool find_comspec(char *out, size_t size)
 {
     uint16_t psp = v86_buf_seg();
@@ -88,12 +90,24 @@ void dos_session_body(struct vm *vm)
         klog("VMM: EXEC of COMMAND.COM in VM %d failed, DOS error %d\n", vm->id, vm->result);
     else
         klog("VMM: DOS session in VM %d ended\n", vm->id);
+    dos_flush_buffers();
+}
+
+/* Each VM has its own copy of DOS, including its disk buffers, so a VM
+ * must flush them before another VM can see what it wrote (and the reader
+ * must drop its stale ones). INT 21h AH=0Dh does both. A DOS critical
+ * section shared by all VMs (as Win386's DOSMGR did) will replace this. */
+static void dos_flush_buffers(void)
+{
+    struct v86_regs r = { .eax = 0x0D00 };
+    v86_int(0x21, &r);
 }
 
 static void shell_test_body(struct vm *vm)
 {
     uint8_t code = 0;
     vm->result = dos_exec_shell("/C ECHO V86 OK>" TEST_FILE, &code);
+    dos_flush_buffers();
 }
 
 /* Automated check: COMMAND.COM in a new VM writes a file, and the System VM
@@ -116,6 +130,7 @@ void dos_shell_selftest(void)
     if (rc > 0)
         panic("EXEC of COMMAND.COM failed, DOS error %d.", rc);
 
+    dos_flush_buffers();                            /* drop stale buffers */
     uint16_t seg = v86_buf_seg(), buf = v86_buf_off();
     memcpy(v86_ptr(seg, buf), TEST_FILE, sizeof TEST_FILE);
     struct v86_regs r = { .eax = 0x3D00, .edx = buf, .ds = seg };

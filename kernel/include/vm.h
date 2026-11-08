@@ -120,5 +120,6 @@ void vkbd_put(struct vm *vm, uint8_t scancode);
 bool vkbd_port(uint16_t port);
 uint8_t vkbd_in(struct vm *vm, uint16_t port);
 void vkbd_out(struct vm *vm, uint16_t port, uint8_t val);
+void keyboard_forward(struct vm *vm);       /* console type-ahead to a VM */
 
 #endif

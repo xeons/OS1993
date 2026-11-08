@@ -4,6 +4,9 @@
 #   make run        boot it in DOSBox-X (386, 16 MB, HIMEM-style XMS)
 #   make test       headless DOSBox-X run; checks the full round trip to DOS
 #   make check386   verify the kernel contains no post-386 instructions
+#   make qemu       boot FreeDOS 1.3 in QEMU with OS1993 on C: (real DOS)
+#   make qemu-test  the same, headless: run OS1993 /T and check the results
+#   make qemu-emm386  OS1993 must refuse to run with JEMM386 loaded
 #   make clean
 
 CC      := i686-elf-gcc
@@ -11,6 +14,7 @@ OBJCOPY := i686-elf-objcopy
 OBJDUMP := i686-elf-objdump
 NASM    := nasm
 DOSBOX  := dosbox-x
+QEMU    := qemu-system-i386
 
 BUILD   := build
 
@@ -30,7 +34,7 @@ KERNEL_ASM := $(wildcard kernel/*.asm)
 KERNEL_OBJ := $(patsubst kernel/%.asm,$(BUILD)/kernel/%.o,$(KERNEL_ASM)) \
               $(patsubst kernel/%.c,$(BUILD)/kernel/%.o,$(KERNEL_C))
 
-.PHONY: all run test check386 clean
+.PHONY: all run test check386 qemu qemu-test qemu-emm386 clean
 
 all: $(BUILD)/OS1993.COM $(BUILD)/VMM.BIN
 
@@ -63,6 +67,33 @@ test: all
 	SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy $(DOSBOX) $(DOSBOX_ARGS) \
 	    -nogui -time-limit 60 -c "OS1993 /T > LOADER.LOG" -c "exit"
 	@tools/check-test.sh $(BUILD)
+
+# QEMU has no 386 model; a 486 with 16 MB is the closest 1993 machine.
+QEMU_ARGS := -M isapc -cpu 486 -m 16 -drive file=$(BUILD)/freedos.img,format=raw,if=ide \
+             -serial file:$(BUILD)/qemu/SERIAL.LOG -device isa-debug-exit,iobase=0xf4,iosize=4
+QEMU_IMG  := $(BUILD)/freedos.img@@32256
+
+qemu: all
+	@mkdir -p $(BUILD)/qemu
+	tools/mkfreedos.sh normal
+	$(QEMU) $(QEMU_ARGS)
+
+qemu-test: all
+	@mkdir -p $(BUILD)/qemu && rm -f $(BUILD)/qemu/*.LOG
+	@tools/mkfreedos.sh normal autotest
+	timeout -s KILL 120 $(QEMU) $(QEMU_ARGS) -display none || true
+	@MTOOLS_SKIP_CHECK=1 mcopy -o -i $(QEMU_IMG) ::/OS1993/LOADER.LOG $(BUILD)/qemu/ 2>/dev/null || true
+	@tools/check-test.sh $(BUILD)/qemu
+
+qemu-emm386: all
+	@mkdir -p $(BUILD)/qemu && rm -f $(BUILD)/qemu/*.LOG
+	@tools/mkfreedos.sh emm386 autotest
+	timeout -s KILL 120 $(QEMU) $(QEMU_ARGS) -display none || true
+	@MTOOLS_SKIP_CHECK=1 mcopy -o -i $(QEMU_IMG) ::/OS1993/LOADER.LOG $(BUILD)/qemu/ 2>/dev/null || true
+	@tr -d '\r' < $(BUILD)/qemu/LOADER.LOG
+	@tr -d '\r' < $(BUILD)/qemu/LOADER.LOG | grep -q "virtual 8086 mode" && \
+	    echo "  PASS  loader refused to run under JEMM386" || \
+	    { echo "  FAIL  loader did not refuse JEMM386"; exit 1; }
 
 check386: $(BUILD)/vmm.elf
 	@tools/check386.sh $(OBJDUMP) $<

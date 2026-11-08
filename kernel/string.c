@@ -1,17 +1,23 @@
 #include "kernel.h"
 
+/* REP STOSD / MOVSD for the bulk (fine on a 386), bytes for the rest. */
 void *memset(void *d, int c, size_t n)
 {
-    uint8_t *p = d;
-    while (n--) *p++ = (uint8_t)c;
+    uint32_t v = (uint8_t)c * 0x01010101u;
+    void *p = d;
+    size_t dwords = n / 4, bytes = n % 4;
+    __asm__ volatile("cld\n\trep stosl\n\tmov %3, %%ecx\n\trep stosb"
+                     : "+D"(p), "+c"(dwords) : "a"(v), "r"(bytes) : "memory");
     return d;
 }
 
 void *memcpy(void *d, const void *s, size_t n)
 {
-    uint8_t *dp = d;
-    const uint8_t *sp = s;
-    while (n--) *dp++ = *sp++;
+    void *dp = d;
+    const void *sp = s;
+    size_t dwords = n / 4, bytes = n % 4;
+    __asm__ volatile("cld\n\trep movsl\n\tmov %3, %%ecx\n\trep movsb"
+                     : "+D"(dp), "+S"(sp), "+c"(dwords) : "r"(bytes) : "memory");
     return d;
 }
 

@@ -66,6 +66,15 @@ void keyboard_init(void)
     irq_install(1, keyboard_irq);
 }
 
+/* Hand keys still queued for the console to a VM that just got the focus,
+ * so type-ahead after starting a session isn't lost. */
+void keyboard_forward(struct vm *vm)
+{
+    int sc;
+    while ((sc = keyboard_read()) >= 0)
+        vkbd_put(vm, (uint8_t)sc);
+}
+
 int keyboard_read(void)
 {
     if (head == tail)
