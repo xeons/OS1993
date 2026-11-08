@@ -1,11 +1,12 @@
 #!/bin/sh
 # Build build/freedos.img: a bootable FreeDOS 1.3 hard disk with OS1993 on it.
 #
-#   tools/mkfreedos.sh [normal|emm386] [autotest]
+#   tools/mkfreedos.sh [normal|emm386] [autotest|autorun]
 #
 #   normal    HIMEMX only (what OS1993 needs)
 #   emm386    HIMEMX + JEMM386: the CPU is in V86 mode, OS1993 must refuse
 #   autotest  run "OS1993 /T" at boot and power off afterwards
+#   autorun   run "OS1993" at boot (driven by a script) and power off
 #
 # The FreeDOS 1.3 Lite USB image is downloaded once into .cache/freedos and
 # checked against the published SHA-256.
@@ -59,16 +60,21 @@ SET PATH=\FREEDOS\BIN
 SET COMSPEC=C:\FREEDOS\BIN\COMMAND.COM
 cd \OS1993
 if exist AUTOTEST goto test
+if exist AUTORUN goto run
 echo.
 echo OS1993 is in C:\OS1993. Type OS1993 to start it.
 goto end
 :test
 OS1993 /T > LOADER.LOG
 QEXIT
+:run
+OS1993
+QEXIT
 :end
 EOF
 
-[ -n "$autotest" ] && : > "$tmp/AUTOTEST"
+[ "$autotest" = autotest ] && : > "$tmp/AUTOTEST"
+[ "$autotest" = autorun ] && : > "$tmp/AUTORUN"
 # QEXIT.COM: out 0F4h, al -- QEMU's isa-debug-exit device ends the emulator
 printf '\272\364\000\260\000\356\315\040' > "$tmp/QEXIT.COM"   # mov dx,0F4h / mov al,0 / out dx,al / int 20h
 
@@ -81,5 +87,6 @@ mdel -i "$I" ::/SETUP.BAT ::/FDCONFIG.SYS ::/FDAUTO.BAT
 mcopy -i "$I" "$tmp/FDCONFIG.SYS" "$tmp/FDAUTO.BAT" ::/
 mmd   -i "$I" ::/OS1993
 mcopy -i "$I" "$build/OS1993.COM" "$build/VMM.BIN" "$tmp/QEXIT.COM" ::/OS1993/
-[ -n "$autotest" ] && mcopy -i "$I" "$tmp/AUTOTEST" ::/OS1993/
-echo "Built $img ($variant${autotest:+, autotest})"
+[ -f "$tmp/AUTOTEST" ] && mcopy -i "$I" "$tmp/AUTOTEST" ::/OS1993/
+[ -f "$tmp/AUTORUN" ] && mcopy -i "$I" "$tmp/AUTORUN" ::/OS1993/
+echo "Built $img ($variant${autotest:+, $autotest})"

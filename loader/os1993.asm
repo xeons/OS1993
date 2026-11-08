@@ -754,7 +754,10 @@ gdt_end:
 
 ; Returning from a V86 call: ARPL is invalid in real/V86 mode, so it raises
 ; #UD and the kernel's V86 monitor regains control (the Win386 technique).
+; The first ends kernel-initiated calls, the second catches returns from DOS
+; (for the DOS critical section).
 v86_stub        db  0x63, 0xC0          ; arpl ax, ax
+                db  0x63, 0xC0          ; arpl ax, ax
 
 rm_idtr         dw  0x03FF
                 dd  0

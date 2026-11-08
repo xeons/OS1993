@@ -48,7 +48,8 @@ struct bootinfo {
     uint32_t gdtr_base;    /* 48                                             */
     uint32_t xms_kb;       /* 52 size of the XMS block actually allocated    */
     /* Offsets below are within the loader's segment (loader_base >> 4).   */
-    uint16_t v86_stub_off; /* 56 ARPL breakpoint ending kernel V86 calls     */
+    uint16_t v86_stub_off; /* 56 two ARPL breakpoints: end of kernel V86
+                                 calls, and (+2) returns from DOS            */
     uint16_t v86_stack_top;/* 58 initial SP for kernel V86 calls             */
     uint16_t kpath_off;    /* 60 ASCIIZ path the kernel was loaded from      */
     uint16_t buf_off;      /* 62 conventional-memory transfer buffer ...     */

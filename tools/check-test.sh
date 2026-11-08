@@ -19,6 +19,7 @@ expect "$build/SERIAL.LOG" "memory self-test passed"        "memory manager self
 expect "$build/SERIAL.LOG" "V86 self-test passed"           "DOS calls from protected mode"
 expect "$build/SERIAL.LOG" "multi-VM self-test passed"      "concurrent VMs, private memory, focus"
 expect "$build/SERIAL.LOG" "DOS shell test passed"          "COMMAND.COM runs inside the VM"
+expect "$build/SERIAL.LOG" "DOS concurrency test passed"    "two VMs share DOS concurrently"
 expect "$build/SERIAL.LOG" "returning to DOS (exit code 0)" "kernel shut down cleanly"
 expect "$build/LOADER.LOG" "Exit code 00"                   "loader returned to DOS"
 

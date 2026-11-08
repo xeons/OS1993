@@ -7,6 +7,7 @@
 #   make qemu       boot FreeDOS 1.3 in QEMU with OS1993 on C: (real DOS)
 #   make qemu-test  the same, headless: run OS1993 /T and check the results
 #   make qemu-emm386  OS1993 must refuse to run with JEMM386 loaded
+#   make qemu-sessions  type into two concurrent DOS sessions (QEMU sendkey)
 #   make clean
 
 CC      := i686-elf-gcc
@@ -34,7 +35,7 @@ KERNEL_ASM := $(wildcard kernel/*.asm)
 KERNEL_OBJ := $(patsubst kernel/%.asm,$(BUILD)/kernel/%.o,$(KERNEL_ASM)) \
               $(patsubst kernel/%.c,$(BUILD)/kernel/%.o,$(KERNEL_C))
 
-.PHONY: all run test check386 qemu qemu-test qemu-emm386 clean
+.PHONY: all run test check386 qemu qemu-test qemu-emm386 qemu-sessions clean
 
 all: $(BUILD)/OS1993.COM $(BUILD)/VMM.BIN
 
@@ -94,6 +95,9 @@ qemu-emm386: all
 	@tr -d '\r' < $(BUILD)/qemu/LOADER.LOG | grep -q "virtual 8086 mode" && \
 	    echo "  PASS  loader refused to run under JEMM386" || \
 	    { echo "  FAIL  loader did not refuse JEMM386"; exit 1; }
+
+qemu-sessions: all
+	@tools/qemu-sessions-test.py
 
 check386: $(BUILD)/vmm.elf
 	@tools/check386.sh $(OBJDUMP) $<

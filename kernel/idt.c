@@ -59,12 +59,16 @@ void irq_uninstall(unsigned irq)
 void interrupt_dispatch(struct regs *r)
 {
     bool from_v86 = r->eflags & EFLAGS_VM;
+    if (from_v86)
+        vm_check("on entry from V86");
 
     if (r->int_no < IRQ_BASE) {
-        if (from_v86)
+        if (from_v86) {
             v86_exception(r);           /* the V86 monitor */
-        else
+            vm_check("returning to V86 after a trap");
+        } else {
             panic_exception(r);
+        }
         return;
     }
 
@@ -80,5 +84,7 @@ void interrupt_dispatch(struct regs *r)
         if (from_v86)
             v86_deliver(r);
         sched_preempt();            /* after the EOI: may switch threads */
+        if (from_v86)
+            vm_check("returning to V86 after an IRQ");
     }
 }

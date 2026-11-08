@@ -82,16 +82,22 @@ static void set_vm_flags(struct vm *vm, struct regs *r, uint32_t f)
     r->eflags = (r->eflags & ~mask) | (f & mask) | EFLAGS_IF | EFLAGS_VM;
 }
 
-/* Simulate INT n: push FLAGS/CS/IP, clear IF and TF, jump via the IVT. */
-static void reflect_int(struct vm *vm, struct regs *r, uint8_t n)
+/* Simulate INT n: push FLAGS and a return address, clear IF and TF, jump
+ * via the IVT. */
+static void reflect_int_to(struct vm *vm, struct regs *r, uint8_t n, uint16_t ret_cs, uint16_t ret_ip)
 {
     push16(r, (uint16_t)vm_flags(vm, r));
-    push16(r, (uint16_t)r->cs);
-    push16(r, (uint16_t)r->eip);
+    push16(r, ret_cs);
+    push16(r, ret_ip);
     vm->vif = false;
     r->eflags &= ~EFLAGS_TF;
     r->eip = LOWMEM16(n * 4u);          /* this VM's IVT (PDE 0 is ours) */
     r->cs  = LOWMEM16(n * 4u + 2);
+}
+
+static void reflect_int(struct vm *vm, struct regs *r, uint8_t n)
+{
+    reflect_int_to(vm, r, n, (uint16_t)r->cs, (uint16_t)r->eip);
 }
 
 void v86_deliver(struct regs *r)
@@ -115,7 +121,17 @@ static void crash(struct vm *vm, const struct regs *r, const char *why)
     ksnprintf(vm->error, sizeof vm->error, "%s at %04X:%04X (%02X %02X %02X %02X)",
               why, r->cs & 0xFFFF, r->eip & 0xFFFF, code[0], code[1], code[2], code[3]);
     klog("V86: VM %d stopped: %s\n", vm->id, vm->error);
+    klog("V86:   EAX=%08X EBX=%08X ECX=%08X EDX=%08X ESI=%08X EDI=%08X EBP=%08X\n",
+         r->eax, r->ebx, r->ecx, r->edx, r->esi, r->edi, r->ebp);
+    klog("V86:   SS:SP=%04X:%04X DS=%04X ES=%04X FL=%08X ERR=%X CR2=%08X CR3=%08X PDE0=%08X\n",
+         r->user_ss & 0xFFFF, r->user_esp & 0xFFFF, r->v86_ds & 0xFFFF, r->v86_es & 0xFFFF,
+         r->eflags, r->err_code, read_cr2(), read_cr3(),
+         ((volatile uint32_t *)PD_WINDOW)[0]);
+    klog("V86:   VM %d pt0=%08X, DOS depth %d, idle %d\n",
+         vm->id, vm->pt0_phys, vm->dos_depth, vm->int28_depth);
     vpic_reset_in_service(&vm->pic);
+    vm->dos_depth = 0;
+    vm->int28_depth = 0;
     v86_leave(-1, vm->kernel_esp);
 }
 
@@ -202,10 +218,22 @@ static void emulate(struct vm *vm, struct regs *r)
     case 0x9D:                                  /* POPF / POPFD */
         set_vm_flags(vm, r, o32 ? pop32(r) : pop16(r));
         break;
-    case 0xCD:                                  /* INT n */
-        r->eip = (ip + 1) & 0xFFFF;
-        reflect_int(vm, r, *lin(r->cs, ip));
-        return;
+    case 0xCD: {                                /* INT n */
+        uint8_t n = *lin(r->cs, ip);
+        uint16_t next = (uint16_t)(ip + 1);
+        switch (dosmgr_int(vm, r, n, next)) {
+        case DOSMGR_DONE:
+            return;
+        case DOSMGR_HOOK:                       /* DOS returns to our breakpoint */
+            r->eip = next;
+            reflect_int_to(vm, r, n, g.seg, (uint16_t)(g.stub_off + 2));
+            return;
+        default:
+            r->eip = next;
+            reflect_int(vm, r, n);
+            return;
+        }
+    }
     case 0xCC:                                  /* INT 3 */
         r->eip = ip;
         reflect_int(vm, r, 3);
@@ -249,6 +277,17 @@ static void emulate(struct vm *vm, struct regs *r)
     r->eip = ip & 0xFFFF;
 }
 
+/* A CPU exception in V86 code goes to the VM's own handler, as on a real
+ * 8086; log it, since it usually means something went badly wrong. */
+static void log_reflected(struct vm *vm, const struct regs *r)
+{
+    const uint8_t *c = lin(r->cs, r->eip);
+    klog("V86: VM %d exception %02X at %04X:%04X (%02X %02X %02X %02X) SS:SP=%04X:%04X, "
+         "DOS depth %d, idle %d -- reflected\n",
+         vm->id, r->int_no, r->cs & 0xFFFF, r->eip & 0xFFFF, c[0], c[1], c[2], c[3],
+         r->user_ss & 0xFFFF, r->user_esp & 0xFFFF, vm->dos_depth, vm->int28_depth);
+}
+
 void v86_exception(struct regs *r)
 {
     struct vm *vm = vm_current();
@@ -262,9 +301,17 @@ void v86_exception(struct regs *r)
     case 6:                                     /* #UD */
         if ((r->cs & 0xFFFF) == g.seg && (r->eip & 0xFFFF) == g.stub_off)
             complete(vm, r);
+        if ((r->cs & 0xFFFF) == g.seg && (r->eip & 0xFFFF) == (uint16_t)(g.stub_off + 2)) {
+            if (!dosmgr_return(vm, r))          /* a DOS call returned */
+                crash(vm, r, "unexpected return from DOS");
+            break;
+        }
+        log_reflected(vm, r);
         reflect_int(vm, r, 6);
         break;
     case 0: case 1: case 3: case 4: case 5: case 7:
+        if (r->int_no != 1 && r->int_no != 3)
+            log_reflected(vm, r);
         reflect_int(vm, r, (uint8_t)r->int_no); /* as on a real-mode CPU */
         break;
     default: {
@@ -341,12 +388,16 @@ static int run(struct v86_regs *r, uint16_t cs, uint16_t ip, unsigned frame_word
 
 int v86_int(uint8_t vec, struct v86_regs *r)
 {
+    struct vm *vm = vm_current();
+    int depth = dosmgr_kernel_enter(vm, vec, (uint8_t)(r->eax >> 8));
     uint16_t *sp = v86_ptr(g.seg, (uint16_t)(g.stack_top - 6));
     sp[0] = g.stub_off;                         /* IRET frame -> breakpoint */
     sp[1] = g.seg;
     sp[2] = 0x0202;                             /* IF=1 once the handler IRETs */
-    return run(r, LOWMEM16(vec * 4u + 2), LOWMEM16(vec * 4u),   /* IVT: CS, IP */
-               3, false);                       /* INT clears IF */
+    int rc = run(r, LOWMEM16(vec * 4u + 2), LOWMEM16(vec * 4u),   /* IVT: CS, IP */
+                 3, false);                     /* INT clears IF */
+    dosmgr_kernel_leave(vm, depth);
+    return rc;
 }
 
 int v86_call_far(uint16_t seg, uint16_t off, struct v86_regs *r)

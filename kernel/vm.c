@@ -12,30 +12,30 @@
 #include "vm.h"
 
 #define PTE_V86   (PTE_P | PTE_W | PTE_U)
-#define VIDEO_BYTES (VM_VIDEO_PAGES * PAGE_SIZE)
 
 static struct vm vms[VM_MAX];
 struct vm *const system_vm = &vms[0];
 
-static bool     ready;
+static bool     ready;                      /* snapshot taken: VMs can be created */
+static bool     irq_ready;                  /* System VM exists: route IRQs */
 static struct vm *focus;                    /* NULL = VMM console */
-static uint32_t snapshot[VM_PRIV_PAGES];    /* boot-time copy of private pages */
-static uint32_t pt0_template[1024];         /* System VM's PT 0 at boot */
 static uint8_t  dos_mask1, dos_mask2;
 
-static uint32_t priv_page_index(uint32_t page)
-{
-    if (page < VM_LOW_PAGES)
-        return page;
-    if (page >= VM_HMA_PAGE && page < VM_HMA_PAGE + VM_HMA_PAGES)
-        return VM_LOW_PAGES + (page - VM_HMA_PAGE);
-    return (uint32_t)-1;
-}
+/* Private pages: [priv_first, VM_LOW_PAGES) and the BIOS RAM pages.
+ * priv_page[i] is the page number of private slot i; priv_slot[page] the
+ * reverse (-1 for shared pages). */
+static unsigned priv_first, priv_count;
+static uint16_t priv_page[VM_PRIV_MAX];
+static int16_t  priv_slot[VM_V86_PAGES];
+static uint32_t snapshot[VM_PRIV_MAX];      /* boot-time copy of private pages */
+static uint32_t pt0_template[1024];         /* System VM's PT 0 at boot */
 
-static uint32_t priv_page_number(uint32_t i)
-{
-    return i < VM_LOW_PAGES ? i : VM_HMA_PAGE + (i - VM_LOW_PAGES);
-}
+/* Instance data: shared addresses with per-VM contents */
+static struct { uint32_t lin, len; } inst[VM_INST_MAX];
+static unsigned ninst;
+static uint32_t inst_total;
+static uint8_t *inst_snapshot;
+static struct vm *inst_owner;               /* whose data is live in memory */
 
 static volatile uint32_t *vm_pt(struct vm *vm)
 {
@@ -79,34 +79,136 @@ static void blank_video(struct vm *vm)
     }
 }
 
+/* ---- instance data ----------------------------------------------------- */
+
+/* Register shared memory whose contents each VM keeps its own copy of.
+ * Overlapping or touching regions are merged. Returns false (and changes
+ * nothing) for regions that aren't in shared memory. */
+bool vm_add_instance(uint32_t lin, uint32_t len)
+{
+    if (ready)
+        panic("vm_add_instance after the VM snapshot.");
+    if (!len || lin + len > KLOW_SIZE)
+        return false;
+    for (uint32_t p = lin >> PAGE_SHIFT; p <= (lin + len - 1) >> PAGE_SHIFT; p++)
+        if (priv_slot[p] >= 0)
+            return false;
+
+    uint32_t end = lin + len;
+    for (unsigned i = 0; i < ninst; ) {          /* absorb overlapping regions */
+        uint32_t s = inst[i].lin, e = s + inst[i].len;
+        if (lin <= e && s <= end) {
+            if (s < lin) lin = s;
+            if (e > end) end = e;
+            inst_total -= inst[i].len;
+            inst[i] = inst[--ninst];
+            i = 0;
+            continue;
+        }
+        i++;
+    }
+    if (ninst == VM_INST_MAX)
+        panic("Too many VM instance data regions.");
+    inst[ninst].lin = lin;
+    inst[ninst].len = end - lin;
+    inst_total += end - lin;
+    ninst++;
+    return true;
+}
+
+static void inst_copy(uint8_t *buf, bool save)
+{
+    uint32_t off = 0;
+    for (unsigned i = 0; i < ninst; i++) {
+        uint8_t *live = KLOW(inst[i].lin);
+        if (save) memcpy(buf + off, live, inst[i].len);
+        else      memcpy(live, buf + off, inst[i].len);
+        off += inst[i].len;
+    }
+}
+
+static void inst_swap_to(struct vm *vm)
+{
+    if (inst_owner == vm || !ready)
+        return;
+    inst_copy(inst_owner->inst, true);
+    inst_copy(vm->inst, false);
+    inst_owner = vm;
+}
+
+/* Kernel view of a VM's instance data, or NULL if lin isn't instanced. */
+static uint8_t *inst_ptr(struct vm *vm, uint32_t lin)
+{
+    if (!ready || vm == inst_owner)
+        return NULL;
+    uint32_t off = 0;
+    for (unsigned i = 0; i < ninst; i++) {
+        if (lin >= inst[i].lin && lin < inst[i].lin + inst[i].len)
+            return vm->inst + off + (lin - inst[i].lin);
+        off += inst[i].len;
+    }
+    return NULL;
+}
+
+/* ---- the System VM ------------------------------------------------------ */
+
 void vm_system_init(const struct bootinfo *bi)
 {
     dos_mask1 = bi->pic1_mask;
     dos_mask2 = bi->pic2_mask;
+    priv_first = bi->loader_base >> PAGE_SHIFT;
+    for (unsigned p = 0; p < VM_V86_PAGES; p++)
+        priv_slot[p] = -1;
+    priv_count = 0;
+    for (unsigned p = priv_first; p < VM_LOW_PAGES; p++)
+        priv_page[priv_count++] = (uint16_t)p;
+    for (unsigned p = VM_BIOS_RAM_PAGE; p < VM_BIOS_RAM_PAGE + VM_BIOS_RAM_PAGES; p++)
+        priv_page[priv_count++] = (uint16_t)p;
+    for (unsigned i = 0; i < priv_count; i++)
+        priv_slot[priv_page[i]] = (int16_t)i;
 
     struct vm *vm = system_vm;
     vm->id = 0;
     vm->state = VM_RUNNING;
     memcpy(vm->name, "System VM", 10);
     vm->pt0_phys = ((volatile uint32_t *)PD_WINDOW)[0] & PAGE_MASK;
-    for (unsigned i = 0; i < VM_PRIV_PAGES; i++)
-        vm->priv[i] = priv_page_number(i) * PAGE_SIZE;     /* identity */
+    for (unsigned i = 0; i < priv_count; i++)
+        vm->priv[i] = (uint32_t)priv_page[i] * PAGE_SIZE;   /* identity */
     vpic_init(&vm->pic, dos_mask1, dos_mask2);
+    inst_owner = vm;
+    focus = NULL;
+    irq_ready = true;
 
-    /* Template page table and boot snapshot for new VMs */
+    vm_add_instance(0x000, 0x600);          /* IVT, BIOS data, DOS comm area */
+}
+
+void vm_finish_init(void)
+{
+    struct vm *vm = system_vm;
+
     memcpy(pt0_template, (const void *)vm_pt(vm), sizeof pt0_template);
-    if (!alloc_frames(snapshot, VM_PRIV_PAGES) || !alloc_frames(vm->video, VM_VIDEO_PAGES))
+    if (!alloc_frames(snapshot, priv_count) || !alloc_frames(vm->video, VM_VIDEO_PAGES))
         panic("Not enough memory for the VM snapshot.");
-    for (unsigned i = 0; i < VM_PRIV_PAGES; i++)
-        memcpy(phys_to_virt(snapshot[i]), KLOW(priv_page_number(i) * PAGE_SIZE), PAGE_SIZE);
+    for (unsigned i = 0; i < priv_count; i++)
+        memcpy(phys_to_virt(snapshot[i]), KLOW((uint32_t)priv_page[i] * PAGE_SIZE), PAGE_SIZE);
+
+    vm->inst = kmalloc(inst_total);
+    inst_snapshot = kmalloc(inst_total);
+    if (!vm->inst || !inst_snapshot)
+        panic("Not enough memory for VM instance data.");
+    inst_copy(inst_snapshot, true);
 
     /* The console has the screen; the System VM's own video goes to a buffer */
     blank_video(vm);
     map_video(vm, false);
     tlb_flush();
-    focus = NULL;
     ready = true;
+    klog("VMM: VMs share memory below %05X; %u private pages (incl. BIOS RAM at %05X), "
+         "%u bytes instance data\n",
+         priv_first * PAGE_SIZE, priv_count, VM_BIOS_RAM_PAGE * PAGE_SIZE, inst_total);
 }
+
+/* ---- VM lifetime ------------------------------------------------------- */
 
 static void vm_thread_main(void *arg)
 {
@@ -121,8 +223,20 @@ static void vm_thread_main(void *arg)
     irq_restore(f);
 }
 
+static void vm_free_resources(struct vm *vm)
+{
+    free_frames(vm->priv, priv_count);
+    free_frames(vm->video, VM_VIDEO_PAGES);
+    if (vm->pt0_phys) pmm_free(vm->pt0_phys);
+    kfree(vm->inst);
+    vm->pt0_phys = 0;
+    vm->inst = NULL;
+}
+
 struct vm *vm_create(const char *name, void (*body)(struct vm *), void *arg)
 {
+    if (!ready)
+        return NULL;
     struct vm *vm = NULL;
     for (int i = 1; i < VM_MAX; i++)
         if (vms[i].state == VM_FREE) { vm = &vms[i]; break; }
@@ -135,28 +249,24 @@ struct vm *vm_create(const char *name, void (*body)(struct vm *), void *arg)
     memcpy(vm->name, name, n < sizeof vm->name ? n + 1 : sizeof vm->name);
     vm->name[sizeof vm->name - 1] = '\0';
 
-    if (!alloc_frames(vm->priv, VM_PRIV_PAGES))
-        return NULL;
-    if (!alloc_frames(vm->video, VM_VIDEO_PAGES)) {
-        free_frames(vm->priv, VM_PRIV_PAGES);
-        return NULL;
-    }
     vm->pt0_phys = pmm_alloc();
-    if (!vm->pt0_phys) {
-        free_frames(vm->priv, VM_PRIV_PAGES);
-        free_frames(vm->video, VM_VIDEO_PAGES);
+    vm->inst = kmalloc(inst_total);
+    if (!vm->pt0_phys || !vm->inst ||
+        !alloc_frames(vm->priv, priv_count) || !alloc_frames(vm->video, VM_VIDEO_PAGES)) {
+        vm_free_resources(vm);
         return NULL;
     }
 
-    for (unsigned i = 0; i < VM_PRIV_PAGES; i++)
+    for (unsigned i = 0; i < priv_count; i++)
         memcpy(phys_to_virt(vm->priv[i]), phys_to_virt(snapshot[i]), PAGE_SIZE);
+    memcpy(vm->inst, inst_snapshot, inst_total);
     blank_video(vm);
 
     volatile uint32_t *pt = vm_pt(vm);
     for (unsigned i = 0; i < 1024; i++)
         pt[i] = pt0_template[i];
-    for (unsigned i = 0; i < VM_PRIV_PAGES; i++)
-        pt[priv_page_number(i)] = vm->priv[i] | PTE_V86;
+    for (unsigned i = 0; i < priv_count; i++)
+        pt[priv_page[i]] = vm->priv[i] | PTE_V86;
     map_video(vm, false);
 
     vpic_init(&vm->pic, dos_mask1, dos_mask2);
@@ -164,9 +274,7 @@ struct vm *vm_create(const char *name, void (*body)(struct vm *), void *arg)
     vm->arg = arg;
     vm->thread = thread_create(vm->name, vm_thread_main, vm, vm);
     if (!vm->thread) {
-        free_frames(vm->priv, VM_PRIV_PAGES);
-        free_frames(vm->video, VM_VIDEO_PAGES);
-        pmm_free(vm->pt0_phys);
+        vm_free_resources(vm);
         return NULL;
     }
     vm->state = VM_READY;
@@ -185,9 +293,11 @@ void vm_reap(void)
         struct vm *vm = &vms[i];
         if (vm->state != VM_FINISHED || !thread_reap(vm->thread))
             continue;
-        free_frames(vm->priv, VM_PRIV_PAGES);
-        free_frames(vm->video, VM_VIDEO_PAGES);
-        pmm_free(vm->pt0_phys);
+        uint32_t f = irq_save();
+        if (inst_owner == vm)               /* never leave a dead VM's data live */
+            inst_swap_to(vm_current());
+        irq_restore(f);
+        vm_free_resources(vm);
         memset(vm, 0, sizeof *vm);
     }
 }
@@ -220,16 +330,20 @@ void vm_switch_to(struct vm *vm)
         pd[0] = vm->pt0_phys | PTE_V86;
         tlb_flush();
     }
+    inst_swap_to(vm);
     if (vm->active)
         kernel_tss.esp0 = vm->kernel_esp;
 }
 
 void *vm_ptr(struct vm *vm, uint32_t linear)
 {
+    uint8_t *ip = inst_ptr(vm, linear);
+    if (ip)
+        return ip;
+
     uint32_t page = linear >> PAGE_SHIFT, frame;
-    uint32_t idx = priv_page_index(page);
-    if (idx != (uint32_t)-1)
-        frame = vm->priv[idx];
+    if (page < VM_V86_PAGES && priv_slot[page] >= 0)
+        frame = vm->priv[priv_slot[page]];
     else if (page >= VM_VIDEO_PAGE && page < VM_VIDEO_PAGE + VM_VIDEO_PAGES && vm != focus)
         frame = vm->video[page - VM_VIDEO_PAGE];
     else
@@ -269,6 +383,7 @@ void vm_set_focus(struct vm *target)
         con_detach();                               /* console to its shadow */
     }
 
+    focus = target;
     if (target) {                                   /* new VM onto the screen */
         for (unsigned i = 0; i < VM_VIDEO_PAGES; i++)
             memcpy(real + i * PAGE_SIZE, phys_to_virt(target->video[i]), PAGE_SIZE);
@@ -278,7 +393,7 @@ void vm_set_focus(struct vm *target)
         con_attach();
     }
     tlb_flush();
-    focus = target;
+    klog("VMM: focus -> %s\n", target ? target->name : "console");
     irq_restore(f);
 }
 
@@ -294,6 +409,23 @@ void vm_focus_next(void)
 
 struct vm *vm_focus(void) { return focus; }
 
+/* The machine state V86 code runs in must belong to the VM of the current
+ * thread. Checked on every trap/IRQ out of V86 mode and before returning. */
+void vm_check(const char *where)
+{
+    struct vm *vm = vm_current();
+    uint32_t pde0 = ((volatile uint32_t *)PD_WINDOW)[0] & PAGE_MASK;
+    bool bad_inst = ready && inst_owner != vm;
+    bool bad_pt   = pde0 != vm->pt0_phys;
+    bool bad_esp0 = vm->active && kernel_tss.esp0 != vm->kernel_esp;
+    if (bad_inst || bad_pt || bad_esp0)
+        panic("VM state mismatch %s: thread %s, VM %d; instance owner VM %d, "
+              "PDE0 %08X (VM %08X), ESP0 %08X (VM %08X)",
+              where, current ? current->name : "?", vm->id,
+              inst_owner ? inst_owner->id : -1, pde0, vm->pt0_phys,
+              kernel_tss.esp0, vm->kernel_esp);
+}
+
 /* ---- interrupt routing ------------------------------------------------- */
 
 void vm_raise_irq(struct vm *vm, unsigned irq)
@@ -306,17 +438,18 @@ void vm_raise_irq(struct vm *vm, unsigned irq)
  * drivers for them. */
 void vm_hw_irq(unsigned irq)
 {
-    if (!ready)
+    if (!irq_ready)
         return;
     vpic_hw_irq(&system_vm->pic, irq);
     thread_wake(system_vm->thread);
 }
 
 /* Share a timer tick with every VM. A VM whose previous tick is still
- * undelivered gets its BIOS tick count advanced directly. */
+ * undelivered gets its BIOS tick count advanced directly. Waking every VM
+ * also makes VMs waiting for DOS or an IRQ re-check. */
 bool vm_timer_tick(void)
 {
-    if (!ready)
+    if (!irq_ready)
         return false;
     for (int i = 0; i < VM_MAX; i++) {
         struct vm *vm = &vms[i];
@@ -340,6 +473,6 @@ void vm_restore_dos(void)
         return;
     vm_set_focus(NULL);
     map_video(system_vm, true);                     /* identity again */
-    vm_switch_to(system_vm);
+    vm_switch_to(system_vm);                        /* its PT 0 and instance data */
     tlb_flush();
 }

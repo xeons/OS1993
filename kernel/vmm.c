@@ -131,12 +131,16 @@ void kmain(const struct bootinfo *bi)
     v86_init(bi);
     sched_init(system_vm);
     ok("V86 monitor, System VM and scheduler");
+    dosmgr_init();
+    vm_finish_init();
+    dosmgr_started();
+    ok("DOS shared between VMs (DOSMGR)");
 
     kprintf("\n");
     kprintf("  Arena           %6u KB  physical %p, mapped at %p\n",
             bi->arena_size / 1024, bi->arena_phys, bi->arena_virt);
     kprintf("  Free frames     %6u KB  (each DOS session needs about %u KB)\n",
-            pmm_free_pages() * 4, (VM_PRIV_PAGES + VM_VIDEO_PAGES + 1) * 4);
+            pmm_free_pages() * 4, (VM_LOW_PAGES - (bi->loader_base >> 12) + VM_BIOS_RAM_PAGES + VM_VIDEO_PAGES + 1) * 4);
     kprintf("\n");
     v86_selftest(bi);
 
@@ -145,6 +149,7 @@ void kmain(const struct bootinfo *bi)
     if (test) {
         vm_selftest();
         dos_shell_selftest();
+        dos_concurrency_selftest();
         kprintf("  Test mode: returning to DOS automatically.\n");
         limit = timer_ticks() + TIMER_HZ_X10 / 10;      /* ~1 s */
     }
@@ -173,5 +178,6 @@ void kmain(const struct bootinfo *bi)
     }
 
     klog("VMM: %u timer ticks seen\n", timer_ticks());
+    dosmgr_shutdown();
     kernel_shutdown(0);
 }

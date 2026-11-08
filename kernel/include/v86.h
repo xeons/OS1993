@@ -67,6 +67,7 @@ void v86_deliver(struct regs *r);
 int  dos_exec_shell(const char *args, uint8_t *exit_code);
 void dos_session_body(struct vm *vm);   /* interactive COMMAND.COM */
 void dos_shell_selftest(void);
+void dos_concurrency_selftest(void);
 
 /* vmtest.c */
 void vm_selftest(void);

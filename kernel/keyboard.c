@@ -119,6 +119,7 @@ void vkbd_put(struct vm *vm, uint8_t sc)
         k->q[k->head] = sc;
         k->head = next;
     }
+    vm->keys++;
     if (!k->full)
         latch_next(vm);
     irq_restore(f);
