@@ -5,10 +5,11 @@ README.md for what already works.
 
 ## GUI and UI library
 
-- [ ] **Menus**: a per-window menu bar (Windows 95 style), drop-down
-      menus, keyboard access (Alt, mnemonics), check marks and separators.
-- [ ] **System menu**: the title bar's system box currently only closes on
-      double-click; it needs Restore / Move / Size / Minimize / Maximize / Close.
+- [ ] Menus: keyboard accelerator tables (`TranslateAccelerator`); the
+      accelerator text in menu items is only a label so far. Owner-drawn
+      items, bitmaps in menus, `WM_MENUSELECT` for status-bar help,
+      `InsertMenu`/`DeleteMenu`/`ModifyMenu`, a menu bar that wraps to a
+      second line when the window is narrow.
 - [ ] More controls: combo box (drop-down list), tab control, spin box,
       multi-line edit with scrolling, tree view, tooltips.
 - [ ] Standard dialogs: message box (OK / Cancel / Yes / No), file open/save.
@@ -16,7 +17,7 @@ README.md for what already works.
       scrolling done properly.
 - [ ] Mouse cursor shapes: resize arrows over borders, I-beam over edits,
       wait cursor.
-- [ ] Keyboard: accelerators, Alt+Space for the system menu, Alt+Esc,
+- [ ] Keyboard: accelerators, Alt+Esc,
       arrow keys between radio buttons in a group.
 - [ ] Proportional font for window text (the VGA 8x16 font is all there is).
 - [ ] Desktop: icons, wallpaper pattern, and a shell with a **taskbar**

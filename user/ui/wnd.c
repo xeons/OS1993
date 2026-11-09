@@ -81,11 +81,13 @@ bool RegisterClass(const WNDCLASS *wc)
     return true;
 }
 
-static void builtin(const char *name, WNDPROC proc, bool transparent)
+static struct wclass *builtin(const char *name, WNDPROC proc, bool transparent)
 {
     WNDCLASS wc = { .name = name, .proc = proc, .background = C_FACE };
     RegisterClass(&wc);
-    find_class(name)->transparent = transparent;
+    struct wclass *c = find_class(name);
+    c->transparent = transparent;
+    return c;
 }
 
 void ui_init_classes(void)
@@ -97,6 +99,7 @@ void ui_init_classes(void)
     builtin(WC_SCROLLBAR, scrollbar_proc, false);
     builtin(WC_TRACKBAR, trackbar_proc, false);
     builtin(WC_PROGRESS, progress_proc, true);
+    builtin("#MENU", menu_popup_proc, false)->noactivate = true;   /* menus never activate */
 }
 
 /* ---- geometry ----------------------------------------------------------- */
@@ -207,6 +210,7 @@ HWND CreateWindow(const char *cls, const char *text, unsigned style,
     n->x = x; n->y = y; n->w = w; n->h = h;
     n->visible = (style & WS_VISIBLE) != 0;
     n->enabled = !(style & WS_DISABLED);
+    n->bar_sel = -1;
     if (text)
         strncpy0(n->text, text, TEXT_MAX);
     n->parent = (style & WS_CHILD) ? p : NULL;
@@ -225,7 +229,7 @@ HWND CreateWindow(const char *cls, const char *text, unsigned style,
     }
     if (n->visible) {
         ui_invalidate_wnd(n);
-        if (!n->parent)
+        if (!n->parent && !c->noactivate)
             wnd_activate(n);
     }
     return n;
@@ -241,13 +245,14 @@ bool DestroyWindow(HWND h)
         return false;
     if (w->visible)
         ui_invalidate_wnd(w);
-    if (!w->parent)
+    if (frame_has(w))
         DebugLog("closed %s", w->text);
     SendMessage(w, WM_DESTROY, 0, 0);
     while (w->first)
         DestroyWindow(w->first);
     kill_timers(w);
     drop_messages(w);
+    menu_window_gone(w);
     if (focus == w) focus = NULL;
     if (capture == w) capture = NULL;
     struct wnd *t = wnd_top(w);
@@ -326,7 +331,7 @@ bool ShowWindow(HWND h, int cmd)
     default:
         w->visible = true;
         ui_invalidate_wnd(w);
-        if (!w->parent)
+        if (!w->parent && !w->cls->noactivate)
             wnd_activate(w);
     }
     return was;
@@ -455,7 +460,7 @@ static struct wnd *first_tabstop(struct wnd *w)
 
 void wnd_activate(struct wnd *t)
 {
-    if (!t || t->parent || !t->visible)
+    if (!t || t->parent || !t->visible || t->cls->noactivate)
         return;
     wnd_raise(t);
     if (active == t)
@@ -716,11 +721,38 @@ LRESULT DefWindowProc(HWND h, unsigned msg, WPARAM wp, LPARAM lp)
         case SC_MINIMIZE: frame_minimize(w); break;
         case SC_MAXIMIZE: frame_maximize(w); break;
         case SC_RESTORE:  frame_restore(w); break;
+        case SC_MOVE:     ui_keyboard_track(w, false); break;
+        case SC_SIZE:     ui_keyboard_track(w, true); break;
+        case SC_KEYMENU:  menu_keymenu(w, (int)lp); break;
         }
         return 0;
-    case WM_SYSKEYDOWN:
-        if (wp == VK_F4)
-            SendMessage(wnd_top(w), WM_SYSCOMMAND, SC_CLOSE, 0);
+    case WM_SYSKEYDOWN: {                      /* Alt+key, F10 */
+        struct wnd *t = wnd_top(w);
+        bool alt = (lp & (1 << 29)) != 0;
+        if (wp == VK_F4 && alt)
+            SendMessage(t, WM_SYSCOMMAND, SC_CLOSE, 0);
+        else if (wp == VK_F10 && !alt)
+            SendMessage(t, WM_SYSCOMMAND, SC_KEYMENU, 0);
+        else if (alt && wp == VK_SPACE)
+            SendMessage(t, WM_SYSCOMMAND, SC_KEYMENU, ' ');
+        else if (alt && ((wp >= 'A' && wp <= 'Z') || (wp >= '0' && wp <= '9')))
+            SendMessage(t, WM_SYSCOMMAND, SC_KEYMENU, (LPARAM)kbd_char((int)wp, false));
+        return 0;
+    }
+    case WM_SYSKEYUP:                          /* Alt pressed and released alone */
+        if (wp == VK_MENU && (lp & (1 << 26)))
+            SendMessage(wnd_top(w), WM_SYSCOMMAND, SC_KEYMENU, 0);
+        return 0;
+    case WM_RBUTTONUP: {
+        int x, y;
+        wnd_client_screen(w, &x, &y);
+        SendMessage(h, WM_CONTEXTMENU, (WPARAM)h,
+                    MAKELPARAM(x + GET_X_LPARAM(lp), y + GET_Y_LPARAM(lp)));
+        return 0;
+    }
+    case WM_CONTEXTMENU:                       /* unhandled: ask the parent */
+        if (w->parent)
+            return SendMessage(w->parent, WM_CONTEXTMENU, wp, lp);
         return 0;
     case WM_PAINT: {
         PAINTSTRUCT ps;

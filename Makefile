@@ -12,6 +12,7 @@
 #   make qemu-vga   check the VGA driver with QEMU screendumps
 #   make qemu-wm    drive the window manager and every control (mouse, keys)
 #   make qemu-absmouse  absolute pointer via QEMU's VMware port (exact position)
+#   make qemu-menu  menu bar, system menu and context menus (mouse, keys)
 #   make clean
 
 CC      := i686-elf-gcc
@@ -48,7 +49,7 @@ UI_BASE     := $(shell $(MKDEF) user/ui/ui.def base)
 
 KRNL_OBJ := $(U)/krnl/header.o $(U)/krnl/krnl.o $(U)/gen/krnl_exports.o $(U)/lib/lib.o
 GFX_OBJ := $(U)/gfx/header.o $(U)/gfx/gfx.o $(U)/gen/gfx_exports.o $(U)/lib/lib.o
-UI_SRC  := wnd input frame paint dialog button static edit listbox scroll trackbar kbd theme
+UI_SRC  := wnd input frame paint menu dialog button static edit listbox scroll trackbar kbd theme
 UI_OBJ  := $(U)/ui/header.o $(patsubst %,$(U)/ui/%.o,$(UI_SRC)) \
            $(U)/gen/ui_exports.o $(U)/gen/gfx_imports.o $(U)/gen/krnl_imports.o $(U)/lib/lib.o
 GUI_OBJ := $(U)/apps/header.o $(U)/lib/crt0.o $(U)/apps/gui.o $(U)/gen/ui_imports.o \
@@ -61,7 +62,7 @@ KERNEL_ASM := $(wildcard kernel/*.asm)
 KERNEL_OBJ := $(patsubst kernel/%.asm,$(BUILD)/kernel/%.o,$(KERNEL_ASM)) \
               $(patsubst kernel/%.c,$(BUILD)/kernel/%.o,$(KERNEL_C))
 
-.PHONY: all run test check386 qemu qemu-test qemu-emm386 qemu-sessions qemu-vga qemu-wm qemu-absmouse clean
+.PHONY: all run test check386 qemu qemu-test qemu-emm386 qemu-sessions qemu-vga qemu-wm qemu-absmouse qemu-menu clean
 
 all: $(BUILD)/OS1993.COM $(BUILD)/VMM.BIN $(MODULES)
 
@@ -186,6 +187,9 @@ qemu-wm: all
 
 qemu-absmouse: all
 	@tools/qemu-absmouse-test.py
+
+qemu-menu: all
+	@tools/qemu-menu-test.py
 
 check386: $(BUILD)/vmm.elf $(U)/KERNEL.elf $(U)/GFX.elf $(U)/UI.elf $(U)/GUI.elf
 	@for f in $^; do tools/check386.sh $(OBJDUMP) $$f || exit 1; done

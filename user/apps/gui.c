@@ -65,7 +65,21 @@ static void open_about(void)
 
 /* ---- Programs ---------------------------------------------------------- */
 
-enum { ID_DOS = 10, ID_ABOUT, ID_EXIT };
+enum { ID_DOS = 10, ID_ABOUT, ID_EXIT, ID_CONTENTS };
+
+static HMENU programs_menu(void)
+{
+    HMENU file = CreatePopupMenu(), help = CreatePopupMenu(), bar = CreateMenu();
+    AppendMenu(file, MF_STRING, ID_DOS, "&MS-DOS Prompt");
+    AppendMenu(file, MF_STRING, ID_ABOUT, "&About OS1993...");
+    AppendMenu(file, MF_SEPARATOR, 0, NULL);
+    AppendMenu(file, MF_STRING, ID_EXIT, "E&xit to VMM");
+    AppendMenu(help, MF_STRING, ID_CONTENTS, "&Contents\tF1");
+    AppendMenu(help, MF_STRING, ID_ABOUT, "&About OS1993");
+    AppendMenu(bar, MF_POPUP, (uintptr_t)file, "&File");
+    AppendMenu(bar, MF_POPUP, (uintptr_t)help, "&Help");
+    return bar;
+}
 
 static LRESULT programs_proc(HWND h, unsigned msg, WPARAM wp, LPARAM lp)
 {
@@ -77,6 +91,10 @@ static LRESULT programs_proc(HWND h, unsigned msg, WPARAM wp, LPARAM lp)
         child(h, WC_BUTTON, "Exit to VMM", WS_TABSTOP, 12, 96, 176, BTN_H, ID_EXIT);
         return 0;
     case WM_COMMAND:
+        if (!lp) {                      /* from the menu */
+            static const char *const names[] = { "MS-DOS Prompt", "About OS1993", "Exit to VMM", "Contents" };
+            DebugLog("menu %s", names[LOWORD(wp) - ID_DOS]);
+        }
         switch (LOWORD(wp)) {
         case ID_DOS:
             DebugLog("button MS-DOS Prompt");
@@ -101,7 +119,37 @@ static LRESULT programs_proc(HWND h, unsigned msg, WPARAM wp, LPARAM lp)
 /* ---- Controls ----------------------------------------------------------- */
 
 enum { ID_SOUND = 20, ID_CLOCK, ID_SLOW, ID_NORMAL, ID_TURBO, ID_NAME, ID_LIST,
-       ID_VOLUME, ID_SCROLL, ID_PROGRESS, ID_TIMER };
+       ID_VOLUME, ID_SCROLL, ID_PROGRESS, ID_TIMER, ID_RESET };
+
+/* The right-click menu: a Speed submenu mirroring the radio buttons. */
+static void context_menu(HWND h, int x, int y)
+{
+    HMENU speed = CreatePopupMenu(), menu = CreatePopupMenu();
+    AppendMenu(speed, MF_STRING, ID_SLOW, "&Slow");
+    AppendMenu(speed, MF_STRING, ID_NORMAL, "&Normal");
+    AppendMenu(speed, MF_STRING, ID_TURBO, "&Turbo");
+    int cur = IsDlgButtonChecked(h, ID_SLOW) ? ID_SLOW : IsDlgButtonChecked(h, ID_TURBO) ? ID_TURBO : ID_NORMAL;
+    CheckMenuRadioItem(speed, ID_SLOW, ID_TURBO, (unsigned)cur, MF_BYCOMMAND);
+    AppendMenu(menu, MF_POPUP, (uintptr_t)speed, "&Speed");
+    AppendMenu(menu, MF_SEPARATOR, 0, NULL);
+    AppendMenu(menu, MF_STRING | (IsDlgButtonChecked(h, ID_SOUND) ? MF_CHECKED : 0), ID_SOUND, "Sound &effects");
+    AppendMenu(menu, MF_STRING, ID_RESET, "&Reset volume");
+    int id = TrackPopupMenu(menu, TPM_RETURNCMD, x, y, h);
+    DestroyMenu(menu);
+    switch (id) {
+    case ID_SLOW: case ID_NORMAL: case ID_TURBO:
+        SendMessage(GetDlgItem(h, id), BM_SETCHECK, BST_CHECKED, 0);
+        DebugLog("speed %s", id == ID_SLOW ? "Slow" : id == ID_TURBO ? "Turbo" : "Normal");
+        break;
+    case ID_SOUND:
+        SendMessage(GetDlgItem(h, ID_SOUND), BM_CLICK, 0, 0);
+        break;
+    case ID_RESET:
+        SendMessage(GetDlgItem(h, ID_VOLUME), TBM_SETPOS, 1, 40);
+        DebugLog("volume reset");
+        break;
+    }
+}
 
 static const char *const colours[] = {
     "Platinum", "Graphite", "Lavender", "Teal", "Ocean", "Forest",
@@ -216,6 +264,9 @@ static LRESULT controls_proc(HWND h, unsigned msg, WPARAM wp, LPARAM lp)
             DebugLog("scroll %d", pos);
         return 0;
     }
+    case WM_CONTEXTMENU:
+        context_menu(h, GET_X_LPARAM(lp), GET_Y_LPARAM(lp));
+        return 0;
     case WM_TIMER: {                    /* animate the progress bar */
         HWND p = GetDlgItem(h, ID_PROGRESS);
         SendMessage(p, PBM_SETPOS, (WPARAM)((SendMessage(p, PBM_GETPOS, 0, 0) + 1) % 101), 0);
@@ -261,7 +312,9 @@ int main(void)
     register_class("Controls", controls_proc, C_FACE);
     register_class("About", about_proc, C_FACE);
 
-    CreateWindow("Programs", "Programs", FRAMED | WS_VISIBLE, 16, 16, 210, 160, NULL, 0, NULL);
+    HWND programs = CreateWindow("Programs", "Programs", FRAMED, 16, 16, 210, 181, NULL, 0, NULL);
+    SetMenu(programs, programs_menu());
+    ShowWindow(programs, SW_SHOW);
     open_about();
     HWND controls = CreateWindow("Controls", "Controls", FRAMED | WS_THICKFRAME | WS_VISIBLE,
                                  246, 40, 380, 330, NULL, 0, NULL);

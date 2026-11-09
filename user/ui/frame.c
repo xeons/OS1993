@@ -29,7 +29,16 @@ void frame_client(struct wnd *w, RECT *r)
         frame_outer(w, r);
         return;
     }
-    *r = (RECT){ w->x + FRAME, w->y + CLIENT_TOP, w->x + w->w - FRAME, w->y + w->h - FRAME };
+    int top = w->y + CLIENT_TOP + (w->menu ? MENUBAR_H + 1 : 0);
+    *r = (RECT){ w->x + FRAME, top, w->x + w->w - FRAME, w->y + w->h - FRAME };
+}
+
+bool frame_menubar(struct wnd *w, RECT *r)
+{
+    if (!frame_has(w) || !w->menu || w->state == WS_STATE_MIN)
+        return false;
+    *r = (RECT){ w->x + FRAME, w->y + CLIENT_TOP, w->x + w->w - FRAME, w->y + CLIENT_TOP + MENUBAR_H };
+    return true;
 }
 
 static RECT title_rect(struct wnd *w)
@@ -95,9 +104,11 @@ int frame_hit(struct wnd *w, int x, int y, int *edges)
         if (*edges)
             return HT_BORDER;
     }
-    RECT t = title_rect(w);
+    RECT t = title_rect(w), bar;
     if (rect_contains(&t, x, y))
         return HT_CAPTION;
+    if (frame_menubar(w, &bar) && rect_contains(&bar, x, y))
+        return HT_MENU;
     return HT_CLIENT;
 }
 
@@ -260,9 +271,15 @@ void frame_paint(struct wnd *w, bool active)
     if (tile)
         return;
 
-    RECT c;
+    RECT c, bar;
     frame_client(w, &c);
-    gfx_rect(g, c.left - 1, c.top - 1, c.right - c.left + 2, c.bottom - c.top + 2,
+    int top = c.top;
+    if (frame_menubar(w, &bar)) {
+        top = bar.top;
+        menubar_paint(w);
+        gfx_hline(g, c.left, bar.bottom, c.right - c.left, active ? C_GRAY2 : C_GRAY4);
+    }
+    gfx_rect(g, c.left - 1, top - 1, c.right - c.left + 2, c.bottom - top + 2,
              active ? C_GRAY2 : C_GRAY4);
 }
 

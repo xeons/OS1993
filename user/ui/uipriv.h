@@ -20,6 +20,7 @@
 #define ITEM_H      16
 #define MIN_W       160
 #define MIN_H       100
+#define MENUBAR_H   20
 
 #define WND_MAX     96
 #define CLASS_MAX   24
@@ -36,6 +37,7 @@ struct wclass {
     int      extra;
     uint8_t  background;
     bool     transparent;       /* mouse goes through (STATIC, group boxes) */
+    bool     noactivate;        /* top level that never activates (menus) */
 };
 
 struct wnd {
@@ -54,6 +56,8 @@ struct wnd {
     uint8_t        extra[EXTRA_MAX];
     struct { char name[16]; void *value; } props[PROP_MAX];
     struct wnd    *focus_child;              /* top level: focus to restore */
+    struct menu   *menu, *sysmenu;           /* menu bar, system menu */
+    int            bar_sel;                  /* highlighted menu bar item, -1 */
     bool           visible, enabled;
 
     /* State for the built-in control classes */
@@ -82,7 +86,7 @@ void        ui_init_classes(void);
 
 /* frame.c -- the non-client area of top-level windows */
 enum { HT_NOWHERE, HT_CLIENT, HT_CAPTION, HT_SYSMENU, HT_MINBUTTON, HT_MAXBUTTON,
-       HT_CLOSE, HT_TILE, HT_BORDER };
+       HT_CLOSE, HT_TILE, HT_BORDER, HT_MENU };
 #define E_L 1
 #define E_R 2
 #define E_T 4
@@ -97,6 +101,7 @@ void  frame_paint_grip(struct wnd *w);
 void  frame_minimize(struct wnd *w);
 void  frame_maximize(struct wnd *w);
 void  frame_restore(struct wnd *w);
+bool  frame_menubar(struct wnd *w, RECT *r);  /* its menu bar, screen coords */
 extern int  frame_pressed_box;               /* HT_* while being clicked */
 extern struct wnd *frame_pressed_wnd;
 
@@ -140,6 +145,25 @@ void  sbar_draw(HDC dc, const struct sbar *s, int pressed_part);
 int   sbar_hit(const struct sbar *s, int x, int y);
 int   sbar_thumb_value(const struct sbar *s, int along, int grab);
 void  sbar_thumb(const struct sbar *s, int *pos, int *len, int *track, int *tlen);
+
+/* input.c -- modal loops (menus, keyboard move/size) read input directly */
+struct modal_ev {
+    int  type;                               /* EV_KEY, EV_MOUSE, EV_FOCUS */
+    int  x, y;
+    bool moved, ldown, lup, rdown, rup;
+    int  vk;
+    bool up;
+};
+void  ui_modal_event(struct modal_ev *m);    /* waits; paints meanwhile */
+void  ui_keyboard_track(struct wnd *w, bool size);   /* SC_MOVE / SC_SIZE */
+
+/* menu.c */
+LRESULT menu_popup_proc(HWND, unsigned, WPARAM, LPARAM);
+void  menubar_paint(struct wnd *w);
+void  menu_track_bar(struct wnd *w, int x, int y);   /* click on the bar */
+void  menu_track_sys(struct wnd *w);                 /* click on the system box */
+void  menu_keymenu(struct wnd *w, int ch);           /* SC_KEYMENU */
+void  menu_window_gone(struct wnd *w);
 
 /* kbd.c */
 int   kbd_vk(int scancode);                  /* scancode -> VK_* (0: none) */

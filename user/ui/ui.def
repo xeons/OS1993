@@ -59,3 +59,17 @@ EXPORTS
     DrawBevel
     DrawRoundRect
     TextWidth
+    CreateMenu
+    CreatePopupMenu
+    DestroyMenu
+    AppendMenu
+    SetMenu
+    GetMenu
+    GetSubMenu
+    GetMenuItemCount
+    CheckMenuItem
+    EnableMenuItem
+    CheckMenuRadioItem
+    GetSystemMenu
+    TrackPopupMenu
+    DrawMenuBar

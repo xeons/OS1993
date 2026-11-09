@@ -43,6 +43,7 @@ bool     HasMouse(void);
 
 typedef struct wnd  *HWND;
 typedef struct dc   *HDC;
+typedef struct menu *HMENU;
 typedef uint32_t     WPARAM;
 typedef int32_t      LPARAM;
 typedef int32_t      LRESULT;
@@ -114,10 +115,13 @@ enum {
 #define WM_CHAR             0x0102
 #define WM_SYSKEYDOWN       0x0104
 #define WM_SYSKEYUP         0x0105
+#define WM_CONTEXTMENU      0x007B  /* wParam = window clicked, lParam = screen x,y */
 #define WM_COMMAND          0x0111
 #define WM_SYSCOMMAND       0x0112
 #define WM_TIMER            0x0113
 #define WM_HSCROLL          0x0114
+#define WM_INITMENU         0x0116  /* wParam = menu bar or system menu */
+#define WM_INITMENUPOPUP    0x0117  /* wParam = menu, lParam = MAKELPARAM(pos, system) */
 #define WM_VSCROLL          0x0115
 #define WM_MOUSEMOVE        0x0200
 #define WM_LBUTTONDOWN      0x0201
@@ -139,6 +143,21 @@ enum {
 #define SC_MAXIMIZE         0xF030
 #define SC_CLOSE            0xF060
 #define SC_RESTORE          0xF120
+#define SC_KEYMENU          0xF100  /* lParam = mnemonic, ' ' system menu, 0 menu bar */
+
+/* Menus */
+#define MF_STRING           0x0000
+#define MF_ENABLED          0x0000
+#define MF_UNCHECKED        0x0000
+#define MF_BYCOMMAND        0x0000
+#define MF_GRAYED           0x0001
+#define MF_DISABLED         0x0002
+#define MF_CHECKED          0x0008
+#define MF_POPUP            0x0010  /* id is the submenu's HMENU */
+#define MFT_RADIOCHECK      0x0200  /* checked shows a dot, not a tick */
+#define MF_BYPOSITION       0x0400
+#define MF_SEPARATOR        0x0800
+#define TPM_RETURNCMD       0x0100  /* return the id instead of posting WM_COMMAND */
 
 /* WM_HSCROLL / WM_VSCROLL codes */
 #define SB_LINEUP           0
@@ -317,6 +336,24 @@ void    DrawBitmap(HDC dc, int x, int y, const uint16_t *rows, int h, uint8_t co
 void    DrawBevel(HDC dc, const RECT *r, bool raised);
 void    DrawRoundRect(HDC dc, const RECT *r, uint8_t color);
 int     TextWidth(const char *s);
+
+/* Menus. Item text marks its mnemonic with '&' and may carry a
+ * right-aligned accelerator after a tab: "E&xit\tAlt+F4". Choosing an item
+ * sends WM_COMMAND (id, 0) -- WM_SYSCOMMAND from the system menu. */
+HMENU   CreateMenu(void);                           /* a menu bar */
+HMENU   CreatePopupMenu(void);
+bool    DestroyMenu(HMENU menu);                    /* and its submenus */
+bool    AppendMenu(HMENU menu, unsigned flags, uintptr_t id, const char *text);
+bool    SetMenu(HWND hwnd, HMENU menu);
+HMENU   GetMenu(HWND hwnd);
+HMENU   GetSubMenu(HMENU menu, int pos);
+int     GetMenuItemCount(HMENU menu);
+int     CheckMenuItem(HMENU menu, unsigned item, unsigned flags);   /* -> old, or -1 */
+int     EnableMenuItem(HMENU menu, unsigned item, unsigned flags);  /* -> old, or -1 */
+bool    CheckMenuRadioItem(HMENU menu, unsigned first, unsigned last, unsigned check, unsigned flags);
+HMENU   GetSystemMenu(HWND hwnd, bool revert);
+int     TrackPopupMenu(HMENU menu, unsigned flags, int x, int y, HWND owner);
+bool    DrawMenuBar(HWND hwnd);
 
 /* Small runtime helpers (each module has its own copy: user/lib/lib.c) */
 size_t  strlen(const char *s);

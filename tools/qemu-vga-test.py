@@ -42,7 +42,7 @@ def main():
         check(m.wait_log("GUI: mouse ready"), "GUI started")
         m.goto(60, 30)                             # activate Programs first:
         m.click()                                  # the click below won't change it
-        m.goto(120, 88)                            # over "MS-DOS Prompt"
+        m.goto(120, 109)                           # over "MS-DOS Prompt"
         a = m.screenshot("vga-desktop")
         check(a[:2] == (640, 480), f"desktop is 640x480 (got {a[0]}x{a[1]})")
         check(near(pixel(a, 630, 470), rgb(DESKTOP)), "desktop drawn with the GUI's palette")

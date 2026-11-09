@@ -26,6 +26,7 @@ are for later stages.
 | `make qemu-emm386` | FreeDOS with JEMM386: the loader must refuse to start       |
 | `make qemu-sessions` | types into two concurrent DOS sessions via QEMU's monitor |
 | `make qemu-absmouse` | absolute pointer through QEMU's VMware port: the cursor lands on the exact pixel, and clicks hit their control |
+| `make qemu-menu` | menu bar, system menu and right-click menus by mouse and keyboard (mnemonics, F10, Alt+Space, keyboard Move) |
 | `make qemu-wm`   | drives the window manager through QEMU's mouse and keyboard: every control, activate/move/resize/minimize/maximize/close, palette after a DOS session |
 | `make qemu-vga`  | the VDD: the GUI's desktop must come back pixel-identical after a text DOS session (except its animated progress bar) |
 
@@ -290,6 +291,20 @@ Windows 95 set of window controls and widgets.
   Windows resize from their borders, corners and size grip. Moves and
   resizes drag an XOR outline. Minimized windows become title tiles along
   the bottom until the shell gets a taskbar.
+- **Menus** (`user/ui/menu.c`). Menu bars (`CreateMenu`, `SetMenu`),
+  pop-up menus with submenus, separators, check marks and radio dots,
+  greyed items, `&` mnemonics and right-aligned accelerator text
+  (`"&Close\tAlt+F4"`), and context menus (`TrackPopupMenu`; a right click
+  sends `WM_CONTEXTMENU` up the parent chain). As in Windows, a menu is a
+  modal loop with each open pop-up a window of its own; the chosen item
+  arrives as `WM_COMMAND`. Mouse: click and click, or press-drag-release;
+  hovering opens submenus, which flip left at the screen edge. Keys: Alt
+  or F10 selects the menu bar, Alt+letter opens a menu, arrows, Enter, Esc
+  and mnemonics. Every window has a **system menu** (`GetSystemMenu`):
+  Restore, Move, Size, Minimize, Maximize, Close, greyed as the window's
+  state requires, from the system box or Alt+Space; it sends
+  `WM_SYSCOMMAND`. Move and Size from the menu work from the keyboard
+  (arrow keys, Enter, Esc), as in Windows.
 - **Controls**, one class per file: `BUTTON` (push button with
   default-button ring, check box, radio button group, group box), `STATIC`,
   `EDIT` (caret, Home/End/Delete), `LISTBOX` with its own scroll bar,
@@ -302,8 +317,9 @@ Windows 95 set of window controls and widgets.
   under the session's text mode, as Windows' VDD did. Back in front, it
   repaints everything.
 
-Demo windows: **Programs** (MS-DOS Prompt, About, Exit to VMM),
-**Controls** (one of each control) and **About OS1993**. Esc leaves the GUI.
+Demo windows: **Programs** (MS-DOS Prompt, About, Exit to VMM, and a
+File / Help menu bar), **Controls** (one of each control, and a right-click
+menu with a Speed submenu) and **About OS1993**. Esc leaves the GUI.
 
 ## Mouse
 

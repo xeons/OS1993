@@ -83,7 +83,7 @@ def main():
         check(m.wait_log("GUI: closed About OS1993"), "About's OK button closes it")
 
         # --- a DOS session from the Programs window, and back ---
-        m.goto(120, 188); m.click()
+        m.goto(120, 209); m.click()
         check(m.wait_log("Started DOS 1"), "MS-DOS Prompt button starts a DOS session")
         m.key("alt-tab")
         m.wait_log("focus -> console")

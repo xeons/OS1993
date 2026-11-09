@@ -39,6 +39,7 @@ bool ui_cursor_overlaps(int x0, int y0, int x1, int y1)
 /* ---- keyboard --------------------------------------------------------------- */
 
 static bool shift, ctrl, alt;
+static bool alt_alone;                      /* Alt pressed, nothing else yet */
 
 int GetKeyState(int vk)
 {
@@ -46,18 +47,35 @@ int GetKeyState(int vk)
     return down ? -128 : 0;
 }
 
-static void key_event(int sc)
+/* Track the modifiers; -> the virtual key, 0 for none. */
+static int key_update(int sc, bool *up_out, int *code_out)
 {
     if (sc == 0xE0)                             /* extended-key prefix */
-        return;
+        return 0;
     bool up = sc & 0x80;
     int code = sc & 0x7F;
     int vk = kbd_vk(code);
     if (!vk)
-        return;
+        return 0;
+    if (!up)
+        alt_alone = vk == VK_MENU ? (alt_alone || !alt) : false;
     if (vk == VK_SHIFT)   shift = !up;
     if (vk == VK_CONTROL) ctrl = !up;
     if (vk == VK_MENU)    alt = !up;
+    *up_out = up;
+    *code_out = code;
+    return vk;
+}
+
+static void key_event(int sc)
+{
+    bool up;
+    int code, vk = key_update(sc, &up, &code);
+    if (!vk)
+        return;
+    bool alone = up && vk == VK_MENU && alt_alone;
+    if (up && vk == VK_MENU)
+        alt_alone = false;
 
     struct wnd *target = wnd_from(GetFocus());
     if (!target)
@@ -67,7 +85,8 @@ static void key_event(int sc)
     bool sys = alt || vk == VK_MENU || vk == VK_F10;
     unsigned msg = up ? (sys ? WM_SYSKEYUP : WM_KEYUP) : (sys ? WM_SYSKEYDOWN : WM_KEYDOWN);
     uint32_t lp = 1u | ((uint32_t)code << 16) | (alt ? 1u << 29 : 0) |
-                  (shift ? 1u << 25 : 0) | (up ? (1u << 30) | (1u << 31) : 0);
+                  (shift ? 1u << 25 : 0) | (alone ? 1u << 26 : 0) |
+                  (up ? (1u << 30) | (1u << 31) : 0);
     PostMessage(target, msg, (WPARAM)vk, (LPARAM)lp);
 }
 
@@ -146,16 +165,18 @@ static void press(int x, int y)
         frame_pressed_box = part;
         ui_invalidate_wnd(t);
         break;
+    case HT_SYSMENU:                            /* double-click closes (in the menu) */
+        menu_track_sys(t);
+        break;
+    case HT_MENU:
+        menu_track_bar(t, x, y);
+        break;
     case HT_CAPTION:
-    case HT_SYSMENU:
         if (is_double(t, part, now)) {
-            if (part == HT_SYSMENU)
-                SendMessage(t, WM_SYSCOMMAND, SC_CLOSE, 0);
-            else
-                SendMessage(t, WM_SYSCOMMAND, t->state == WS_STATE_MAX ? SC_RESTORE : SC_MAXIMIZE, 0);
+            SendMessage(t, WM_SYSCOMMAND, t->state == WS_STATE_MAX ? SC_RESTORE : SC_MAXIMIZE, 0);
             break;
         }
-        if (part == HT_CAPTION && t->state == WS_STATE_NORMAL) {
+        if (t->state == WS_STATE_NORMAL) {
             mode = M_MOVE;
             mw = t;
             frame_outer(t, &outline);
@@ -212,6 +233,16 @@ static void finish_size(void)
     DebugLog("resized %s to %dx%d", mw->text, mw->w, mw->h);
 }
 
+static void cursor_to(int x, int y)
+{
+    if (x == cur_x && y == cur_y)
+        return;
+    ui_cursor(false);
+    cur_x = x;
+    cur_y = y;
+    ui_cursor(true);
+}
+
 static void mouse_event(int x, int y, uint8_t buttons)
 {
     bool ldown = (buttons & MB_LEFT) && !(last_buttons & MB_LEFT);
@@ -221,12 +252,8 @@ static void mouse_event(int x, int y, uint8_t buttons)
     bool moved = x != cur_x || y != cur_y;
     last_buttons = buttons;
     unsigned keys = ((buttons & MB_LEFT) ? MK_LBUTTON : 0) | ((buttons & MB_RIGHT) ? MK_RBUTTON : 0);
-    if (moved) {
-        ui_cursor(false);
-        cur_x = x;
-        cur_y = y;
-        ui_cursor(true);
-    }
+    if (moved)
+        cursor_to(x, y);
 
     if (!wnd_from(mw))
         mw = NULL;
@@ -325,6 +352,9 @@ void ui_input_event(const struct user_event *e)
 {
     switch (e->type) {
     case EV_FOCUS:
+        /* Keys pressed for the switch (Alt+Tab) went elsewhere: forget them,
+         * or a lone Alt release would open the menu bar. */
+        shift = ctrl = alt = alt_alone = false;
         if (e->key) cur_on = false;             /* repaint draws a fresh cursor */
         ui_set_background(e->key == 0);
         break;
@@ -334,5 +364,116 @@ void ui_input_event(const struct user_event *e)
     case EV_MOUSE:
         mouse_event(e->x, e->y, e->buttons);
         break;
+    }
+}
+
+/* ---- modal loops ------------------------------------------------------------ */
+
+/* The next raw input event, translated, for a loop that owns the input
+ * (menus, keyboard move and size). Painting goes on while it waits. */
+void ui_modal_event(struct modal_ev *m)
+{
+    struct user_event e;
+    for (;;) {
+        while (GetInputEvent(&e)) {
+            memset(m, 0, sizeof *m);
+            m->type = e.type;
+            m->x = cur_x;
+            m->y = cur_y;
+            switch (e.type) {
+            case EV_FOCUS:
+                ui_input_event(&e);
+                return;
+            case EV_KEY: {
+                int code;
+                m->vk = key_update(e.key, &m->up, &code);
+                alt_alone = false;              /* Alt in a menu doesn't reopen it */
+                if (m->vk)
+                    return;
+                break;
+            }
+            case EV_MOUSE:
+                m->ldown = (e.buttons & MB_LEFT) && !(last_buttons & MB_LEFT);
+                m->lup = !(e.buttons & MB_LEFT) && (last_buttons & MB_LEFT);
+                m->rdown = (e.buttons & MB_RIGHT) && !(last_buttons & MB_RIGHT);
+                m->rup = !(e.buttons & MB_RIGHT) && (last_buttons & MB_RIGHT);
+                m->moved = e.x != cur_x || e.y != cur_y;
+                last_buttons = e.buttons;
+                cursor_to(e.x, e.y);
+                m->x = e.x;
+                m->y = e.y;
+                return;
+            }
+        }
+        if (ui_paint_pending())
+            ui_paint();
+        WaitForInput();
+    }
+}
+
+static void size_outline(RECT o, int dx, int dy)
+{
+    outline.right = clampi(o.right + dx, o.left + MIN_W, 640);
+    outline.bottom = clampi(o.bottom + dy, o.top + MIN_H, 480);
+}
+
+/* Move or size a window from the keyboard (system menu Move / Size): the
+ * arrow keys move the outline 8 pixels, so does the mouse; Enter or a
+ * click accepts, Esc cancels. Sizing moves the bottom-right corner. */
+void ui_keyboard_track(struct wnd *w, bool size)
+{
+    if (w->parent || w->state != WS_STATE_NORMAL || (size && !(w->style & WS_THICKFRAME)))
+        return;
+    mw = w;
+    frame_outer(w, &outline);
+    RECT start = outline;
+    int dx = 0, dy = 0, lx = cur_x, ly = cur_y;
+    ui_paint();
+    xor_outline();
+    for (;;) {
+        struct modal_ev e;
+        ui_modal_event(&e);
+        int result = 0;                         /* 1 accept, -1 cancel */
+        if (e.type == EV_FOCUS) {
+            result = -1;
+        } else if (e.type == EV_KEY && !e.up) {
+            switch (e.vk) {
+            case VK_LEFT:   dx -= 8; break;
+            case VK_RIGHT:  dx += 8; break;
+            case VK_UP:     dy -= 8; break;
+            case VK_DOWN:   dy += 8; break;
+            case VK_RETURN: result = 1; break;
+            case VK_ESCAPE: result = -1; break;
+            }
+        } else if (e.type == EV_MOUSE) {
+            dx += e.x - lx;
+            dy += e.y - ly;
+            lx = e.x;
+            ly = e.y;
+            if (e.ldown) result = 1;
+        }
+        xor_outline();
+        if (!wnd_from(w)) {
+            mw = NULL;
+            return;
+        }
+        if (size) {
+            size_outline(start, dx, dy);
+        } else {
+            int ww = start.right - start.left, hh = start.bottom - start.top;
+            outline.left = start.left + dx;
+            outline.top = clampi(start.top + dy, 0, 480 - TILE_H);
+            outline.right = outline.left + ww;
+            outline.bottom = outline.top + hh;
+        }
+        if (result > 0) {
+            if (size) finish_size();
+            else finish_move();
+        }
+        if (result) {
+            mw = NULL;
+            return;
+        }
+        xor_outline();
     }
 }

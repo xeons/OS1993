@@ -192,6 +192,10 @@ class Machine:
         self.move(-700, -500)
         self.move(x, y)
 
+    def rclick(self, pause=0.6):
+        self.cmd("mouse_button 2", 0.3)
+        self.cmd("mouse_button 0", pause)
+
     def click(self, pause=0.6):
         self.cmd("mouse_button 1", 0.3)
         self.cmd("mouse_button 0", pause)
