@@ -5,16 +5,27 @@
  */
 #include "uipriv.h"
 
-int frame_pressed_box;
-struct wnd *frame_pressed_wnd;
+#define frame_pressed_box (S->frame_pressed_box)
+#define frame_pressed_wnd (S->frame_pressed_wnd)
 
 bool frame_has(struct wnd *w)
 {
     return !w->parent && (w->style & WS_CAPTION) == WS_CAPTION;
 }
 
+/* With a shell (a taskbar) minimized windows leave the screen; without
+ * one they become tiles along the bottom. */
+bool frame_shown(struct wnd *w)
+{
+    return w->parent || w->state != WS_STATE_MIN || !S->shell_hook;
+}
+
 void frame_outer(struct wnd *w, RECT *r)
 {
+    if (!w->parent && w->state == WS_STATE_MIN && S->shell_hook) {
+        *r = (RECT){ 0, 0, 0, 0 };
+        return;
+    }
     if (!w->parent && w->state == WS_STATE_MIN) {
         int x = 4 + w->min_slot * (TILE_W + 4), y = 480 - TILE_H - 4;
         *r = (RECT){ x, y, x + TILE_W, y + TILE_H };
@@ -118,7 +129,8 @@ static void notify_size(struct wnd *w)
 {
     RECT c;
     GetClientRect(w, &c);
-    SendMessage(w, WM_SIZE, 0, MAKELPARAM(c.right, c.bottom));
+    wnd_notify(w, WM_SIZE, 0, MAKELPARAM(c.right, c.bottom));
+    ui_shell_notify(HSHELL_REDRAW, w);
 }
 
 void frame_minimize(struct wnd *w)
@@ -142,11 +154,8 @@ void frame_minimize(struct wnd *w)
     w->state = WS_STATE_MIN;
     ui_invalidate_wnd(w);
     if (wnd_active() == w)                          /* activate the next one */
-        for (int i = n - 1; i >= 0; i--)
-            if (list[i] != w && list[i]->visible && list[i]->state != WS_STATE_MIN) {
-                wnd_activate(list[i]);
-                break;
-            }
+        wnd_activate_next(w);
+    ui_shell_notify(HSHELL_REDRAW, w);
     DebugLog("minimized %s", w->text);
 }
 
@@ -158,7 +167,8 @@ void frame_maximize(struct wnd *w)
     if (w->state == WS_STATE_NORMAL) {
         w->rx = w->x; w->ry = w->y; w->rw = w->w; w->rh = w->h;
     }
-    w->x = 0; w->y = 0; w->w = 640; w->h = 480;
+    RECT a = S->work;                               /* the work area (not the taskbar) */
+    w->x = a.left; w->y = a.top; w->w = a.right - a.left; w->h = a.bottom - a.top;
     w->state = WS_STATE_MAX;
     ui_invalidate_wnd(w);
     wnd_activate(w);

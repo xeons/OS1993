@@ -47,6 +47,7 @@ void gfx_text(struct gfx *g, int x, int y, const char *s, uint8_t fg, uint8_t bg
 
 /* 1-bit images, rows of up to 16 pixels, MSB = leftmost */
 void gfx_bitmap(struct gfx *g, int x, int y, const uint16_t *rows, int h, uint8_t color);
+void gfx_blit8(struct gfx *g, int x, int y, int w, int h, const uint8_t *pixels, int stride);
 /* Invert the pixels under an image or rectangle; doing it twice undoes it. */
 void gfx_xor_bitmap(struct gfx *g, int x, int y, const uint16_t *rows, int h);
 void gfx_xor_fill(struct gfx *g, int x, int y, int w, int h);

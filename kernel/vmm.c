@@ -105,9 +105,9 @@ static void start_gui(void)
 {
     if (!vga_gfx_enter())
         return;
-    if (user_start("GUI.BIN", UINFO_GRAPHICS) != 0) {
+    if (user_start("SHELL.BIN", UINFO_GRAPHICS) != 0) {
         vga_gfx_leave();
-        kprintf("  Cannot start GUI.BIN (see the debug log).\n");
+        kprintf("  Cannot start SHELL.BIN (see the debug log).\n");
     }
 }
 
@@ -185,6 +185,7 @@ void kmain(const struct bootinfo *bi)
                   (t * 100 / TIMER_HZ_X10) % 10);
         con_write_at(CON_ROWS - 1, CON_COLS - 20, STATUS_ATTR, line);
         vm_reap();
+        user_service();
         show_vm_line();
 
         if (gui_was_running && !user_running()) {   /* the GUI ended */

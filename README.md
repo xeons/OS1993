@@ -17,7 +17,7 @@ are for later stages.
 
 | Command          | What it does                                                  |
 |------------------|---------------------------------------------------------------|
-| `make`           | builds `build/OS1993.COM` (loader), `build/VMM.BIN` (kernel) and `build/GUI.BIN` (ring-3 GUI) |
+| `make`           | builds `build/OS1993.COM` (loader), `build/VMM.BIN` (kernel), the ring-3 DLLs and programs (`*.DLL`, `*.BIN`) |
 | `make run`       | boots it in DOSBox-X: 386, 16 MB, XMS, no EMS                 |
 | `make test`      | headless round trip DOS → VMM → DOS, checked automatically    |
 | `make check386`  | fails if the kernel contains any post-386 or FPU instruction  |
@@ -26,6 +26,7 @@ are for later stages.
 | `make qemu-emm386` | FreeDOS with JEMM386: the loader must refuse to start       |
 | `make qemu-sessions` | types into two concurrent DOS sessions via QEMU's monitor |
 | `make qemu-absmouse` | absolute pointer through QEMU's VMware port: the cursor lands on the exact pixel, and clicks hit their control |
+| `make qemu-shell` | the shell and its programs as processes: Start menu by mouse and Ctrl+Esc, desktop icons, Calculator, Paint, Clock, taskbar buttons, Run, Shut Down |
 | `make qemu-msgbox` | keyboard accelerators per window, message boxes: modality, default button, Tab, Yes/No letters, Esc, Alt+F4 |
 | `make qemu-menu` | menu bar, system menu and right-click menus by mouse and keyboard (mnemonics, F10, Alt+Space, keyboard Move) |
 | `make qemu-wm`   | drives the window manager through QEMU's mouse and keyboard: every control, activate/move/resize/minimize/maximize/close, palette after a DOS session |
@@ -191,36 +192,40 @@ Not handled yet: programs that switch to protected mode themselves (DOS
 extenders, a real HIMEM's block moves). The VM is stopped with a message.
 That needs VCPI/DPMI.
 
-## Ring 3: the GUI's home
+## Ring 3: processes
 
-The GUI will be 32-bit flat protected-mode code running in ring 3 in the
-System VM, as Windows 3.x ran its protected-mode code there. The
-infrastructure is in place (`kernel/user.c`, `user/`):
+The GUI is 32-bit flat protected-mode code in ring 3, as Windows 3.x ran
+its protected-mode code in the System VM (`kernel/user.c`, `user/`). A GUI
+session is a set of **processes**, each with one thread and its own
+address space, like Win95's 32-bit side.
 
 - **Segments.** Ring-3 flat code and data descriptors (selectors 23h/2Bh).
   Isolation comes from paging: user pages have the U bit, kernel pages don't.
-- **Address space.** The image is linked at `0040_0000`, above the V86
-  area. The stack ends at `7FFF_0000`, and an info block plus the 8×16 font
-  sit at `7FFF_0000`. The VGA window (A0000) is mapped at `7FF0_0000`, so
-  the display driver draws directly. VGA ports are open in the TSS I/O
-  bitmap.
-- **Loader.** `GUI.BIN` (header `GUI3`, entry, file size, memory size) is
-  read through DOS by the System VM from the directory `VMM.BIN` came
-  from, into zeroed user pages. A ring-3 thread then IRETs into it, with
-  TSS.ESP0 set to that thread's kernel stack on every switch.
-- **System calls.** `INT 30h` through a DPL-3 gate. EAX selects the
-  function: exit, print to the debug log, ticks, yield, wait for the next
-  tick, read a key, start a DOS session. User pointers are checked.
-- **Faults.** An exception in ring 3 kills the program with a log line; the
-  rest of the system carries on.
-- **Input.** `SYS_GET_EVENT` delivers keyboard and mouse events.
-
-**G** in the VMM console loads `GUI.BIN`, the demo desktop now running in
-ring 3. It links the very same `kernel/gfx.c` display driver, unchanged.
-**N** there asks the VMM for a DOS session, and **Esc** exits back to the
-text console. In test mode the same binary is run twice as a self-test:
-executing `CLI` must be killed with #GP, and writing kernel memory must be
-killed with #PF.
+- **Address spaces.** There is still one page directory. A process owns
+  the user page-directory entries (below 2 GB), which are swapped in when
+  one of its threads is scheduled, the way VMs swap PDE 0, so the kernel
+  half is identical everywhere by construction. A program is linked at
+  `0040_0000`; DLLs at their own bases above `1000_0000`; the stack ends at
+  `7FFF_0000`, where an info block (pid, arguments, the 8×16 font) sits.
+- **The shared region** at `6000_0000` is one page table installed in every
+  process: the VGA window, then a 512 KB **shared arena** where UI.DLL keeps
+  the window manager's state, as Win95's USER kept its data in the shared
+  arena.
+- **Loading.** The VMM console thread loads programs through DOS (the
+  System VM's own file system): `SYS_EXEC` from a process queues a request
+  and waits. Each process gets its own copy of every DLL it imports.
+- **System calls** (`INT 30h`, DPL-3 gate): exit, debug print, ticks,
+  yield, wait/wake (`SYS_WAIT` sleeps until another process wakes it,
+  input arrives, or a timeout), exec, kill, process liveness, kernel locks
+  (handed to the next waiter, released if their owner dies), the RTC time,
+  input events, start a DOS session. User pointers are checked.
+- **Faults and kills.** An exception in ring 3 ends that process with a log
+  line; the others carry on, and UI.DLL drops its windows. A killed process
+  ends on its way back to ring 3.
+- **Sessions.** **G** in the VMM console starts the shell (`SHELL.BIN`), the
+  session's first process; when it ends, every other process goes too. In
+  test mode `DEMO.BIN` is run twice as a self-test: executing `CLI` must be
+  killed with #GP, and writing kernel memory must be killed with #PF.
 
 ## Shared libraries (DLLs)
 
@@ -237,18 +242,75 @@ system DLLs.
 - **The loader** (`kernel/user.c`) loads a program, then the DLLs it
   imports and theirs, from the program's directory. It fills every slot by
   name and refuses to start with a clear message if an export is missing.
-  Everything is unmapped when the program exits.
+  Everything is unmapped, page tables too, when the process ends.
+- **`HOOK fn`** in a `.DEF` makes every export call `fn()` first: UI.DLL
+  takes its lock that way.
 
 | Module    | Base        | Contents                                         |
 |-----------|-------------|--------------------------------------------------|
 | `KERNEL.DLL` | `1000_0000` | the userland kernel library: wraps the INT 30h system calls (`user/krnl/`) |
 | `GFX.DLL` | `1010_0000` | the VGA display driver (`user/gfx/`)             |
 | `UI.DLL`  | `1020_0000` | windows, messages, painting, controls (`user/ui/`); imports KERNEL, GFX |
-| `GUI.BIN` | `0040_0000` | the demo applications (`user/apps/`); imports KERNEL, UI |
+| `SHELL.DLL` | `1030_0000` | the shell API: `ShellExecute`, `ShellAbout`, `Shell_NotifyIcon`, stock icons (`user/shell/`) |
+| `*.BIN`   | `0040_0000` | programs (`user/apps/`): SHELL, CALC, PAINT, CLOCK, DEMO |
 
 Programs include one header, `user/lib/os1993.h` (the `windows.h` of
-OS1993), and call KERNEL.DLL (`GetTickCount`, `Sleep`, `DebugLog`,
-`StartDosSession`, ...) instead of issuing system calls themselves.
+OS1993), and call KERNEL.DLL (`CreateProcess`, `GetTickCount`, `Sleep`,
+`GetLocalTime`, `WaitForWake`/`WakeProcess`, `AcquireLock`, `DebugLog`,
+...) instead of issuing system calls themselves.
+
+## The window system across processes
+
+UI.DLL's state (windows, classes, z-order, queues, timers, menus, input
+and cursor state, the off-screen buffer) lives in the shared arena, so an
+`HWND` means the same window in every process. Each window belongs to the
+process that created it, and only that process runs its window procedure.
+
+- **One lock**, like Win95's Win16Mutex: every UI.DLL export takes it on
+  entry; a process lets go only when it waits (in `GetMessage`, a modal
+  loop, `Sleep`, `CreateProcess`, or a cross-process `SendMessage`).
+- **A queue per process.** `PostMessage` goes to the window owner's queue
+  and wakes it. `SendMessage` to another process's window waits while that
+  process runs the window procedure, answering messages sent to it
+  meanwhile so two processes can't deadlock. **`WM_COPYDATA`** copies its
+  data across: the IPC primitive (the tray icons use it).
+- **Input** is turned into messages by whichever process pumps first. A
+  click on a frame becomes `WM_NCLBUTTONDOWN` for the window's owner, with
+  raw input reserved for it while its `DefWindowProc` runs the move, size,
+  box or menu loop.
+- **Painting.** Each top-level window has its own update area; its owner
+  paints it clipped to its visible region (minus the windows above), so
+  processes paint independently, into the shared off-screen buffer.
+- **Process death.** Windows, classes, queues and menus of a process that
+  ended are removed by the next process that pumps.
+- **Shell support:** `RegisterShellHookWindow` (`WM_SHELLHOOK` on window
+  creation, activation, title and state changes), `SetShellWindow` (the
+  desktop stays at the bottom), `WS_EX_TOPMOST`, `WS_EX_TOOLWINDOW`,
+  `WS_EX_NOACTIVATE`, `EnumWindows`, `FindWindow`, `SetForegroundWindow`,
+  the work area (`SystemParametersInfo`), class icons. Ctrl+Esc anywhere
+  goes to the shell. With a shell running, minimized windows leave the
+  screen for the taskbar instead of becoming tiles.
+
+## The shell and its programs
+
+- **SHELL.BIN** (`user/apps/shell.c`), in the style of Windows 95: a
+  desktop with icons (double-click or Enter opens; right click for Run and
+  About); a taskbar with the **Start** button and menu (Programs, Run...,
+  About, Shut Down...; also Ctrl+Esc), a button per program window (click
+  to switch, again to minimize), and the notification area with tray icons
+  and a clock. A Run dialog starts any program by name. Shut Down asks,
+  then ends the session.
+- **CALC.BIN**: the standard calculator: the four operations, square root,
+  percent, reciprocal, sign, memory, by mouse or keyboard. Without an FPU
+  or libgcc, it computes in 64-bit fixed point (six decimals, twelve
+  digits) with its own division.
+- **PAINT.BIN**: a 400×280 canvas, pencil, brush, eraser, flood fill,
+  line, rectangle, filled rectangle and ellipse (rubber-banded), a 16-colour
+  palette (left button foreground, right button background).
+- **CLOCK.BIN**: analog (scales with the window; sine table) or digital
+  (seven segments and the date), seconds on or off, from the RTC.
+- **DEMO.BIN**: the Control Demo (Programs, Controls and About windows),
+  with a tray icon through `Shell_NotifyIcon`.
 
 Each module links its own copy of the tiny C runtime (`user/lib/`).
 
@@ -332,9 +394,9 @@ Windows 95 set of window controls and widgets.
   under the session's text mode, as Windows' VDD did. Back in front, it
   repaints everything.
 
-Demo windows: **Programs** (MS-DOS Prompt, About, Exit to VMM, and a
+Demo windows (DEMO.BIN): **Programs** (MS-DOS Prompt, About, Exit, and a
 File / Help menu bar; F1, Ctrl+D and Ctrl+Q; Exit asks first), **Controls** (one of each control, and a right-click
-menu with a Speed submenu) and **About OS1993**. Esc leaves the GUI.
+menu with a Speed submenu) and **About OS1993**. Esc closes the demo.
 
 ## Mouse
 
@@ -407,7 +469,8 @@ user/lib/os1993.h                        the public API; crt0, header, C runtime
 user/krnl/                               KERNEL.DLL (system call wrappers)
 user/gfx/                                GFX.DLL (planar VGA drawing)
 user/ui/                                 UI.DLL (windows, messages, controls)
-user/apps/gui.c                          GUI.BIN, the demo applications
+user/shell/                              SHELL.DLL (shell API, stock icons)
+user/apps/                               SHELL.BIN, CALC.BIN, PAINT.BIN, CLOCK.BIN, DEMO.BIN
 kernel/gdt.c idt.c pic.c timer.c keyboard.c console.c serial.c kprintf.c panic.c
 kernel/include/          headers; bootinfo.h is shared with the loader
 kernel/linker.ld         links at 0x80000000, header first
@@ -440,14 +503,15 @@ tools/                   check386.sh, check-test.sh
    are done. Still to do: the PIT (programs that reprogram the timer), CRTC
    ports for background VMs, graphics modes, mouse, serial and printer ports.
 6. **Graphics and GUI.** Done: the VGA driver and ring-3 support (flat
-   user segments, INT 30h system calls, `GUI.BIN` loader, fault
+   user segments, INT 30h system calls, program loader, fault
    isolation), the PS/2 mouse, and the window manager with the Windows 95
    control set in a Platinum-inspired style, double-buffered, plus DLLs
-   (KERNEL.DLL, GFX.DLL, UI.DLL) with a Win32-style message-based window
-   API, and an absolute mouse under emulators. Next: menus,
-   combo boxes and tabs; several application programs running at once,
-   each in its own address space with the DLLs shared; a shell with a
-   taskbar; VESA truecolor.
+   (KERNEL.DLL, GFX.DLL, UI.DLL, SHELL.DLL) with a Win32-style
+   message-based window API, menus, accelerators and message boxes, an
+   absolute mouse under emulators, processes with their own address spaces
+   sharing one window system, and a Windows 95-style shell with
+   Calculator, Paint and Clock. Next: file I/O for programs, combo boxes
+   and tabs, DLL code shared between processes, VESA truecolor.
 7. **Win16-style API layer.** 16-bit protected-mode apps in ring 3 with LDTs,
    built with Open Watcom.
 8. **Coexisting with EMM386** through VCPI/GEMMIS, and acting as a DPMI host.

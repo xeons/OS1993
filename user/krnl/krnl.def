@@ -12,3 +12,14 @@ EXPORTS
     GetInputEvent
     WaitForInput
     HasMouse
+    CreateProcess
+    GetCurrentProcessId
+    IsProcessAlive
+    TerminateProcess
+    GetProcessExitCount
+    WaitForWake
+    WakeProcess
+    AcquireLock
+    ReleaseLock
+    GetLocalTime
+    SetWaitHooks

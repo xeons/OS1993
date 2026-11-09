@@ -1,34 +1,29 @@
 /*
- * wnd.c -- window classes, windows, messages, focus and activation.
+ * wnd.c -- window classes, windows, z-order, focus and activation,
+ * properties, DefWindowProc, and the calls the shell uses.
  *
  * The model follows Windows: every window belongs to a class whose window
  * procedure handles its messages; DefWindowProc supplies the default
  * behaviour; controls are child windows; anything can be subclassed by
  * swapping its window procedure (SetWindowLong GWL_WNDPROC) and passing
- * the rest on with CallWindowProc. There is one message queue (one
- * program at a time); painting happens when it runs dry.
+ * the rest on with CallWindowProc. Windows live in the shared arena; each
+ * belongs to the process that created it, which alone runs its procedure.
  */
 #include "uipriv.h"
-
-static struct wclass classes[CLASS_MAX];
-static int nclasses;
-static struct wnd wnds[WND_MAX];
-static struct wnd *tops[WND_MAX];            /* top-level z-order, bottom first */
-static int ntops;
-static struct wnd *active, *focus, *capture;
 
 /* ---- lookups ------------------------------------------------------------ */
 
 struct wnd *wnd_from(HWND h)
 {
-    uintptr_t p = (uintptr_t)h, base = (uintptr_t)wnds;
-    if (p < base || p >= base + sizeof wnds || (p - base) % sizeof(struct wnd))
+    uintptr_t p = (uintptr_t)h, base = (uintptr_t)S->wnds;
+    if (p < base || p >= base + sizeof S->wnds || (p - base) % sizeof(struct wnd))
         return NULL;
     struct wnd *w = (struct wnd *)h;
     return w->magic == WND_MAGIC ? w : NULL;
 }
 
 bool IsWindow(HWND h) { return wnd_from(h) != NULL; }
+bool wnd_mine(struct wnd *w) { return w && w->pid == ui_pid; }
 
 static bool same_name(const char *a, const char *b)
 {
@@ -42,9 +37,11 @@ static bool same_name(const char *a, const char *b)
 
 static struct wclass *find_class(const char *name)
 {
-    for (int i = 0; i < nclasses; i++)
-        if (same_name(classes[i].name, name))
-            return &classes[i];
+    for (int i = 0; i < S->nclasses; i++) {
+        struct wclass *c = &S->classes[i];
+        if (c->name[0] && (c->pid == 0 || c->pid == ui_pid) && same_name(c->name, name))
+            return c;
+    }
     return NULL;
 }
 
@@ -57,36 +54,70 @@ struct wnd *wnd_top(struct wnd *w)
 
 int wnd_toplevels(struct wnd **out)
 {
-    for (int i = 0; i < ntops; i++)
-        out[i] = tops[i];
-    return ntops;
+    for (int i = 0; i < S->ntops; i++)
+        out[i] = S->tops[i];
+    return S->ntops;
 }
 
-struct wnd *wnd_active(void) { return active; }
+struct wnd *wnd_active(void) { return S->active; }
 
 struct wnd *wnd_owned_popup(struct wnd *owner)
 {
-    for (int i = ntops - 1; i >= 0; i--)
-        if (tops[i]->owner == owner && tops[i]->visible && tops[i]->enabled &&
-            !tops[i]->cls->noactivate)
-            return tops[i];
+    for (int i = S->ntops - 1; i >= 0; i--)
+        if (S->tops[i]->owner == owner && S->tops[i]->visible && S->tops[i]->enabled &&
+            !(S->tops[i]->exstyle & WS_EX_NOACTIVATE))
+            return S->tops[i];
     return NULL;
+}
+
+/* A notification: sent to our own windows, posted to other processes'. */
+LRESULT wnd_notify(struct wnd *w, unsigned msg, WPARAM wp, LPARAM lp)
+{
+    if (!w)
+        return 0;
+    if (wnd_mine(w))
+        return SendMessage(w, msg, wp, lp);
+    PostMessage(w, msg, wp, lp);
+    return 0;
+}
+
+/* Taskbar material: a visible, captioned, unowned top-level window. */
+static bool shell_relevant(struct wnd *w)
+{
+    return w && !w->parent && !w->owner && frame_has(w) && !(w->exstyle & WS_EX_TOOLWINDOW) &&
+           w != S->desktop;
+}
+
+void ui_shell_notify(int code, struct wnd *w)
+{
+    struct wnd *hook = S->shell_hook;
+    if (hook && hook != w && wnd_from(hook) && (shell_relevant(w) || code == HSHELL_WINDOWDESTROYED))
+        PostMessage(hook, WM_SHELLHOOK, (WPARAM)code, (LPARAM)w);
 }
 
 /* ---- classes ------------------------------------------------------------ */
 
 bool RegisterClass(const WNDCLASS *wc)
 {
-    if (!wc || !wc->name || !wc->proc || find_class(wc->name) || nclasses == CLASS_MAX ||
+    if (!wc || !wc->name || !wc->proc || find_class(wc->name) ||
         wc->extra < 0 || wc->extra > EXTRA_MAX)
         return false;
-    struct wclass *c = &classes[nclasses++];
+    struct wclass *c = NULL;
+    for (int i = 0; i < S->nclasses; i++)                   /* a freed slot */
+        if (!S->classes[i].name[0]) { c = &S->classes[i]; break; }
+    if (!c) {
+        if (S->nclasses == CLASS_MAX)
+            return false;
+        c = &S->classes[S->nclasses++];
+    }
     memset(c, 0, sizeof *c);
     strncpy0(c->name, wc->name, sizeof c->name);
+    c->pid = ui_pid;
     c->proc = wc->proc;
     c->style = wc->style;
     c->extra = wc->extra;
     c->background = wc->background;
+    c->icon = wc->icon;
     return true;
 }
 
@@ -95,6 +126,7 @@ static struct wclass *builtin(const char *name, WNDPROC proc, bool transparent)
     WNDCLASS wc = { .name = name, .proc = proc, .background = C_FACE };
     RegisterClass(&wc);
     struct wclass *c = find_class(name);
+    c->pid = 0;                                             /* everyone's */
     c->transparent = transparent;
     return c;
 }
@@ -177,6 +209,68 @@ struct wnd *wnd_child_at(struct wnd *w, int x, int y)
     return wnd_child_at(hit, x - hit->x, y - hit->y);
 }
 
+/* ---- z-order -------------------------------------------------------------- */
+
+/* Where a top-level window belongs: the desktop at the bottom, topmost
+ * windows above the rest. */
+static int band(struct wnd *w)
+{
+    if (w == S->desktop) return 0;
+    if (w->exstyle & WS_EX_TOPMOST) return 2;
+    return 1;
+}
+
+static void tops_insert(struct wnd *w)          /* at the top of its band */
+{
+    int i = S->ntops;
+    while (i > 0 && band(S->tops[i - 1]) > band(w))
+        i--;
+    for (int k = S->ntops; k > i; k--)
+        S->tops[k] = S->tops[k - 1];
+    S->tops[i] = w;
+    S->ntops++;
+}
+
+static void tops_remove(struct wnd *w)
+{
+    int i = 0;
+    while (i < S->ntops && S->tops[i] != w)
+        i++;
+    if (i == S->ntops)
+        return;
+    for (; i < S->ntops - 1; i++)
+        S->tops[i] = S->tops[i + 1];
+    S->ntops--;
+}
+
+void wnd_raise(struct wnd *t)
+{
+    int i = 0;
+    while (i < S->ntops && S->tops[i] != t)
+        i++;
+    if (i == S->ntops)
+        return;
+    bool top = true;                            /* already the top of its band? */
+    for (int k = i + 1; k < S->ntops; k++)
+        if (band(S->tops[k]) == band(t))
+            top = false;
+    if (top)
+        return;
+    tops_remove(t);
+    tops_insert(t);
+    ui_invalidate_wnd(t);
+    struct wnd *owned[WND_MAX];                 /* the windows it owns stay above it */
+    int n = 0;
+    for (int k = 0; k < S->ntops; k++)
+        if (S->tops[k]->owner == t && S->tops[k]->visible)
+            owned[n++] = S->tops[k];
+    for (int k = 0; k < n; k++) {
+        tops_remove(owned[k]);
+        tops_insert(owned[k]);
+        ui_invalidate_wnd(owned[k]);
+    }
+}
+
 /* ---- windows ------------------------------------------------------------ */
 
 static void unlink(struct wnd *w)
@@ -189,33 +283,29 @@ static void unlink(struct wnd *w)
             *pp = w->next;
         return;
     }
-    int i = 0;
-    while (i < ntops && tops[i] != w)
-        i++;
-    for (; i < ntops - 1; i++)
-        tops[i] = tops[i + 1];
-    if (ntops)
-        ntops--;
+    tops_remove(w);
 }
 
-HWND CreateWindow(const char *cls, const char *text, unsigned style,
-                  int x, int y, int w, int h, HWND parent, int id, void *param)
+HWND CreateWindowEx(unsigned exstyle, const char *cls, const char *text, unsigned style,
+                    int x, int y, int w, int h, HWND parent, int id, void *param)
 {
     struct wclass *c = find_class(cls ? cls : "");
     struct wnd *p = parent ? wnd_from(parent) : NULL;
-    if (!c || (parent && !p) || ((style & WS_CHILD) && !p))
+    if (!c || (parent && !p) || ((style & WS_CHILD) && (!p || !wnd_mine(p))))
         return NULL;
     struct wnd *n = NULL;
     for (int i = 0; i < WND_MAX; i++)
-        if (wnds[i].magic != WND_MAGIC) { n = &wnds[i]; break; }
-    if (!n || (!p && ntops == WND_MAX))
+        if (S->wnds[i].magic != WND_MAGIC) { n = &S->wnds[i]; break; }
+    if (!n || (!(style & WS_CHILD) && S->ntops == WND_MAX))
         return NULL;
 
     memset(n, 0, sizeof *n);
     n->magic = WND_MAGIC;
+    n->pid = ui_pid;
     n->cls = c;
     n->proc = c->proc;
     n->style = style;
+    n->exstyle = exstyle | (c->noactivate ? WS_EX_NOACTIVATE : 0);
     n->id = id;
     n->x = x; n->y = y; n->w = w; n->h = h;
     n->visible = (style & WS_VISIBLE) != 0;
@@ -231,65 +321,117 @@ HWND CreateWindow(const char *cls, const char *text, unsigned style,
             pp = &(*pp)->next;
         *pp = n;
     } else {
-        tops[ntops++] = n;
+        tops_insert(n);
     }
 
     if (SendMessage(n, WM_CREATE, 0, (LPARAM)param) == -1) {
         DestroyWindow(n);
         return NULL;
     }
+    if (!wnd_from(n))
+        return NULL;
     if (n->visible) {
         ui_invalidate_wnd(n);
-        if (!n->parent && !c->noactivate)
+        if (!n->parent && !(n->exstyle & WS_EX_NOACTIVATE))
             wnd_activate(n);
     }
+    if (!n->parent)
+        ui_shell_notify(HSHELL_WINDOWCREATED, n);
     return n;
 }
 
-static void kill_timers(struct wnd *w);
-static void drop_messages(struct wnd *w);
+HWND CreateWindow(const char *cls, const char *text, unsigned style,
+                  int x, int y, int w, int h, HWND parent, int id, void *param)
+{
+    return CreateWindowEx(0, cls, text, style, x, y, w, h, parent, id, param);
+}
+
+/* Activate the next window after w goes (topmost windows such as the
+ * taskbar, and the desktop, only if nothing else is left). */
+void wnd_activate_next(struct wnd *gone)
+{
+    S->active = NULL;
+    for (int pass = 0; pass < 2; pass++)
+        for (int i = S->ntops - 1; i >= 0; i--) {
+            struct wnd *t = S->tops[i];
+            if (t == gone || !t->visible || t->state == WS_STATE_MIN || t->exstyle & WS_EX_NOACTIVATE ||
+                !t->enabled)
+                continue;
+            if (pass == 0 && (t == S->desktop || (t->exstyle & WS_EX_TOPMOST)))
+                continue;
+            wnd_activate(t);
+            return;
+        }
+}
+
+static void kill_window_timers(struct wnd *w)
+{
+    for (int i = 0; i < TIMER_MAX; i++)
+        if (S->timers[i].w == w)
+            S->timers[i].w = NULL;
+}
+
+/* Take w out of every shared structure (no messages: also used for the
+ * windows of processes that died). */
+static void forget(struct wnd *w)
+{
+    while (w->first)
+        forget(w->first);
+    if (w->visible)
+        ui_invalidate_wnd(w);
+    kill_window_timers(w);
+    for (int i = 0; i < PROC_MAX; i++) {            /* drop its posted messages */
+        struct pqueue *q = &S->queues[i];
+        for (unsigned k = q->head; k != q->tail; k = (k + 1) % QMAX)
+            if (q->q[k].hwnd == w)
+                q->q[k] = (MSG){ 0 };
+    }
+    if (S->focus == w) S->focus = NULL;
+    if (S->capture == w) S->capture = NULL;
+    if (S->frame_pressed_wnd == w) S->frame_pressed_wnd = NULL;
+    if (S->in.last_click_wnd == w) S->in.last_click_wnd = NULL;
+    struct wnd *t = wnd_top(w);
+    if (t && t != w && t->focus_child == w)
+        t->focus_child = NULL;
+    if (S->shell_hook == w) S->shell_hook = NULL;
+    if (S->desktop == w) S->desktop = NULL;
+    menu_window_gone(w);
+    unlink(w);
+    bool was_active = S->active == w;
+    bool top = !w->parent;
+    w->magic = 0;
+    if (top)
+        ui_shell_notify(HSHELL_WINDOWDESTROYED, w);
+    if (was_active)
+        wnd_activate_next(w);
+}
+
+void ui_forget_window(struct wnd *w) { forget(w); }
 
 bool DestroyWindow(HWND h)
 {
     struct wnd *w = wnd_from(h);
-    if (!w)
+    if (!w || !wnd_mine(w))
         return false;
-    if (w->visible)
-        ui_invalidate_wnd(w);
     if (frame_has(w))
         DebugLog("closed %s", w->text);
     SendMessage(w, WM_DESTROY, 0, 0);
+    if (!wnd_from(w))
+        return true;
     while (w->first)
         DestroyWindow(w->first);
-    for (int i = ntops - 1; i >= 0; i--)          /* and the windows it owns */
-        if (i < ntops && tops[i]->owner == w)
-            DestroyWindow(tops[i]);
-    kill_timers(w);
-    drop_messages(w);
-    menu_window_gone(w);
-    if (focus == w) focus = NULL;
-    if (capture == w) capture = NULL;
-    struct wnd *t = wnd_top(w);
-    if (t && t != w && t->focus_child == w)
-        t->focus_child = NULL;
-    unlink(w);
-    bool was_active = active == w;
-    w->magic = 0;
-    if (was_active) {
-        active = NULL;
-        for (int i = ntops - 1; i >= 0; i--)
-            if (tops[i]->visible && tops[i]->state != WS_STATE_MIN) {
-                wnd_activate(tops[i]);
-                break;
-            }
-    }
+    for (int i = S->ntops - 1; i >= 0; i--)         /* and the windows it owns */
+        if (i < S->ntops && S->tops[i]->owner == w && wnd_mine(S->tops[i]))
+            DestroyWindow(S->tops[i]);
+    if (wnd_from(w))
+        forget(w);
     return true;
 }
 
 HWND GetParent(HWND h)
 {
     struct wnd *w = wnd_from(h);
-    return w ? w->parent : NULL;
+    return w ? (w->parent ? w->parent : w->owner) : NULL;
 }
 
 HWND GetDlgItem(HWND parent, int id)
@@ -316,8 +458,8 @@ bool MoveWindow(HWND h, int x, int y, int w, int hh, bool repaint)
     if (n->visible && repaint) ui_invalidate_wnd(n);
     RECT c;
     GetClientRect(n, &c);
-    SendMessage(n, WM_SIZE, 0, MAKELPARAM(c.right, c.bottom));
-    SendMessage(n, WM_MOVE, 0, MAKELPARAM(x, y));
+    wnd_notify(n, WM_SIZE, 0, MAKELPARAM(c.right, c.bottom));
+    wnd_notify(n, WM_MOVE, 0, MAKELPARAM(x, y));
     return true;
 }
 
@@ -330,24 +472,21 @@ bool ShowWindow(HWND h, int cmd)
     case SW_HIDE:
         if (w->visible) ui_invalidate_wnd(w);
         w->visible = false;
-        if (active == w) {
-            active = NULL;
-            for (int i = ntops - 1; i >= 0; i--)
-                if (tops[i] != w && tops[i]->visible && tops[i]->state != WS_STATE_MIN) {
-                    wnd_activate(tops[i]);
-                    break;
-                }
-        }
+        if (S->active == w)
+            wnd_activate_next(w);
         break;
+    case SW_MINIMIZE:
     case SW_SHOWMINIMIZED: w->visible = true; frame_minimize(w); break;
     case SW_SHOWMAXIMIZED: w->visible = true; frame_maximize(w); break;
-    case SW_RESTORE:       w->visible = true; frame_restore(w); break;
+    case SW_RESTORE:       w->visible = true; frame_restore(w); wnd_activate(w); break;
     default:
         w->visible = true;
         ui_invalidate_wnd(w);
-        if (!w->parent && !w->cls->noactivate)
+        if (!w->parent && !(w->exstyle & WS_EX_NOACTIVATE))
             wnd_activate(w);
     }
+    if (!w->parent && was != w->visible)
+        ui_shell_notify(w->visible ? HSHELL_WINDOWCREATED : HSHELL_WINDOWDESTROYED, w);
     return was;
 }
 
@@ -358,9 +497,9 @@ bool EnableWindow(HWND h, bool enable)
     bool was = !w->enabled;
     if (w->enabled != enable) {
         w->enabled = enable;
-        if (!enable && focus == w)
+        if (!enable && S->focus == w)
             SetFocus(w->parent);
-        SendMessage(w, WM_ENABLE, enable, 0);
+        wnd_notify(w, WM_ENABLE, enable, 0);
         ui_invalidate_wnd(w);
     }
     return was;
@@ -372,18 +511,57 @@ bool IsWindowEnabled(HWND h)
     return w && w->enabled;
 }
 
-int SetWindowText(HWND h, const char *text) { return (int)SendMessage(h, WM_SETTEXT, 0, (LPARAM)text); }
-int GetWindowText(HWND h, char *buf, int max) { return (int)SendMessage(h, WM_GETTEXT, (WPARAM)max, (LPARAM)buf); }
+bool IsWindowVisible(HWND h)
+{
+    struct wnd *w = wnd_from(h);
+    return w && w->visible;
+}
+
+bool IsIconic(HWND h)
+{
+    struct wnd *w = wnd_from(h);
+    return w && w->state == WS_STATE_MIN;
+}
+
+int GetWindowProcessId(HWND h)
+{
+    struct wnd *w = wnd_from(h);
+    return w ? w->pid : 0;
+}
+
+/* Text: another process's window is read and written directly (its
+ * procedure can't be called from here), as Windows does for GetWindowText. */
+int SetWindowText(HWND h, const char *text)
+{
+    struct wnd *w = wnd_from(h);
+    if (!w) return 0;
+    if (wnd_mine(w))
+        return (int)SendMessage(h, WM_SETTEXT, 0, (LPARAM)text);
+    strncpy0(w->text, text ? text : "", TEXT_MAX);
+    ui_invalidate_wnd(w);
+    return 1;
+}
+
+int GetWindowText(HWND h, char *buf, int max)
+{
+    struct wnd *w = wnd_from(h);
+    if (!w || !buf || max <= 0) return 0;
+    if (wnd_mine(w))
+        return (int)SendMessage(h, WM_GETTEXT, (WPARAM)max, (LPARAM)buf);
+    strncpy0(buf, w->text, (size_t)max);
+    return (int)strlen(buf);
+}
 
 int32_t GetWindowLong(HWND h, int index)
 {
     struct wnd *w = wnd_from(h);
     if (!w) return 0;
     switch (index) {
-    case GWL_WNDPROC:  return (int32_t)(uintptr_t)w->proc;
+    case GWL_WNDPROC:  return wnd_mine(w) ? (int32_t)(uintptr_t)w->proc : 0;
     case GWL_STYLE:    return (int32_t)w->style;
     case GWL_ID:       return w->id;
     case GWL_USERDATA: return w->userdata;
+    case GWL_EXSTYLE:  return (int32_t)w->exstyle;
     }
     if (index < 0 || index + 4 > w->cls->extra)
         return 0;
@@ -395,7 +573,7 @@ int32_t GetWindowLong(HWND h, int index)
 int32_t SetWindowLong(HWND h, int index, int32_t value)
 {
     struct wnd *w = wnd_from(h);
-    if (!w) return 0;
+    if (!w || !wnd_mine(w)) return 0;
     int32_t old = GetWindowLong(h, index);
     switch (index) {
     case GWL_WNDPROC:  if (value) w->proc = (WNDPROC)(uintptr_t)value; break;
@@ -447,19 +625,6 @@ void *RemoveProp(HWND h, const char *name)
 
 /* ---- activation, focus, capture ------------------------------------------ */
 
-void wnd_raise(struct wnd *t)
-{
-    int i = 0;
-    while (i < ntops && tops[i] != t)
-        i++;
-    if (i == ntops)
-        return;
-    for (; i < ntops - 1; i++)
-        tops[i] = tops[i + 1];
-    tops[ntops - 1] = t;
-    ui_invalidate_wnd(t);
-}
-
 static struct wnd *first_tabstop(struct wnd *w)
 {
     for (struct wnd *c = w->first; c; c = c->next) {
@@ -472,232 +637,146 @@ static struct wnd *first_tabstop(struct wnd *w)
     return NULL;
 }
 
-void wnd_activate(struct wnd *t)
+static void set_focus(struct wnd *w)
 {
-    if (!t || t->parent || !t->visible || t->cls->noactivate)
+    struct wnd *old = S->focus;
+    if (w == old)
         return;
-    wnd_raise(t);
-    if (active == t)
-        return;
-    struct wnd *old = active;
-    active = t;
-    if (old && wnd_from(old)) {
-        SendMessage(old, WM_ACTIVATE, WA_INACTIVE, (LPARAM)t);
-        ui_invalidate_wnd(old);
-    }
-    SendMessage(t, WM_ACTIVATE, WA_ACTIVE, (LPARAM)old);
-    struct wnd *f = wnd_from(t->focus_child) ? t->focus_child : first_tabstop(t);
-    SetFocus(f ? f : t);
+    S->focus = w;
+    if (old && wnd_from(old))
+        wnd_notify(old, WM_KILLFOCUS, (WPARAM)w, 0);
+    if (w)
+        wnd_notify(w, WM_SETFOCUS, (WPARAM)old, 0);
 }
 
-HWND GetActiveWindow(void) { return active; }
+void wnd_activate(struct wnd *t)
+{
+    if (!t || t->parent || !t->visible || t->exstyle & WS_EX_NOACTIVATE)
+        return;
+    wnd_raise(t);
+    if (S->active == t)
+        return;
+    struct wnd *old = S->active;
+    S->active = t;
+    if (old && wnd_from(old)) {
+        wnd_notify(old, WM_ACTIVATE, WA_INACTIVE, (LPARAM)t);
+        ui_invalidate_wnd(old);
+    }
+    ui_invalidate_wnd(t);
+    wnd_notify(t, WM_ACTIVATE, WA_ACTIVE, (LPARAM)old);
+    struct wnd *f = wnd_from(t->focus_child) ? t->focus_child : first_tabstop(t);
+    set_focus(f ? f : t);
+    ui_shell_notify(HSHELL_WINDOWACTIVATED, t);
+}
+
+HWND GetActiveWindow(void) { return S->active; }
+HWND GetForegroundWindow(void) { return S->active; }
 
 HWND SetActiveWindow(HWND h)
 {
-    struct wnd *old = active, *w = wnd_from(h);
+    struct wnd *old = S->active, *w = wnd_from(h);
     if (w)
         wnd_activate(wnd_top(w));
     return old;
 }
 
-HWND GetFocus(void) { return focus; }
+bool SetForegroundWindow(HWND h)
+{
+    struct wnd *w = wnd_from(h);
+    if (!w)
+        return false;
+    w = wnd_top(w);
+    if (w->state == WS_STATE_MIN)
+        frame_restore(w);
+    wnd_activate(w);
+    return true;
+}
+
+HWND GetFocus(void) { return S->focus; }
 
 HWND SetFocus(HWND h)
 {
-    struct wnd *w = h ? wnd_from(h) : NULL, *old = focus;
+    struct wnd *w = h ? wnd_from(h) : NULL, *old = S->focus;
     if ((h && !w) || w == old)
         return old;
     if (w) {
         struct wnd *t = wnd_top(w);
         t->focus_child = w;
-        if (t != active) {                      /* activating sets the focus */
+        if (t != S->active) {                   /* activating sets the focus */
             wnd_activate(t);
             return old;
         }
     }
-    focus = w;
-    if (old && wnd_from(old))
-        SendMessage(old, WM_KILLFOCUS, (WPARAM)w, 0);
-    if (w)
-        SendMessage(w, WM_SETFOCUS, (WPARAM)old, 0);
+    set_focus(w);
     return old;
 }
 
 HWND SetCapture(HWND h)
 {
-    struct wnd *old = capture;
-    capture = wnd_from(h);
+    struct wnd *old = S->capture;
+    S->capture = wnd_from(h);
     return old;
 }
 
-bool ReleaseCapture(void) { capture = NULL; return true; }
-HWND GetCapture(void)     { return capture; }
+bool ReleaseCapture(void) { S->capture = NULL; return true; }
+HWND GetCapture(void)     { return S->capture; }
 
-/* ---- the message queue ------------------------------------------------------ */
+/* ---- the shell's view ------------------------------------------------------ */
 
-#define QMAX 128
-static MSG queue[QMAX];
-static unsigned qhead, qtail;
-static bool quit_posted;
-static int quit_code;
-
-bool PostMessage(HWND h, unsigned msg, WPARAM w, LPARAM l)
+bool EnumWindows(WNDENUMPROC proc, LPARAM l)
 {
-    if (h && !wnd_from(h))
-        return false;
-    if (msg == WM_MOUSEMOVE && qhead != qtail) {        /* merge moves */
-        MSG *last = &queue[(qtail + QMAX - 1) % QMAX];
-        if (last->message == WM_MOUSEMOVE && last->hwnd == h) {
-            last->wParam = w;
-            last->lParam = l;
-            return true;
-        }
-    }
-    unsigned next = (qtail + 1) % QMAX;
-    if (next == qhead)
-        return false;
-    queue[qtail] = (MSG){ h, msg, w, l, GetTickCount() };
-    qtail = next;
+    struct wnd *list[WND_MAX];
+    int n = wnd_toplevels(list);
+    for (int i = n - 1; i >= 0; i--)
+        if (wnd_from(list[i]) && !(list[i]->exstyle & WS_EX_NOACTIVATE) && !proc(list[i], l))
+            return false;
     return true;
 }
 
-void PostQuitMessage(int code)
+HWND FindWindow(const char *cls, const char *title)
 {
-    quit_posted = true;
-    quit_code = code;
+    for (int i = S->ntops - 1; i >= 0; i--) {
+        struct wnd *t = S->tops[i];
+        if ((!cls || same_name(t->cls->name, cls)) && (!title || !strcmp(t->text, title)))
+            return t;
+    }
+    return NULL;
 }
 
-static void drop_messages(struct wnd *w)
-{
-    for (unsigned i = qhead; i != qtail; i = (i + 1) % QMAX)
-        if (queue[i].hwnd == w)
-            queue[i] = (MSG){ 0 };
-}
-
-/* ---- timers ------------------------------------------------------------------ */
-
-#define TIMER_MAX 16
-static struct { struct wnd *w; int id; uint32_t interval, due; } timers[TIMER_MAX];
-
-int SetTimer(HWND h, int id, uint32_t ms)
+bool RegisterShellHookWindow(HWND h)
 {
     struct wnd *w = wnd_from(h);
-    if (!w || !ms) return 0;
-    int slot = -1;
-    for (int i = 0; i < TIMER_MAX; i++) {
-        if (timers[i].w == w && timers[i].id == id) { slot = i; break; }
-        if (!timers[i].w && slot < 0) slot = i;
-    }
-    if (slot < 0) return 0;
-    timers[slot].w = w;
-    timers[slot].id = id;
-    timers[slot].interval = ms;
-    timers[slot].due = GetTickCount() + ms;
-    return id ? id : 1;
+    if (!w) return false;
+    S->shell_hook = w;
+    return true;
 }
 
-bool KillTimer(HWND h, int id)
+bool SetShellWindow(HWND h)
 {
-    for (int i = 0; i < TIMER_MAX; i++)
-        if (timers[i].w == (struct wnd *)h && timers[i].id == id) {
-            timers[i].w = NULL;
-            return true;
-        }
+    struct wnd *w = wnd_from(h);
+    if (!w || w->parent) return false;
+    S->desktop = w;
+    tops_remove(w);
+    tops_insert(w);
+    ui_invalidate_wnd(w);
+    return true;
+}
+
+HWND GetShellWindow(void) { return S->desktop; }
+
+int GetClassIcon(HWND h)
+{
+    struct wnd *w = wnd_from(h);
+    return w ? w->cls->icon : 0;
+}
+
+bool SystemParametersInfo(unsigned action, unsigned param, void *pv, unsigned flags)
+{
+    (void)param; (void)flags;
+    if (!pv) return false;
+    if (action == SPI_GETWORKAREA) { *(RECT *)pv = S->work; return true; }
+    if (action == SPI_SETWORKAREA) { S->work = *(const RECT *)pv; return true; }
     return false;
-}
-
-static void kill_timers(struct wnd *w)
-{
-    for (int i = 0; i < TIMER_MAX; i++)
-        if (timers[i].w == w)
-            timers[i].w = NULL;
-}
-
-static void run_timers(void)
-{
-    uint32_t now = GetTickCount();
-    for (int i = 0; i < TIMER_MAX; i++) {
-        if (!timers[i].w || (int32_t)(now - timers[i].due) < 0)
-            continue;
-        timers[i].due = now + timers[i].interval;
-        bool pending = false;                       /* WM_TIMERs don't pile up */
-        for (unsigned q = qhead; q != qtail; q = (q + 1) % QMAX)
-            if (queue[q].message == WM_TIMER && queue[q].hwnd == timers[i].w &&
-                (int)queue[q].wParam == timers[i].id)
-                pending = true;
-        if (!pending)
-            PostMessage(timers[i].w, WM_TIMER, (WPARAM)timers[i].id, 0);
-    }
-}
-
-/* ---- getting and dispatching messages ------------------------------------------ */
-
-static void pump(void)
-{
-    struct user_event e;
-    for (int n = 0; n < 64 && GetInputEvent(&e); n++)
-        ui_input_event(&e);
-    run_timers();
-}
-
-bool PeekMessage(MSG *m, bool remove)
-{
-    pump();
-    while (qhead != qtail) {
-        *m = queue[qhead];
-        if (m->message == WM_NULL && !m->hwnd) {     /* dropped */
-            qhead = (qhead + 1) % QMAX;
-            continue;
-        }
-        if (remove)
-            qhead = (qhead + 1) % QMAX;
-        return true;
-    }
-    if (ui_paint_pending())
-        ui_paint();
-    if (quit_posted) {
-        *m = (MSG){ NULL, WM_QUIT, (WPARAM)quit_code, 0, GetTickCount() };
-        if (remove)
-            quit_posted = false;
-        return true;
-    }
-    return false;
-}
-
-bool GetMessage(MSG *m)
-{
-    while (!PeekMessage(m, true))
-        WaitForInput();
-    return m->message != WM_QUIT;
-}
-
-LRESULT DispatchMessage(const MSG *m)
-{
-    struct wnd *w = wnd_from(m->hwnd);
-    return w ? w->proc(m->hwnd, m->message, m->wParam, m->lParam) : 0;
-}
-
-LRESULT SendMessage(HWND h, unsigned msg, WPARAM w, LPARAM l)
-{
-    struct wnd *n = wnd_from(h);
-    return n ? n->proc(h, msg, w, l) : 0;
-}
-
-LRESULT CallWindowProc(WNDPROC proc, HWND h, unsigned msg, WPARAM w, LPARAM l)
-{
-    return proc && wnd_from(h) ? proc(h, msg, w, l) : 0;
-}
-
-bool TranslateMessage(const MSG *m)
-{
-    if (m->message != WM_KEYDOWN)
-        return false;
-    char ch = kbd_char((int)m->wParam, (m->lParam & (1 << 25)) != 0);
-    if (!ch)
-        return false;
-    if ((m->lParam & (1 << 27)) && m->wParam >= 'A' && m->wParam <= 'Z')
-        ch = (char)(m->wParam - 'A' + 1);           /* Ctrl+letter: a control code */
-    return PostMessage(m->hwnd, WM_CHAR, (WPARAM)(uint8_t)ch, m->lParam);
 }
 
 /* ---- mouse messages ---------------------------------------------------------------- */
@@ -720,6 +799,8 @@ LRESULT DefWindowProc(HWND h, unsigned msg, WPARAM wp, LPARAM lp)
     case WM_SETTEXT:
         strncpy0(w->text, lp ? (const char *)lp : "", TEXT_MAX);
         ui_invalidate_wnd(w);
+        if (!w->parent)
+            ui_shell_notify(HSHELL_REDRAW, w);
         return 1;
     case WM_GETTEXT: {
         if (!lp || !wp) return 0;
@@ -731,12 +812,19 @@ LRESULT DefWindowProc(HWND h, unsigned msg, WPARAM wp, LPARAM lp)
     case WM_CLOSE:
         DestroyWindow(h);
         return 0;
+    case WM_NCLBUTTONDOWN:                     /* a click on the frame */
+        ui_track_frame(w, (int)wp, GET_X_LPARAM(lp), GET_Y_LPARAM(lp));
+        return 0;
+    case WM_NCLBUTTONDBLCLK:
+        if (wp == HT_CAPTION && (w->style & WS_MAXIMIZEBOX))
+            SendMessage(h, WM_SYSCOMMAND, w->state == WS_STATE_MAX ? SC_RESTORE : SC_MAXIMIZE, 0);
+        return 0;
     case WM_SYSCOMMAND:
         switch (wp & 0xFFF0) {
         case SC_CLOSE:    SendMessage(h, WM_CLOSE, 0, 0); break;
         case SC_MINIMIZE: frame_minimize(w); break;
         case SC_MAXIMIZE: frame_maximize(w); break;
-        case SC_RESTORE:  frame_restore(w); break;
+        case SC_RESTORE:  frame_restore(w); wnd_activate(w); break;
         case SC_MOVE:     ui_keyboard_track(w, false); break;
         case SC_SIZE:     ui_keyboard_track(w, true); break;
         case SC_KEYMENU:  menu_keymenu(w, (int)lp); break;

@@ -18,3 +18,4 @@ EXPORTS
     gfx_xor_frame
     gfx_init_mem
     gfx_present
+    gfx_blit8

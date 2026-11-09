@@ -246,6 +246,8 @@ void mouse_set_delivery(bool on)
     irq_restore(f);
 }
 
+bool mouse_pending(void) { return qhead != qtail; }
+
 bool mouse_get_event(struct user_event *e)
 {
     uint32_t f = irq_save();

@@ -1,7 +1,7 @@
 # OS1993 -- build with modern tools, run on a 1993 machine.
 #
 #   make            build the loader, the kernel, and the ring-3 modules:
-#                   build/OS1993.COM, VMM.BIN, KERNEL.DLL, GFX.DLL, UI.DLL, GUI.BIN
+#                   build/OS1993.COM, VMM.BIN, the DLLs and the programs (*.BIN)
 #   make run        boot it in DOSBox-X (386, 16 MB, HIMEM-style XMS)
 #   make test       headless DOSBox-X run; checks the full round trip to DOS
 #   make check386   verify the kernel contains no post-386 instructions
@@ -14,6 +14,7 @@
 #   make qemu-absmouse  absolute pointer via QEMU's VMware port (exact position)
 #   make qemu-menu  menu bar, system menu and context menus (mouse, keys)
 #   make qemu-msgbox  keyboard accelerators and message boxes
+#   make qemu-shell the shell and its programs, each a process
 #   make clean
 
 CC      := i686-elf-gcc
@@ -39,31 +40,46 @@ NASMFLAGS_K := -f elf32 -g -Ikernel/include/
 # ---- ring 3: MOD3 modules (kernel/include/user.h) -------------------------
 # Each DLL is described by a .DEF file; tools/mkdef.py turns it into the
 # DLL's export table and an import library (JMP [slot] thunks) for callers.
+MAKEFLAGS   += --no-builtin-rules
+.SUFFIXES:
 U           := $(BUILD)/user
 MKDEF       := python3 tools/mkdef.py
-USER_CFLAGS := $(filter-out -Ikernel/include,$(CFLAGS)) -Iuser/lib -Iuser/gfx -Iuser/ui -Ikernel/include -MMD -MP
+USER_CFLAGS := $(filter-out -Ikernel/include,$(CFLAGS)) -Iuser/lib -Iuser/gfx -Iuser/ui -Iuser/shell -Ikernel/include -MMD -MP
 MOD_LDFLAGS := -T user/lib/module.ld -nostdlib -ffreestanding \
                -Wl,--build-id=none -Wl,--no-warn-rwx-segments
 KRNL_BASE   := $(shell $(MKDEF) user/krnl/krnl.def base)
 GFX_BASE    := $(shell $(MKDEF) user/gfx/gfx.def base)
 UI_BASE     := $(shell $(MKDEF) user/ui/ui.def base)
+SHELL_BASE  := $(shell $(MKDEF) user/shell/shell.def base)
 
-KRNL_OBJ := $(U)/krnl/header.o $(U)/krnl/krnl.o $(U)/gen/krnl_exports.o $(U)/lib/lib.o
-GFX_OBJ := $(U)/gfx/header.o $(U)/gfx/gfx.o $(U)/gen/gfx_exports.o $(U)/lib/lib.o
-UI_SRC  := wnd input frame paint menu accel msgbox dialog button static edit listbox scroll trackbar kbd theme
-UI_OBJ  := $(U)/ui/header.o $(patsubst %,$(U)/ui/%.o,$(UI_SRC)) \
-           $(U)/gen/ui_exports.o $(U)/gen/gfx_imports.o $(U)/gen/krnl_imports.o $(U)/lib/lib.o
-GUI_OBJ := $(U)/apps/header.o $(U)/lib/crt0.o $(U)/apps/gui.o $(U)/gen/ui_imports.o \
-           $(U)/gen/krnl_imports.o $(U)/lib/lib.o
-USER_OBJ := $(sort $(KRNL_OBJ) $(GFX_OBJ) $(UI_OBJ) $(GUI_OBJ))
-MODULES := $(BUILD)/KERNEL.DLL $(BUILD)/GFX.DLL $(BUILD)/UI.DLL $(BUILD)/GUI.BIN
+# DLLs: header, code, export table, import libraries of what they call
+KRNL_OBJ  := $(U)/hdr/KERNEL.DLL.o $(U)/krnl/krnl.o $(U)/gen/krnl_exports.o $(U)/lib/lib.o
+GFX_OBJ   := $(U)/hdr/GFX.DLL.o $(U)/gfx/gfx.o $(U)/gen/gfx_exports.o $(U)/lib/lib.o
+UI_SRC    := wnd queue input frame paint menu accel msgbox dialog button static edit listbox \
+             scroll trackbar kbd theme
+UI_OBJ    := $(U)/hdr/UI.DLL.o $(patsubst %,$(U)/ui/%.o,$(UI_SRC)) \
+             $(U)/gen/ui_exports.o $(U)/gen/gfx_imports.o $(U)/gen/krnl_imports.o $(U)/lib/lib.o
+SHELL_OBJ := $(U)/hdr/SHELL.DLL.o $(U)/shell/shell.o $(U)/shell/icons.o $(U)/gen/shell_exports.o \
+             $(U)/gen/ui_imports.o $(U)/gen/krnl_imports.o $(U)/lib/lib.o
+
+# Programs: user/apps/<name>.c, each a process of its own
+APPS      := SHELL DEMO CALC PAINT CLOCK
+APP_LIBS  := $(U)/lib/crt0.o $(U)/gen/krnl_imports.o $(U)/gen/ui_imports.o \
+             $(U)/gen/shell_imports.o $(U)/lib/lib.o
+app_obj    = $(U)/hdr/$(1).BIN.o $(U)/apps/$(shell echo $(1) | tr A-Z a-z).o $(APP_LIBS)
+
+USER_OBJ  := $(sort $(KRNL_OBJ) $(GFX_OBJ) $(UI_OBJ) $(SHELL_OBJ) \
+                    $(foreach a,$(APPS),$(call app_obj,$(a))))
+MODULES   := $(BUILD)/KERNEL.DLL $(BUILD)/GFX.DLL $(BUILD)/UI.DLL $(BUILD)/SHELL.DLL \
+             $(patsubst %,$(BUILD)/%.BIN,$(APPS))
+MODULE_ELFS := $(patsubst $(BUILD)/%,$(U)/%.elf,$(MODULES))
 
 KERNEL_C   := $(wildcard kernel/*.c)
 KERNEL_ASM := $(wildcard kernel/*.asm)
 KERNEL_OBJ := $(patsubst kernel/%.asm,$(BUILD)/kernel/%.o,$(KERNEL_ASM)) \
               $(patsubst kernel/%.c,$(BUILD)/kernel/%.o,$(KERNEL_C))
 
-.PHONY: all run test check386 qemu qemu-test qemu-emm386 qemu-sessions qemu-vga qemu-wm qemu-absmouse qemu-menu qemu-msgbox clean
+.PHONY: all run test check386 qemu qemu-test qemu-emm386 qemu-sessions qemu-vga qemu-wm qemu-absmouse qemu-menu qemu-msgbox qemu-shell clean
 
 all: $(BUILD)/OS1993.COM $(BUILD)/VMM.BIN $(MODULES)
 
@@ -82,23 +98,29 @@ $(BUILD)/kernel/%.o: kernel/%.c | $(BUILD)/kernel
 $(BUILD)/kernel/%.o: kernel/%.asm kernel/include/selectors.inc | $(BUILD)/kernel
 	$(NASM) $(NASMFLAGS_K) -o $@ $<
 
-$(BUILD)/%.DLL: $(U)/%.elf
+$(BUILD)/%.DLL: $(U)/%.DLL.elf
 	$(OBJCOPY) -O binary $< $@
 
-$(BUILD)/%.BIN: $(U)/%.elf
+$(BUILD)/%.BIN: $(U)/%.BIN.elf
 	$(OBJCOPY) -O binary $< $@
 
-$(U)/KERNEL.elf: $(KRNL_OBJ) user/lib/module.ld
+$(U)/KERNEL.DLL.elf: $(KRNL_OBJ) user/lib/module.ld
 	$(CC) $(MOD_LDFLAGS) -Wl,--defsym=MODBASE=$(KRNL_BASE) -o $@ $(KRNL_OBJ)
 
-$(U)/GFX.elf: $(GFX_OBJ) user/lib/module.ld
+$(U)/GFX.DLL.elf: $(GFX_OBJ) user/lib/module.ld
 	$(CC) $(MOD_LDFLAGS) -Wl,--defsym=MODBASE=$(GFX_BASE) -o $@ $(GFX_OBJ)
 
-$(U)/UI.elf: $(UI_OBJ) user/lib/module.ld
+$(U)/UI.DLL.elf: $(UI_OBJ) user/lib/module.ld
 	$(CC) $(MOD_LDFLAGS) -Wl,--defsym=MODBASE=$(UI_BASE) -o $@ $(UI_OBJ)
 
-$(U)/GUI.elf: $(GUI_OBJ) user/lib/module.ld
-	$(CC) $(MOD_LDFLAGS) -Wl,--defsym=MODBASE=0x00400000 -o $@ $(GUI_OBJ)
+$(U)/SHELL.DLL.elf: $(SHELL_OBJ) user/lib/module.ld
+	$(CC) $(MOD_LDFLAGS) -Wl,--defsym=MODBASE=$(SHELL_BASE) -o $@ $(SHELL_OBJ)
+
+define APP_RULE
+$(U)/$(1).BIN.elf: $(call app_obj,$(1)) user/lib/module.ld
+	$$(CC) $$(MOD_LDFLAGS) -Wl,--defsym=MODBASE=0x00400000 -o $$@ $(call app_obj,$(1))
+endef
+$(foreach a,$(APPS),$(eval $(call APP_RULE,$(a))))
 
 $(U)/%.o: user/%.c
 	@mkdir -p $(dir $@)
@@ -109,13 +131,9 @@ $(U)/lib/crt0.o: user/lib/crt0.asm
 	$(NASM) -f elf32 -g -o $@ $<
 
 # One header per module: kind 1 = program, 2 = library
-$(U)/krnl/header.o: MODDEF := -DKIND=2 -DMODNAME='"KERNEL.DLL"'
-$(U)/gfx/header.o:  MODDEF := -DKIND=2 -DMODNAME='"GFX.DLL"'
-$(U)/ui/header.o:   MODDEF := -DKIND=2 -DMODNAME='"UI.DLL"'
-$(U)/apps/header.o: MODDEF := -DKIND=1 -DMODNAME='"GUI.BIN"'
-$(U)/%/header.o: user/lib/header.asm
+$(U)/hdr/%.o: user/lib/header.asm
 	@mkdir -p $(dir $@)
-	$(NASM) -f elf32 $(MODDEF) -o $@ $<
+	$(NASM) -f elf32 -DKIND=$(if $(filter %.DLL,$*),2,1) -DMODNAME='"$*"' -o $@ $<
 
 $(U)/gen/krnl_exports.asm $(U)/gen/krnl_imports.asm: user/krnl/krnl.def tools/mkdef.py
 	@mkdir -p $(dir $@)
@@ -131,6 +149,11 @@ $(U)/gen/ui_exports.asm $(U)/gen/ui_imports.asm: user/ui/ui.def tools/mkdef.py
 	@mkdir -p $(dir $@)
 	$(MKDEF) $< exports $(U)/gen/ui_exports.asm
 	$(MKDEF) $< imports $(U)/gen/ui_imports.asm
+
+$(U)/gen/shell_exports.asm $(U)/gen/shell_imports.asm: user/shell/shell.def tools/mkdef.py
+	@mkdir -p $(dir $@)
+	$(MKDEF) $< exports $(U)/gen/shell_exports.asm
+	$(MKDEF) $< imports $(U)/gen/shell_imports.asm
 
 $(U)/gen/%.o: $(U)/gen/%.asm
 	$(NASM) -f elf32 -o $@ $<
@@ -195,12 +218,15 @@ qemu-menu: all
 qemu-msgbox: all
 	@tools/qemu-msgbox-test.py
 
-check386: $(BUILD)/vmm.elf $(U)/KERNEL.elf $(U)/GFX.elf $(U)/UI.elf $(U)/GUI.elf
+qemu-shell: all
+	@tools/qemu-shell-test.py
+
+check386: $(BUILD)/vmm.elf $(MODULE_ELFS)
 	@for f in $^; do tools/check386.sh $(OBJDUMP) $$f || exit 1; done
 
 clean:
 	rm -rf $(BUILD)
 
--include $(KERNEL_OBJ:.o=.d) $(USER_OBJ:.o=.d)
+-include $(KERNEL_OBJ:.o=.d)
 
--include $(USER_OBJ:.o=.d)
+-include $(patsubst %.o,%.d,$(filter-out $(U)/hdr/% $(U)/gen/% %/crt0.o,$(USER_OBJ)))

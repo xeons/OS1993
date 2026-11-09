@@ -79,6 +79,8 @@ void keyboard_forward(struct vm *vm)
         vkbd_put(vm, (uint8_t)sc);
 }
 
+bool keyboard_pending(void) { return head != tail; }
+
 int keyboard_read(void)
 {
     if (head == tail)

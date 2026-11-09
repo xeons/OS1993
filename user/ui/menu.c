@@ -17,33 +17,17 @@
  */
 #include "uipriv.h"
 
-#define MENU_MAX   32
-#define ITEM_MAX   16
-#define ITEM_TEXT  32
+#define ITEM_MAX   MITEM_MAX
+#define ITEM_TEXT  MITEM_TEXT
 #define MENU_MAGIC 0x554E454Du  /* "MENU" */
-#define DEPTH      4
+#define DEPTH      MENU_DEPTH
+#define menus      (S->menus)
+#define T          (S->mt)
 
 #define MITEM_H     18
 #define SEP_H      8
 #define PAD        3            /* border + bevel + 1 */
 #define TEXT_X     20           /* check-mark column before the text */
-
-struct mitem {
-    unsigned     flags;
-    unsigned     id;
-    struct menu *sub;
-    char         text[ITEM_TEXT];
-};
-
-struct menu {
-    uint32_t     magic;
-    bool         bar;
-    bool         system;
-    int          n;
-    struct mitem items[ITEM_MAX];
-};
-
-static struct menu menus[MENU_MAX];
 
 static struct menu *menu_from(HMENU h)
 {
@@ -111,6 +95,7 @@ static struct menu *new_menu(bool bar)
         if (menus[i].magic != MENU_MAGIC) {
             memset(&menus[i], 0, sizeof menus[i]);
             menus[i].magic = MENU_MAGIC;
+            menus[i].pid = ui_pid;
             menus[i].bar = bar;
             return &menus[i];
         }
@@ -345,23 +330,12 @@ void menubar_paint(struct wnd *w)
 
 /* ---- pop-up windows ------------------------------------------------------------------ */
 
-struct level {
-    struct menu *m;
-    struct wnd  *w;
-    int          sel;           /* highlighted item, -1 none */
-};
-
-static struct {
-    struct wnd  *owner;
-    bool         bar;           /* tracking the owner's menu bar */
-    bool         system;        /* the root is the system menu */
-    bool         sysclick;      /* opened by a click on the system box */
-    uint32_t     opened;
-    struct level lv[DEPTH];
-    int          n;
-    bool         done, chosen;
-    unsigned     result;
-} T;
+void menu_process_gone(int pid)
+{
+    for (int i = 0; i < MENU_MAX; i++)
+        if (menus[i].magic == MENU_MAGIC && menus[i].pid == pid)
+            menus[i].magic = 0;
+}
 
 static int item_h(const struct mitem *it) { return (it->flags & MF_SEPARATOR) ? SEP_H : MITEM_H; }
 
@@ -398,7 +372,7 @@ static const uint16_t g_check[9] = { 0x0080, 0x0180, 0x0300, 0x8600, 0xCC00, 0x7
 static const uint16_t g_dot[7]   = { 0x3800, 0x7C00, 0xFE00, 0xFE00, 0xFE00, 0x7C00, 0x3800 };
 static const uint16_t g_arrow[7] = { 0x8000, 0xC000, 0xE000, 0xF000, 0xE000, 0xC000, 0x8000 };
 
-static void popup_paint(struct wnd *w, struct level *lv)
+static void popup_paint(struct wnd *w, struct menu_level *lv)
 {
     struct gfx *g = &ui_gfx;
     int x = w->x, y = w->y, cw = w->w, ch = w->h;
@@ -442,7 +416,7 @@ LRESULT menu_popup_proc(HWND h, unsigned msg, WPARAM wp, LPARAM lp)
         PAINTSTRUCT ps;
         HDC dc = BeginPaint(h, &ps);
         dc_apply(dc);
-        struct level *lv = (struct level *)(uintptr_t)w->userdata;
+        struct menu_level *lv = (struct menu_level *)(uintptr_t)w->userdata;
         if (lv && lv->m)
             popup_paint(w, lv);
         EndPaint(h, &ps);
@@ -451,7 +425,7 @@ LRESULT menu_popup_proc(HWND h, unsigned msg, WPARAM wp, LPARAM lp)
     return DefWindowProc(h, msg, wp, lp);
 }
 
-static void invalidate_item(struct level *lv, int i)
+static void invalidate_item(struct menu_level *lv, int i)
 {
     if (i < 0 || !lv->w)
         return;
@@ -460,7 +434,7 @@ static void invalidate_item(struct level *lv, int i)
 
 static void set_sel(int k, int i)
 {
-    struct level *lv = &T.lv[k];
+    struct menu_level *lv = &T.lv[k];
     if (lv->sel == i)
         return;
     invalidate_item(lv, lv->sel);
@@ -500,7 +474,7 @@ static void open_popup_at(struct menu *m, int x, int y, bool keyboard, int pos, 
     if (y + h > 480) y = 480 - h;
     if (x < 0) x = 0;
     if (y < 0) y = 0;
-    struct level *lv = &T.lv[T.n];
+    struct menu_level *lv = &T.lv[T.n];
     lv->m = m;
     lv->sel = keyboard ? first_selectable(m) : -1;
     lv->w = wnd_from(CreateWindow("#MENU", "", WS_POPUP | WS_VISIBLE, x, y, w, h, NULL, 0, NULL));
@@ -530,7 +504,7 @@ static void open_bar_item(int i, bool keyboard)
 
 static void open_sub(int k, int i, bool keyboard)   /* item i of level k */
 {
-    struct level *lv = &T.lv[k];
+    struct menu_level *lv = &T.lv[k];
     close_to(k + 1);
     struct mitem *it = &lv->m->items[i];
     if ((it->flags & MF_POPUP) && enabled(it))
@@ -583,7 +557,7 @@ static int level_at(int x, int y)
 
 static int item_at(int k, int y)
 {
-    struct level *lv = &T.lv[k];
+    struct menu_level *lv = &T.lv[k];
     int ry = y - lv->w->y;
     for (int i = 0; i < lv->m->n; i++) {
         int top = item_top(lv->m, i);
@@ -730,6 +704,7 @@ static void key(int vk)
 /* Run the loop; -> the chosen id (0 for none), already sent unless asked. */
 static unsigned run(bool return_cmd)
 {
+    ui_modal_begin();
     if (T.bar || T.system)
         SendMessage(T.owner, WM_INITMENU, (WPARAM)(T.bar ? T.owner->menu : T.owner->sysmenu), 0);
     while (!T.done) {
@@ -754,6 +729,7 @@ static unsigned run(bool return_cmd)
     if (owner && T.chosen && !return_cmd)
         PostMessage(owner, T.system ? WM_SYSCOMMAND : WM_COMMAND, T.system ? id : MAKEWPARAM(id, 0), 0);
     memset(&T, 0, sizeof T);
+    ui_modal_end();
     return id;
 }
 
@@ -832,6 +808,11 @@ int TrackPopupMenu(HMENU h, unsigned flags, int x, int y, HWND owner)
     if (!m || !o || !start(o))
         return 0;
     T.system = m->system;
+    if (flags & TPM_BOTTOMALIGN) {
+        int w, h;
+        popup_size(m, &w, &h);
+        y -= h;
+    }
     open_popup(m, x, y, false, 0);
     unsigned id = run(flags & TPM_RETURNCMD);
     return (flags & TPM_RETURNCMD) ? (int)id : id != 0;

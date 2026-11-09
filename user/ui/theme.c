@@ -20,11 +20,3 @@ const uint8_t theme_palette[16][3] = {
     [C_YELLOW]    = { 63, 56, 16 },
     [C_ACCENT_DK] = { 16, 16, 40 },
 };
-
-void InitUI(void)
-{
-    ui_screen_init();
-    gfx_set_palette(theme_palette);
-    ui_init_classes();
-    ui_invalidate_screen(0, 0, 640, 480);
-}

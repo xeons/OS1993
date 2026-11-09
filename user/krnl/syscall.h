@@ -29,6 +29,16 @@ static inline int  sys_get_key(void)         { return (int)syscall3(SYS_GET_KEY,
 static inline int  sys_new_session(void)     { return (int)syscall3(SYS_NEW_SESSION, 0, 0, 0); }
 static inline int  sys_get_event(struct user_event *e) { return (int)syscall3(SYS_GET_EVENT, (uint32_t)e, 0, 0); }
 static inline int  sys_mouse(void)           { return (int)syscall3(SYS_MOUSE, 0, 0, 0); }
+static inline int  sys_exec(const char *p, const char *a) { return (int)syscall3(SYS_EXEC, (uint32_t)p, (uint32_t)a, 0); }
+static inline int  sys_wait(uint32_t ms, uint32_t f)     { return (int)syscall3(SYS_WAIT, ms, f, 0); }
+static inline int  sys_wake(int pid)         { return (int)syscall3(SYS_WAKE, (uint32_t)pid, 0, 0); }
+static inline int  sys_getpid(void)          { return (int)syscall3(SYS_GETPID, 0, 0, 0); }
+static inline int  sys_alive(int pid)        { return (int)syscall3(SYS_PROC_ALIVE, (uint32_t)pid, 0, 0); }
+static inline int  sys_kill(int pid)         { return (int)syscall3(SYS_KILL, (uint32_t)pid, 0, 0); }
+static inline int  sys_lock(int n)           { return (int)syscall3(SYS_LOCK, (uint32_t)n, 0, 0); }
+static inline int  sys_unlock(int n)         { return (int)syscall3(SYS_UNLOCK, (uint32_t)n, 0, 0); }
+static inline int  sys_time(struct systime *t) { return (int)syscall3(SYS_TIME, (uint32_t)t, 0, 0); }
+static inline uint32_t sys_exits(void)       { return syscall3(SYS_PROC_EXITS, 0, 0, 0); }
 __attribute__((noreturn))
 static inline void sys_exit(int code)
 {

@@ -15,7 +15,8 @@ BUILD = os.path.join(ROOT, "build")
 QDIR = os.path.join(BUILD, "qemu")
 IMG = os.path.join(BUILD, "freedos.img")
 
-KEYS = {" ": "spc", "\n": "ret", ".": "dot", ",": "comma", "-": "minus", "/": "slash"}
+KEYS = {" ": "spc", "\n": "ret", ".": "dot", ",": "comma", "-": "minus", "/": "slash",
+        "=": "equal", "+": "shift-equal", "*": "shift-8", "%": "shift-5", "@": "shift-2"}
 
 
 def near(rgb, want, tol=4):
@@ -152,6 +153,22 @@ class Machine:
         except BlockingIOError:
             pass
 
+    # The GUI session: the shell, the Control Demo from its Start menu, and
+    # Start > Shut Down at the end.
+    def start_gui(self):
+        self.key("g")
+        return self.wait_log("GUI: shell ready")
+
+    def start_demo(self, n=1):
+        for k in ("ctrl-esc", "p", "d"):
+            self.key(k)
+        return self.wait_log("GUI: desktop ready", n) and self.wait_log("GUI: mouse ready", n)
+
+    def shut_down(self):
+        for k in ("ctrl-esc", "u", "y"):
+            self.key(k)
+        return self.wait_log("USER: SHELL.BIN exited with code 0")
+
     def key(self, k, pause=0.25):
         self.cmd(f"sendkey {k}", pause)
 
@@ -194,6 +211,11 @@ class Machine:
 
     def rclick(self, pause=0.6):
         self.cmd("mouse_button 2", 0.3)
+        self.cmd("mouse_button 0", pause)
+
+    def dblclick(self, pause=0.6):
+        for b in ("1", "0", "1"):
+            self.cmd(f"mouse_button {b}", 0.08)
         self.cmd("mouse_button 0", pause)
 
     def click(self, pause=0.6):

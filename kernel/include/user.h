@@ -1,5 +1,5 @@
 /*
- * user.h -- ring-3 programs (the GUI) and the INT 30h system call interface.
+ * user.h -- ring-3 processes and the INT 30h system call interface.
  *
  * Shared with the ring-3 side (user/): the system call numbers, the image
  * header and the info block a program receives in EBX at entry.
@@ -10,13 +10,20 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-/* Ring-3 address space (global for now: there is one ring-3 program) */
-#define USER_BASE       0x00400000u     /* image is linked here */
+/* Each process has its own address space below 2 GB; the shared region is
+ * the same memory, at the same address, in all of them (like Win95's shared
+ * arena, where USER kept its data). */
+#define USER_BASE       0x00400000u     /* a program's image is linked here */
 #define USER_LIMIT      0x80000000u     /* the kernel starts here */
 #define USER_STACK_TOP  0x7FFF0000u
 #define USER_STACK_SIZE 0x00010000u
-#define USER_VGA        0x7FF00000u     /* A000:0000-AFFF, 64 KB */
 #define USER_INFO       0x7FFF0000u     /* struct user_info + the font */
+#define USER_SHARED     0x60000000u     /* shared region (one page table): */
+#define USER_VGA        0x60000000u     /*   A000:0000-AFFF, 64 KB */
+#define USER_ARENA      0x60010000u     /*   the shared arena */
+#define USER_ARENA_SIZE 0x00080000u     /*   512 KB */
+#define PROC_MAX        8               /* processes at once */
+#define ARGS_MAX        128
 
 /*
  * Module format, for programs and DLLs alike. Each module is linked at a
@@ -66,6 +73,16 @@ struct user_info {                      /* at USER_INFO, pointed to by EBX */
     uint32_t vga;                       /* user address of video memory */
     uint32_t font;                      /* user address of the 8x16 font */
     uint32_t width, height;
+    uint32_t pid;
+    uint32_t arena, arena_size;         /* the shared arena */
+    char     name[16];                  /* the program's file name */
+    char     args[ARGS_MAX];            /* command line arguments */
+};
+
+/* Local time from the real-time clock (SYS_TIME); fields as in SYSTEMTIME */
+struct systime {
+    uint16_t year, month, day_of_week, day;
+    uint16_t hour, minute, second, ms;
 };
 
 /* An input event (SYS_GET_EVENT) */
@@ -94,19 +111,40 @@ struct user_event {
 #define SYS_NEW_SESSION 6               /* start a DOS session -> VM id, or -1 */
 #define SYS_GET_EVENT   7               /* EBX = struct user_event * -> 1, or 0 */
 #define SYS_MOUSE       8               /* -> 1 if there is a mouse */
+#define SYS_EXEC        9               /* EBX = program, ECX = args -> pid, or -1 */
+#define SYS_WAIT        10              /* EBX = timeout ms (~0: none), ECX = WAIT_INPUT
+                                           -> 1 woken, 0 timed out or input */
+#define SYS_WAKE        11              /* EBX = pid: end (or pre-empt) its SYS_WAIT */
+#define SYS_GETPID      12
+#define SYS_PROC_ALIVE  13              /* EBX = pid -> 1 if it is running */
+#define SYS_KILL        14              /* EBX = pid -> 0, or -1 */
+#define SYS_LOCK        15              /* EBX = lock 0-7: wait for it, then own it */
+#define SYS_UNLOCK      16              /* EBX = lock */
+#define SYS_TIME        17              /* EBX = struct systime * */
+#define SYS_PROC_EXITS  18              /* -> how many processes have ended so far */
+#define WAIT_INFINITE   0xFFFFFFFFu
+#define WAIT_INPUT      1               /* also end the wait when input is pending */
+#define LOCK_MAX        8
 
 #ifndef USER_SIDE                       /* kernel only */
 struct regs;
 void syscall_dispatch(struct regs *r);
 void user_fault(struct regs *r);
 
-/* Load and start a ring-3 program from the directory VMM.BIN came from.
- * Returns 0, or -1 if it couldn't be loaded. */
+void user_return(struct regs *r);       /* about to return to ring 3 */
+struct process;
+void proc_switch(struct process *p);    /* scheduler: install its address space */
+
+/* Start a ring-3 session with its first process (the shell), loaded from
+ * the directory VMM.BIN came from. Returns 0, or -1 if it couldn't be
+ * loaded. The session lasts until that process ends; the others go too. */
 int  user_start(const char *name, uint32_t flags);
 bool user_running(void);
-void user_tick(void);                   /* timer: wake a waiting program */
+void user_service(void);                /* console thread: loads, reaping */
+void user_tick(void);                   /* timer: wake waiting processes */
 void user_screen(bool ours);            /* the GUI gained/lost the screen */
-/* After it ended: exit code (>= 0) or -(exception number + 1). */
+/* After the session: the first process's exit code (>= 0) or
+ * -(exception number + 1). */
 int  user_result(void);
 void user_selftest(void);
 #endif

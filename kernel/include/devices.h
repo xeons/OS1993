@@ -12,6 +12,7 @@ uint32_t timer_ticks(void);
 /* keyboard.c -- raw set-1 scancodes from the 8042 */
 void keyboard_init(void);
 int  keyboard_read(void);            /* next scancode, or -1 */
+bool keyboard_pending(void);
 int  keyboard_poll_key(void);        /* interrupts off: wait for a key press */
 
 /* mouse.c -- PS/2 mouse on IRQ 12 */
@@ -22,5 +23,6 @@ void mouse_byte(uint8_t b);          /* a byte from the auxiliary port */
 bool mouse_present(void);
 void mouse_set_delivery(bool on);    /* queue events for the GUI */
 bool mouse_get_event(struct user_event *e);
+bool mouse_pending(void);
 
 #endif

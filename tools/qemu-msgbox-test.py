@@ -6,7 +6,7 @@ Accelerators: F1 and Ctrl+Q in Programs, Ctrl+R and Ctrl+3 in Controls
 to their owner (clicking the owner leaves the box in front), Enter takes
 the default button (also when it's Cancel), Tab moves between buttons,
 letters answer Yes/No, Esc does nothing in a Yes/No box, Alt+F4 means
-Cancel, and Yes on the exit confirmation ends the GUI.
+Cancel, and Yes on the exit confirmation ends the demo.
 """
 import sys
 import os
@@ -21,8 +21,7 @@ def main():
     with Machine() as m:
         if not m.wait_log("PS/2 mouse"):
             raise SystemExit("  FAIL  VMM did not boot")
-        m.key("g")
-        check(m.wait_log("GUI: desktop ready"), "GUI started")
+        check(m.start_gui() and m.start_demo(), "GUI started (shell, then the Control Demo)")
 
         # --- Programs: F1 opens the Contents box; the owner is disabled ---
         m.goto(120, 25); m.click()
@@ -37,7 +36,7 @@ def main():
 
         # --- Ctrl+Q: Yes/No question; N answers, Esc can't cancel ---
         m.key("ctrl-q")
-        check(m.wait_log("GUI: accel Exit to VMM"), "Ctrl+Q accelerator")
+        check(m.wait_log("GUI: accel Exit"), "Ctrl+Q accelerator")
         m.screenshot("msgbox-question")
         m.key("esc")
         m.key("n")
@@ -72,7 +71,8 @@ def main():
         m.goto(120, 25); m.click()
         m.key("ctrl-q"); m.key("y")
         check(m.wait_log("GUI: box Exit -> 6"), "Y answers Yes")
-        check(m.wait_log("USER: exited with code 0"), "Yes on the confirmation ends the GUI")
+        check(m.wait_log("USER: DEMO.BIN exited with code 0"), "Yes on the confirmation ends the demo")
+        check(m.shut_down(), "Start > Shut Down ends the GUI")
         m.key("x", 1)
         check(m.wait_exit(), "QEMU powered off")
     return 1 if check.failures else 0

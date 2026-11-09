@@ -12,6 +12,7 @@
 #include "mm.h"
 #include "sched.h"
 #include "vm.h"
+#include "user.h"
 
 static struct thread threads[MAX_THREADS];
 struct thread *current;
@@ -113,6 +114,7 @@ void schedule(void)
     struct thread *prev = current;
     current = next;
     vm_switch_to(next->vm);                 /* PDE 0 and TSS.ESP0 */
+    proc_switch(next->proc);                /* user PDEs (ring-3 processes) */
     if (next->user)                         /* traps from ring 3 land here */
         kernel_tss.esp0 = (uint32_t)(uintptr_t)next->stack + THREAD_STACK;
     switch_context(&prev->esp, next->esp);

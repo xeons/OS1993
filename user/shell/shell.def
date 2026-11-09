@@ -1,0 +1,9 @@
+; SHELL.DLL -- the shell API: starting programs, About, tray icons, stock icons
+LIBRARY SHELL.DLL
+BASE    0x10300000
+EXPORTS
+    ShellExecute
+    ShellAbout
+    Shell_NotifyIcon
+    DrawIcon
+    DrawSmallIcon

@@ -281,3 +281,40 @@ void gfx_text(struct gfx *g, int x, int y, const char *s, uint8_t fg, uint8_t bg
         blit_rows(g, x, y, rows, 16, fg, 0x00);
     }
 }
+
+/* Copy w x h pixels (one byte each, a colour index) to x,y through the
+ * clip. On a memory target whole bytes of 8 pixels go at once. */
+void gfx_blit8(struct gfx *g, int x, int y, int w, int h, const uint8_t *pixels, int stride)
+{
+    int x0 = x > g->cx0 ? x : g->cx0, x1 = x + w < g->cx1 ? x + w : g->cx1;
+    int y0 = y > g->cy0 ? y : g->cy0, y1 = y + h < g->cy1 ? y + h : g->cy1;
+    if (x0 >= x1 || y0 >= y1)
+        return;
+    for (int row = y0; row < y1; row++) {
+        const uint8_t *src = pixels + (row - y) * stride - x;
+        if (!g->planes) {
+            for (int px = x0; px < x1; px++)
+                if (src[px] != 0xFF)
+                    gfx_pixel(g, px, row, src[px]);
+            continue;
+        }
+        for (int col = x0 >> 3; col <= (x1 - 1) >> 3; col++) {
+            uint8_t bits[4] = { 0, 0, 0, 0 }, mask = 0;
+            for (int b = 0; b < 8; b++) {
+                int px = col * 8 + b;
+                if (px < x0 || px >= x1)
+                    continue;
+                uint8_t bit = (uint8_t)(0x80 >> b), c = src[px];
+                if (c == 0xFF)                      /* transparent */
+                    continue;
+                mask |= bit;
+                for (int p = 0; p < 4; p++)
+                    if (c & (1 << p))
+                        bits[p] |= bit;
+            }
+            uint8_t *q = g->planes + row * g->stride + col;
+            for (int p = 0; p < 4; p++, q += GFX_PLANE_BYTES)
+                *q = (uint8_t)((*q & ~mask) | bits[p]);
+        }
+    }
+}

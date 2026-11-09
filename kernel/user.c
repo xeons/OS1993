@@ -1,16 +1,29 @@
 /*
- * user.c -- ring-3 programs: loading, the INT 30h system calls, faults.
+ * user.c -- ring-3 processes: address spaces, loading, the INT 30h system
+ * calls, waiting and waking, locks, faults.
  *
- * There is one ring-3 program at a time: the GUI, which belongs to the
- * System VM (Windows ran its protected-mode code there too). Programs and
- * the DLLs they import are MOD3 modules (kernel/include/user.h), each
- * linked at a fixed address. The VMM console thread loads them through
- * DOS -- the System VM's own file system -- into fresh user pages, fills in
- * every program's and DLL's imports, and starts a ring-3 thread.
+ * A ring-3 session (the GUI) is a set of processes, each with one thread
+ * and its own address space below 2 GB. There is still a single page
+ * directory: a process owns the user page-directory entries (1-511), which
+ * are swapped in when one of its threads is scheduled -- the trick VMs use
+ * for PDE 0 -- so the kernel half is the same everywhere by construction.
+ * The shared region (video memory and the shared arena, where UI.DLL keeps
+ * the window manager's state) is one page table installed in every process.
+ *
+ * Programs and DLLs are MOD3 modules (kernel/include/user.h). The VMM
+ * console thread loads them through DOS, the System VM's own file system:
+ * a process asking for another (SYS_EXEC) queues a request and waits. Each
+ * process gets its own copy of every DLL it imports, at the DLL's base.
+ *
+ * Processes synchronise with SYS_WAIT / SYS_WAKE (a process sleeps until
+ * another wakes it, input arrives, or a timeout) and with kernel locks,
+ * which are handed to the next waiter and released if their owner dies.
+ * The session ends when its first process (the shell) does.
  */
 #include "kernel.h"
 #include "devices.h"
 #include "gdt.h"
+#include "interrupts.h"
 #include "io.h"
 #include "mm.h"
 #include "sched.h"
@@ -19,59 +32,98 @@
 #include "vga.h"
 #include "vm.h"
 
-#define MAX_IMAGE  (2u * 1024 * 1024)
+#define MAX_IMAGE   (2u * 1024 * 1024)
+#define USER_PDES   512                     /* PDEs 0-511 cover user space */
+#define SHARED_PDE  (USER_SHARED >> 22)
 
 struct module {
     char     name[16];
-    uint32_t base, end;                 /* mapped [base, end) */
+    uint32_t base, end;                     /* mapped [base, end) */
     uint32_t exports, imports;
     bool     resolved;
 };
 
+enum pstate { P_FREE, P_RUNNING, P_DEAD };
+
+struct process {
+    enum pstate    state;
+    int            pid;
+    char           name[16];
+    struct thread *thread;
+    uint32_t      *pde;                     /* user PDEs while not installed */
+    struct module  mods[MOD_MAX];           /* mods[0] is the program */
+    int            nmods;
+    uint32_t       entry;
+    int            result;
+    bool           killed;
+    volatile bool  wake;                    /* a wake-up is pending */
+    bool           waiting;                 /* in SYS_WAIT */
+    bool           wait_input;              /* ... and input ends it */
+    uint32_t       deadline;                /* tick to give up waiting, 0: never */
+    int            lock_wait;               /* lock it waits for, -1 none */
+};
+
 void user_enter(uint32_t eip, uint32_t esp, uint32_t ebx);  /* entry.asm */
 
+static struct process procs[PROC_MAX];
+static struct process *installed;           /* whose PDEs are in the directory */
+static int next_pid = 1;
+
 static struct {
-    struct thread *thread;
-    volatile bool  running;
+    bool           running;                 /* a session is on */
+    int            leader;                  /* its first process */
     int            result;
-    uint32_t       entry;
-    struct module  mods[MOD_MAX];       /* mods[0] is the program */
-    int            nmods;
-    bool           vga_mapped;
-    uint32_t       prints;              /* SYS_PRINT calls (self-test) */
-    volatile int   focus_event;         /* -1 none, else EV_FOCUS key */
-    bool           background;          /* VGA ports trapped */
+    uint32_t       flags;
+    uint32_t       shared_pde;              /* the shared region's page table */
+    uint32_t       prints;                  /* SYS_PRINT calls (self-test) */
+    uint32_t       exits;
+    volatile int   focus_event;             /* -1 none, else EV_FOCUS key */
+    bool           background;              /* VGA ports trapped */
+    int            lock_owner[LOCK_MAX];    /* pid, 0 = free */
 } u = { .focus_event = -1 };
 
-/* VGA ports the display driver uses */
-static bool vga_port(uint16_t p)
+static struct {                             /* one exec request at a time */
+    volatile bool  pending;
+    char           name[16];
+    char           args[ARGS_MAX];
+    struct thread *waiter;
+    int            pid;
+} req;
+
+static void strncpy0(char *d, const char *s, size_t size)
 {
-    return (p >= 0x3C0 && p <= 0x3CF) || p == 0x3D4 || p == 0x3D5 || p == 0x3DA;
+    size_t n = 0;
+    while (n + 1 < size && s[n]) { d[n] = s[n]; n++; }
+    d[n] = '\0';
 }
 
-static void trap_vga(bool trap)
+static struct process *proc_of(int pid)
 {
-    for (uint16_t p = 0x3C0; p <= 0x3DA; p++)
-        if (vga_port(p))
-            tss_trap_port(p, trap);
+    for (int i = 0; i < PROC_MAX; i++)
+        if (procs[i].state == P_RUNNING && procs[i].pid == pid)
+            return &procs[i];
+    return NULL;
 }
 
-/* While a DOS session has the screen the GUI must not touch the VGA: its
- * port accesses trap and are emulated (writes dropped, reads FFh), and it
- * is told to stop drawing, then to repaint when the screen comes back --
- * what Windows' VDD did for a System VM in the background. */
-void user_screen(bool ours)
+static struct process *cur_proc(void) { return current ? current->proc : NULL; }
+
+/* ---- address spaces ------------------------------------------------------ */
+
+/* Install p's user PDEs (scheduler, loader). Kernel threads keep whatever
+ * is installed: they never touch user memory. */
+void proc_switch(struct process *p)
 {
-    if (!u.running || ours == !u.background)
+    if (!p || p == installed)
         return;
-    u.background = !ours;
-    trap_vga(!ours);
-    u.focus_event = ours ? 1 : 0;
-    if (u.thread)
-        thread_wake(u.thread);
+    volatile uint32_t *pd = (volatile uint32_t *)PD_WINDOW;
+    if (installed)
+        for (int i = 1; i < USER_PDES; i++)
+            installed->pde[i] = pd[i];
+    for (int i = 1; i < USER_PDES; i++)
+        pd[i] = p->pde[i];
+    installed = p;
+    tlb_flush();
 }
-
-/* ---- user address space ------------------------------------------------ */
 
 static bool map_zeroed(uint32_t va, uint32_t len)
 {
@@ -95,17 +147,49 @@ static void unmap_free(uint32_t va, uint32_t len)
     }
 }
 
-static void release_address_space(void)
+/* Free everything p mapped (p must be installed), page tables included. */
+static void release_address_space(struct process *p)
 {
-    for (int i = 0; i < u.nmods; i++)
-        unmap_free(u.mods[i].base, u.mods[i].end - u.mods[i].base);
-    u.nmods = 0;
+    for (int i = 0; i < p->nmods; i++)
+        unmap_free(p->mods[i].base, p->mods[i].end - p->mods[i].base);
+    p->nmods = 0;
     unmap_free(USER_STACK_TOP - USER_STACK_SIZE, USER_STACK_SIZE);
     unmap_free(USER_INFO, 2 * PAGE_SIZE);
-    if (u.vga_mapped)                       /* device memory: unmap, don't free */
-        for (uint32_t i = 0; i < 16; i++)
-            vmm_unmap(USER_VGA + i * PAGE_SIZE);
-    u.vga_mapped = false;
+    volatile uint32_t *pd = (volatile uint32_t *)PD_WINDOW;
+    for (int i = 1; i < USER_PDES; i++) {
+        if (i == SHARED_PDE)                    /* shared_destroy's business */
+            continue;
+        if (pd[i] & PTE_P)
+            pmm_free(pd[i] & PAGE_MASK);
+        pd[i] = 0;
+    }
+    tlb_flush();
+}
+
+/* The shared region: video memory and the arena, for the whole session. */
+static bool shared_create(void)
+{
+    for (uint32_t i = 0; i < 16; i++)
+        if (vmm_map(USER_VGA + i * PAGE_SIZE, 0xA0000 + i * PAGE_SIZE, PTE_W | PTE_U) != 0)
+            return false;
+    if (!map_zeroed(USER_ARENA, USER_ARENA_SIZE))
+        return false;
+    u.shared_pde = ((volatile uint32_t *)PD_WINDOW)[SHARED_PDE];
+    return true;
+}
+
+static void shared_destroy(void)                /* the last process is installed */
+{
+    if (!u.shared_pde)
+        return;
+    for (uint32_t i = 0; i < 16; i++)
+        vmm_unmap(USER_VGA + i * PAGE_SIZE);    /* device memory: don't free */
+    unmap_free(USER_ARENA, USER_ARENA_SIZE);
+    volatile uint32_t *pd = (volatile uint32_t *)PD_WINDOW;
+    pmm_free(u.shared_pde & PAGE_MASK);
+    pd[SHARED_PDE] = 0;
+    tlb_flush();
+    u.shared_pde = 0;
 }
 
 /* Is [p, p+len) ordinary mapped user memory? */
@@ -119,7 +203,20 @@ static bool user_range_ok(uint32_t p, uint32_t len)
     return true;
 }
 
-/* ---- loading ------------------------------------------------------------ */
+static bool user_string(uint32_t p, char *out, size_t size)
+{
+    for (size_t n = 0; n < size; n++) {
+        if (!user_range_ok(p + n, 1))
+            return false;
+        out[n] = *(const char *)(uintptr_t)(p + n);
+        if (!out[n])
+            return true;
+    }
+    out[size - 1] = '\0';
+    return true;
+}
+
+/* ---- loading ------------------------------------------------------------- */
 
 static int dos_open(const char *path)
 {
@@ -160,14 +257,6 @@ static void program_path(const char *name, char *out, size_t size)
     memcpy(out + dir, name, strlen(name) + 1);
 }
 
-static void user_thread_main(void *arg)
-{
-    (void)arg;
-    user_enter(u.entry, USER_STACK_TOP, USER_INFO);
-}
-
-/* ---- modules ------------------------------------------------------------- */
-
 static bool same_name(const char *a, const char *b)
 {
     for (;; a++, b++) {
@@ -195,18 +284,18 @@ static const char *mod_str(const struct module *m, uint32_t va, uint32_t max)
     return NULL;
 }
 
-static struct module *find_module(const char *name)
+static struct module *find_module(struct process *p, const char *name)
 {
-    for (int i = 0; i < u.nmods; i++)
-        if (same_name(u.mods[i].name, name))
-            return &u.mods[i];
+    for (int i = 0; i < p->nmods; i++)
+        if (same_name(p->mods[i].name, name))
+            return &p->mods[i];
     return NULL;
 }
 
 /* Read a module file into fresh user pages at its own base address. */
-static struct module *load_module(const char *name, uint32_t kind)
+static struct module *load_module(struct process *p, const char *name, uint32_t kind)
 {
-    if (u.nmods == MOD_MAX) {
+    if (p->nmods == MOD_MAX) {
         klog("USER: too many modules loading %s\n", name);
         return NULL;
     }
@@ -231,8 +320,8 @@ static struct module *load_module(const char *name, uint32_t kind)
         ok = hdr.base == USER_BASE && hdr.entry >= hdr.base && hdr.entry < hdr.base + hdr.file_size;
     if (ok && kind == MOD_LIBRARY)
         ok = hdr.base >= DLL_BASE && end <= DLL_LIMIT;
-    for (int i = 0; ok && i < u.nmods; i++)         /* no overlaps */
-        ok = end <= u.mods[i].base || hdr.base >= u.mods[i].end;
+    for (int i = 0; ok && i < p->nmods; i++)         /* no overlaps */
+        ok = end <= p->mods[i].base || hdr.base >= p->mods[i].end;
     if (!ok) {
         klog("USER: %s is not a valid %s module (or overlaps another)\n", path,
              kind == MOD_PROGRAM ? "program" : "library");
@@ -240,7 +329,7 @@ static struct module *load_module(const char *name, uint32_t kind)
         return NULL;
     }
 
-    struct module *m = &u.mods[u.nmods];
+    struct module *m = &p->mods[p->nmods];
     memset(m, 0, sizeof *m);
     m->base = hdr.base;
     m->end = end;
@@ -250,7 +339,7 @@ static struct module *load_module(const char *name, uint32_t kind)
         klog("USER: out of memory loading %s\n", path);
         return NULL;
     }
-    u.nmods++;
+    p->nmods++;
 
     uint32_t loaded = 0;
     while (n > 0 && loaded < hdr.file_size) {
@@ -270,7 +359,7 @@ static struct module *load_module(const char *name, uint32_t kind)
     m->exports = hdr.exports;
     m->imports = hdr.imports;
     if (kind == MOD_PROGRAM)
-        u.entry = hdr.entry;
+        p->entry = hdr.entry;
     return m;
 }
 
@@ -290,7 +379,7 @@ static uint32_t find_export(const struct module *dll, const char *name)
 }
 
 /* Load (if needed) and link every DLL module m imports. */
-static bool resolve(struct module *m, int depth)
+static bool resolve(struct process *p, struct module *m, int depth)
 {
     if (m->resolved)
         return true;
@@ -301,7 +390,6 @@ static bool resolve(struct module *m, int depth)
         klog("USER: imports nested too deeply in %s\n", m->name);
         return false;
     }
-    unsigned linked = 0;
     for (uint32_t d = m->imports;; d += sizeof(struct mod_import)) {
         if (!in_mod(m, d, sizeof(struct mod_import)))
             return false;
@@ -311,16 +399,10 @@ static bool resolve(struct module *m, int depth)
         const char *dll_name = mod_str(m, imp->module, 16);
         if (!dll_name)
             return false;
-        struct module *dll = find_module(dll_name);
-        if (!dll) {
-            dll = load_module(dll_name, MOD_LIBRARY);
-            if (!dll)
-                return false;
-            const struct mod_exports *ex = (const void *)(uintptr_t)dll->exports;
-            klog("USER: loaded %s at %08X (%u exports)\n", dll->name, dll->base,
-                 dll->exports && in_mod(dll, dll->exports, 4) ? ex->count : 0);
-        }
-        if (!resolve(dll, depth + 1))
+        struct module *dll = find_module(p, dll_name);
+        if (!dll && !(dll = load_module(p, dll_name, MOD_LIBRARY)))
+            return false;
+        if (!resolve(p, dll, depth + 1))
             return false;
         for (uint32_t k = 0;; k++) {
             uint32_t np = imp->names + 4 * k, sp = imp->slots + 4 * k;
@@ -337,91 +419,302 @@ static bool resolve(struct module *m, int depth)
                 return false;
             }
             *(uint32_t *)(uintptr_t)sp = addr;
-            linked++;
         }
     }
-    klog("USER: %s: %u imports linked\n", m->name, linked);
     return true;
 }
+
+static void user_thread_main(void *arg)
+{
+    struct process *p = arg;
+    user_enter(p->entry, USER_STACK_TOP, USER_INFO);
+}
+
+/* Create a process running program `name` (console thread only: loading
+ * goes through DOS). -> its pid, or -1. */
+static int spawn(const char *name, const char *args)
+{
+    struct process *p = NULL;
+    for (int i = 0; i < PROC_MAX; i++)
+        if (procs[i].state == P_FREE) { p = &procs[i]; break; }
+    if (!p) {
+        klog("USER: too many processes to start %s\n", name);
+        return -1;
+    }
+    uint32_t *pde = kzalloc(USER_PDES * sizeof(uint32_t));
+    if (!pde)
+        return -1;
+    memset(p, 0, sizeof *p);
+    p->pde = pde;
+    p->pid = next_pid++;
+    p->lock_wait = -1;
+    p->pde[SHARED_PDE] = u.shared_pde;              /* 0 for the first one */
+
+    struct thread *self = current;                  /* load into p's space */
+    struct process *was = self->proc;
+    self->proc = p;
+    proc_switch(p);
+    bool first = !u.shared_pde;
+    struct module *prog = load_module(p, name, MOD_PROGRAM);
+    bool ok = prog && resolve(p, prog, 0) &&
+              map_zeroed(USER_STACK_TOP - USER_STACK_SIZE, USER_STACK_SIZE) &&
+              map_zeroed(USER_INFO, 2 * PAGE_SIZE) &&
+              (!first || !(u.flags & UINFO_GRAPHICS) || shared_create());
+    if (ok) {
+        struct user_info *info = (struct user_info *)(uintptr_t)USER_INFO;
+        info->flags = u.flags;
+        info->width = VGA_GFX_W;
+        info->height = VGA_GFX_H;
+        info->font = USER_INFO + PAGE_SIZE;
+        info->pid = (uint32_t)p->pid;
+        memcpy((void *)(uintptr_t)info->font, vga_font8x16(), 256 * 16);
+        if (u.shared_pde) {
+            info->vga = USER_VGA;
+            info->arena = USER_ARENA;
+            info->arena_size = USER_ARENA_SIZE;
+        }
+        strncpy0(info->name, name, sizeof info->name);
+        strncpy0(info->args, args ? args : "", sizeof info->args);
+        strncpy0(p->name, name, sizeof p->name);
+        for (char *c = p->name; *c; c++)            /* DOS names: upper case */
+            if (*c >= 'a' && *c <= 'z')
+                *c = (char)(*c - 32);
+        p->thread = thread_create(p->name, user_thread_main, p, NULL);
+        ok = p->thread != NULL;
+    }
+    if (!ok) {
+        klog("USER: could not start %s\n", name);
+        release_address_space(p);
+        if (first)
+            shared_destroy();
+        self->proc = was;
+        installed = NULL;
+        kfree(p->pde);
+        memset(p, 0, sizeof *p);
+        return -1;
+    }
+    p->thread->user = true;
+    p->thread->proc = p;
+    p->state = P_RUNNING;
+    self->proc = was;                               /* stays installed (lazy) */
+    klog("USER: started %s as process %d (%d modules)\n", name, p->pid, p->nmods);
+    thread_wake(p->thread);
+    return p->pid;
+}
+
+/* ---- the session ------------------------------------------------------------ */
 
 int user_start(const char *name, uint32_t flags)
 {
     if (u.running)
         return -1;
-    if (u.thread && thread_reap(u.thread))
-        u.thread = NULL;
-    release_address_space();
-
-    struct module *prog = load_module(name, MOD_PROGRAM);
-    if (!prog || !resolve(prog, 0) ||
-        !map_zeroed(USER_STACK_TOP - USER_STACK_SIZE, USER_STACK_SIZE) ||
-        !map_zeroed(USER_INFO, 2 * PAGE_SIZE)) {
-        klog("USER: could not start %s\n", name);
-        release_address_space();
-        return -1;
-    }
-
-    /* Info block, the font, and (for the GUI) the video memory */
-    struct user_info *info = (struct user_info *)(uintptr_t)USER_INFO;
-    info->flags = flags;
-    info->width = VGA_GFX_W;
-    info->height = VGA_GFX_H;
-    info->font = USER_INFO + PAGE_SIZE;
-    memcpy((void *)(uintptr_t)info->font, vga_font8x16(), 256 * 16);
-    if (flags & UINFO_GRAPHICS) {
-        for (uint32_t i = 0; i < 16; i++)
-            vmm_map(USER_VGA + i * PAGE_SIZE, 0xA0000 + i * PAGE_SIZE, PTE_W | PTE_U);
-        u.vga_mapped = true;
-        info->vga = USER_VGA;
-    }
-
+    u.flags = flags;
     u.result = 0;
     u.prints = 0;
-    u.thread = thread_create("GUI", user_thread_main, NULL, NULL);
-    if (!u.thread) {
-        release_address_space();
-        return -1;
-    }
-    u.thread->user = true;
-    u.running = true;
     u.focus_event = -1;
     u.background = false;
+    memset(u.lock_owner, 0, sizeof u.lock_owner);
+    int pid = spawn(name, "");
+    if (pid < 0)
+        return -1;
+    u.leader = pid;
+    u.running = true;
     mouse_set_delivery((flags & UINFO_GRAPHICS) != 0);
-    klog("USER: started %s (entry %08X, %d modules)\n", name, u.entry, u.nmods);
-    thread_wake(u.thread);
     return 0;
 }
 
 bool user_running(void) { return u.running; }
 int  user_result(void)  { return u.result; }
 
-/* Called by the timer: a GUI waiting for a tick may run again. */
-void user_tick(void)
+static void wake_proc(struct process *p)
 {
-    if (u.running && u.thread)
-        thread_wake(u.thread);
+    p->wake = true;
+    if (p->waiting && p->thread)
+        thread_wake(p->thread);
 }
 
+/* Give lock n to its next waiter, if any. Interrupts off. */
+static void lock_handoff(int n)
+{
+    u.lock_owner[n] = 0;
+    for (int i = 0; i < PROC_MAX; i++) {
+        struct process *p = &procs[i];
+        if (p->state == P_RUNNING && p->lock_wait == n) {
+            p->lock_wait = -1;
+            u.lock_owner[n] = p->pid;
+            thread_wake(p->thread);
+            return;
+        }
+    }
+}
+
+/* Console thread, every loop: run exec requests, free ended processes. */
+void user_service(void)
+{
+    uint32_t f = irq_save();
+    for (int i = 0; i < PROC_MAX; i++) {
+        struct process *p = &procs[i];
+        if (p->state != P_DEAD || p->thread->state != T_DEAD)
+            continue;
+        thread_reap(p->thread);
+        current->proc = p;                          /* free its pages */
+        proc_switch(p);
+        release_address_space(p);
+        bool last = true;
+        for (int k = 0; k < PROC_MAX; k++)
+            if (&procs[k] != p && procs[k].state != P_FREE)
+                last = false;
+        if (last)
+            shared_destroy();
+        current->proc = NULL;
+        installed = NULL;
+        kfree(p->pde);
+        memset(p, 0, sizeof *p);
+        if (last && u.running) {                    /* the session is over */
+            u.running = false;
+            mouse_set_delivery(false);
+            if (u.background) {
+                for (uint16_t port = 0x3C0; port <= 0x3DA; port++)
+                    if ((port >= 0x3C0 && port <= 0x3CF) || port == 0x3D4 || port == 0x3D5 || port == 0x3DA)
+                        tss_trap_port(port, false);
+                u.background = false;
+            }
+        }
+    }
+    irq_restore(f);
+
+    if (req.pending) {
+        int pid = u.running ? spawn(req.name, req.args) : -1;
+        f = irq_save();
+        req.pid = pid;
+        req.pending = false;
+        thread_wake(req.waiter);
+        irq_restore(f);
+    }
+}
+
+/* The calling thread's process ends (interrupts off). */
 __attribute__((noreturn))
 static void finish(int result)
 {
-    mouse_set_delivery(false);
-    if (u.background) {
-        trap_vga(false);
-        u.background = false;
+    struct process *p = cur_proc();
+    klog("USER: %s exited with code %d\n", p->name, result);
+    p->state = P_DEAD;
+    p->result = result;
+    u.exits++;
+    for (int n = 0; n < LOCK_MAX; n++)
+        if (u.lock_owner[n] == p->pid)
+            lock_handoff(n);
+    if (p->pid == u.leader) {                       /* the shell: everyone goes */
+        u.result = result;
+        for (int i = 0; i < PROC_MAX; i++)
+            if (procs[i].state == P_RUNNING) {
+                procs[i].killed = true;
+                procs[i].lock_wait = -1;
+                thread_wake(procs[i].thread);
+            }
     }
-    u.result = result;
-    u.running = false;
+    for (int i = 0; i < PROC_MAX; i++)              /* others may wait on us */
+        if (procs[i].state == P_RUNNING)
+            wake_proc(&procs[i]);
     thread_exit();
 }
 
-/* ---- INT 30h ------------------------------------------------------------- */
+/* A killed process ends on its way back to ring 3. */
+void user_return(struct regs *r)
+{
+    (void)r;
+    struct process *p = cur_proc();
+    if (p && p->killed && p->state == P_RUNNING)
+        finish(-1);
+}
+
+static bool input_pending(void)
+{
+    return u.focus_event >= 0 || (vm_focus() == NULL && (keyboard_pending() || mouse_pending()));
+}
+
+/* Timer: wake processes whose wait timed out, or all waiters when input
+ * is pending (whoever gets there first routes it). */
+void user_tick(void)
+{
+    if (!u.running)
+        return;
+    uint32_t now = timer_ticks();
+    bool input = input_pending();
+    for (int i = 0; i < PROC_MAX; i++) {
+        struct process *p = &procs[i];
+        if (p->state != P_RUNNING || !p->waiting)
+            continue;
+        if ((input && p->wait_input) || (p->deadline && (int32_t)(now - p->deadline) >= 0))
+            thread_wake(p->thread);
+    }
+}
+
+/* While a DOS session has the screen the GUI must not touch the VGA: its
+ * port accesses trap and are emulated (writes dropped, reads FFh), and it
+ * is told to stop drawing, then to repaint when the screen comes back --
+ * what Windows' VDD did for a System VM in the background. */
+static bool vga_port(uint16_t p)
+{
+    return (p >= 0x3C0 && p <= 0x3CF) || p == 0x3D4 || p == 0x3D5 || p == 0x3DA;
+}
+
+void user_screen(bool ours)
+{
+    if (!u.running || !(u.flags & UINFO_GRAPHICS) || ours == !u.background)
+        return;
+    u.background = !ours;
+    if (!ours)                      /* keys still unread were for the switch (the */
+        while (keyboard_read() >= 0)    /* Alt of Alt+Tab): read later, Alt sticks */
+            ;
+    for (uint16_t p = 0x3C0; p <= 0x3DA; p++)
+        if (vga_port(p))
+            tss_trap_port(p, !ours);
+    u.focus_event = ours ? 1 : 0;
+    for (int i = 0; i < PROC_MAX; i++)
+        if (procs[i].state == P_RUNNING)
+            wake_proc(&procs[i]);
+}
+
+/* ---- the real-time clock ------------------------------------------------------ */
+
+static uint8_t cmos(uint8_t reg)
+{
+    outb(0x70, reg);
+    return inb(0x71);
+}
+
+static void read_time(struct systime *t)
+{
+    uint32_t f = irq_save();
+    while (cmos(0x0A) & 0x80)                       /* update in progress */
+        ;
+    uint8_t s = cmos(0x00), m = cmos(0x02), h = cmos(0x04), dow = cmos(0x06),
+            d = cmos(0x07), mo = cmos(0x08), y = cmos(0x09), b = cmos(0x0B);
+    irq_restore(f);
+    if (!(b & 0x04)) {                              /* BCD */
+#define BCD(x) (uint8_t)(((x) & 0x0F) + ((x) >> 4) * 10)
+        s = BCD(s); m = BCD(m); d = BCD(d); mo = BCD(mo); y = BCD(y);
+        h = (uint8_t)(BCD(h & 0x7F) | (h & 0x80));
+#undef BCD
+    }
+    if (!(b & 0x02) && (h & 0x80))                  /* 12-hour clock, PM */
+        h = (uint8_t)(((h & 0x7F) % 12) + 12);
+    else if (!(b & 0x02) && (h % 12) == 0 && h == 12)
+        h = 0;
+    *t = (struct systime){ .year = (uint16_t)(y < 80 ? 2000 + y : 1900 + y), .month = mo,
+                           .day_of_week = (uint16_t)(dow ? dow - 1 : 0), .day = d,
+                           .hour = (uint16_t)(h & 0x7F), .minute = m, .second = s, .ms = 0 };
+}
+
+/* ---- INT 30h ------------------------------------------------------------------ */
 
 void syscall_dispatch(struct regs *r)
 {
+    struct process *self = cur_proc();
     switch (r->eax) {
     case SYS_EXIT:
-        klog("USER: exited with code %u\n", r->ebx);
         finish((int)(r->ebx & 0xFF));
     case SYS_PRINT: {
         char text[160];
@@ -445,29 +738,161 @@ void syscall_dispatch(struct regs *r)
         r->eax = 0;
         break;
     case SYS_WAIT_TICK:
-        current->state = T_BLOCKED;         /* user_tick() wakes us */
+        self->waiting = true;
+        self->deadline = timer_ticks() + 1;
+        current->state = T_BLOCKED;
         schedule();
+        self->waiting = false;
         r->eax = 0;
         break;
+    case SYS_WAIT: {
+        if (self->wake) {
+            self->wake = false;
+            r->eax = 1;
+            break;
+        }
+        uint32_t ms = r->ebx;
+        if (ms == 0) {
+            r->eax = 0;
+            break;
+        }
+        bool for_input = r->ecx & WAIT_INPUT;
+        if (for_input && input_pending()) {
+            r->eax = 0;
+            break;
+        }
+        uint32_t ticks = ms == WAIT_INFINITE ? 0 : (ms * 10 + 548) / 549;
+        self->deadline = ticks ? timer_ticks() + ticks : 0;
+        self->waiting = true;
+        self->wait_input = for_input;
+        while (!self->wake && !self->killed) {
+            current->state = T_BLOCKED;
+            schedule();
+            if (self->deadline && (int32_t)(timer_ticks() - self->deadline) >= 0)
+                break;
+            if (for_input && input_pending())
+                break;                              /* input: look at it */
+        }
+        self->waiting = false;
+        self->wait_input = false;
+        r->eax = self->wake ? 1 : 0;
+        self->wake = false;
+        break;
+    }
+    case SYS_WAKE: {
+        struct process *p = proc_of((int)r->ebx);
+        if (p) wake_proc(p);
+        r->eax = p ? 0 : (uint32_t)-1;
+        break;
+    }
+    case SYS_GETPID:
+        r->eax = (uint32_t)self->pid;
+        break;
+    case SYS_PROC_ALIVE:
+        r->eax = proc_of((int)r->ebx) != NULL;
+        break;
+    case SYS_PROC_EXITS:
+        r->eax = u.exits;
+        break;
+    case SYS_KILL: {
+        struct process *p = proc_of((int)r->ebx);
+        if (!p) {
+            r->eax = (uint32_t)-1;
+            break;
+        }
+        klog("USER: killing %s (process %d)\n", p->name, p->pid);
+        p->killed = true;
+        if (p->lock_wait >= 0)
+            p->lock_wait = -1;
+        thread_wake(p->thread);
+        r->eax = 0;
+        if (p == self)
+            finish(-1);
+        break;
+    }
+    case SYS_LOCK: {
+        unsigned n = r->ebx;
+        if (n >= LOCK_MAX) {
+            r->eax = (uint32_t)-1;
+            break;
+        }
+        if (u.lock_owner[n] && !proc_of(u.lock_owner[n]))
+            u.lock_owner[n] = 0;                    /* its owner died */
+        if (!u.lock_owner[n]) {
+            u.lock_owner[n] = self->pid;
+        } else if (u.lock_owner[n] != self->pid) {
+            self->lock_wait = (int)n;               /* lock_handoff wakes us */
+            while (self->lock_wait == (int)n && !self->killed) {
+                current->state = T_BLOCKED;
+                schedule();
+            }
+        }
+        r->eax = u.lock_owner[n] == self->pid ? 0 : (uint32_t)-1;
+        break;
+    }
+    case SYS_UNLOCK: {
+        unsigned n = r->ebx;
+        if (n < LOCK_MAX && u.lock_owner[n] == self->pid) {
+            lock_handoff(n);
+            r->eax = 0;
+        } else {
+            r->eax = (uint32_t)-1;
+        }
+        break;
+    }
+    case SYS_EXEC: {
+        char name[16], args[ARGS_MAX];
+        if (!user_string(r->ebx, name, sizeof name) ||
+            (r->ecx && !user_string(r->ecx, args, sizeof args))) {
+            r->eax = (uint32_t)-1;
+            break;
+        }
+        if (!r->ecx)
+            args[0] = '\0';
+        while (req.pending) {                       /* one request at a time */
+            schedule();
+        }
+        memcpy(req.name, name, sizeof name);
+        memcpy(req.args, args, sizeof args);
+        req.waiter = current;
+        req.pending = true;
+        while (req.pending) {                       /* the console loads it */
+            current->state = T_BLOCKED;
+            schedule();
+        }
+        r->eax = (uint32_t)req.pid;
+        break;
+    }
+    case SYS_TIME: {
+        struct systime t;
+        if (!user_range_ok(r->ebx, sizeof t)) {
+            r->eax = (uint32_t)-1;
+            break;
+        }
+        read_time(&t);
+        memcpy((void *)(uintptr_t)r->ebx, &t, sizeof t);
+        r->eax = 0;
+        break;
+    }
     case SYS_GET_KEY:
         r->eax = vm_focus() == NULL ? (uint32_t)keyboard_read() : (uint32_t)-1;
         break;
     case SYS_GET_EVENT: {
         struct user_event e = { 0 };
-        int sc = vm_focus() == NULL ? keyboard_read() : -1;
+        if (!user_range_ok(r->ebx, sizeof e)) {
+            r->eax = (uint32_t)-1;
+            break;
+        }
+        int sc;
         if (u.focus_event >= 0) {
             e.type = EV_FOCUS;
             e.key = (uint16_t)u.focus_event;
             u.focus_event = -1;
-        } else if (sc >= 0) {
+        } else if ((sc = vm_focus() == NULL ? keyboard_read() : -1) >= 0) {
             e.type = EV_KEY;
             e.key = (uint16_t)sc;
         } else if (!mouse_get_event(&e)) {
             r->eax = 0;
-            break;
-        }
-        if (!user_range_ok(r->ebx, sizeof e)) {
-            r->eax = (uint32_t)-1;
             break;
         }
         memcpy((void *)(uintptr_t)r->ebx, &e, sizeof e);
@@ -519,24 +944,27 @@ void user_fault(struct regs *r)
 {
     if (emulate_vga_io(r))
         return;
+    struct process *p = cur_proc();
     if (r->int_no == 14)
-        klog("USER: GUI killed by exception 0E (page fault, %s %08X) at %04X:%08X\n",
-             (r->err_code & 2) ? "write to" : "read from", read_cr2(),
+        klog("USER: %s killed by exception 0E (page fault, %s %08X) at %04X:%08X\n",
+             p->name, (r->err_code & 2) ? "write to" : "read from", read_cr2(),
              r->cs & 0xFFFF, r->eip);
     else
-        klog("USER: GUI killed by exception %02X at %04X:%08X\n",
-             r->int_no, r->cs & 0xFFFF, r->eip);
+        klog("USER: %s killed by exception %02X at %04X:%08X\n",
+             p->name, r->int_no, r->cs & 0xFFFF, r->eip);
     finish(-(int)(r->int_no + 1));
 }
 
-/* ---- self-test ----------------------------------------------------------- */
+/* ---- self-test ------------------------------------------------------------------ */
 
 static int run_test(uint32_t flags)
 {
-    if (user_start("GUI.BIN", flags) != 0)
-        panic("Cannot load GUI.BIN for the ring-3 self-test.");
-    while (u.running)
+    if (user_start("DEMO.BIN", flags) != 0)
+        panic("Cannot load DEMO.BIN for the ring-3 self-test.");
+    while (u.running) {
+        user_service();
         sched_wait();
+    }
     return u.result;
 }
 
@@ -549,7 +977,6 @@ void user_selftest(void)
     rc = run_test(UINFO_TEST_KERNEL);
     if (rc != -(14 + 1))
         panic("Ring-3 kernel-write test: result %d (expected #PF).", rc);
-    release_address_space();
     kprintf("  Ring 3: system calls work; CLI and kernel writes are refused.\n");
     klog("VMM: ring-3 self-test passed\n");
 }

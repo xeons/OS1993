@@ -1,6 +1,7 @@
 ; UI.DLL -- windows, messages, painting and the standard controls
 LIBRARY UI.DLL
 BASE    0x10200000
+HOOK    ui_enter            ; every call takes the window manager lock
 EXPORTS
     InitUI
     RegisterClass
@@ -77,3 +78,20 @@ EXPORTS
     DestroyAcceleratorTable
     TranslateAccelerator
     MessageBox
+    CreateWindowEx
+    UpdateWindow
+    DrawLineEx
+    DrawEllipse
+    DrawPixels
+    EnumWindows
+    FindWindow
+    GetWindowProcessId
+    IsWindowVisible
+    IsIconic
+    GetForegroundWindow
+    SetForegroundWindow
+    RegisterShellHookWindow
+    SetShellWindow
+    GetShellWindow
+    SystemParametersInfo
+    GetClassIcon

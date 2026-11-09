@@ -20,9 +20,13 @@ README.md for what already works.
 - [ ] Keyboard: Alt+Esc,
       arrow keys between radio buttons in a group.
 - [ ] Proportional font for window text (the VGA 8x16 font is all there is).
-- [ ] Desktop: icons, wallpaper pattern, and a shell with a **taskbar**
-      (minimized windows currently become tiles along the bottom).
-- [ ] Program Manager-style launcher that starts real application programs.
+- [ ] Shell: wallpaper patterns, icon dragging, a Programs list read from a
+      file (needs file I/O), large icons in the Start menu with the
+      vertical banner, taskbar button right-click (the window's system
+      menu), tooltips for tray icons, a task list (Ctrl+Alt+Del) that can
+      end a hung program (SYS_KILL exists).
+- [ ] Programs: Paint and the others can't save or open files yet (no
+      file I/O for ring 3); Calculator scientific view; a Notepad.
 - [ ] Layout: controls don't reflow when a window is resized (programs can
       do it themselves now on `WM_SIZE` with `MoveWindow`).
 - [ ] Dialog templates (`CreateDialog` from a table) and modal loops.
@@ -32,20 +36,24 @@ README.md for what already works.
 
 ## Ring 3 and DLLs
 
-- [ ] **Several ring-3 programs at once**, each with its own address space
-      (per-process page directories), DLL code shared between them and
-      DLL data per process (copy-on-write or per-process data pages).
-- [ ] Kernel page directory entries must then stay identical in every
-      address space (see the TODO in `kernel/paging.c`).
+- [ ] DLL code shared between processes (every process loads its own copy
+      today); DLL data per process (copy-on-write or per-process data pages).
+- [ ] Several threads per process; per-thread message queues.
+- [ ] The window manager lock is held from a process's first UI call until
+      it waits, like Win16Mutex: a program that computes for a long time
+      inside a message handler freezes the GUI. Finer-grained locking.
+- [ ] A process killed while holding the window manager lock can leave the
+      shared arena inconsistent (the lock is released, the data isn't
+      repaired).
 - [ ] DLL initialization / termination entry points (DllMain-style).
 - [ ] Import by ordinal; versioning; a loader error shown in the GUI
       instead of only the debug log.
 - [ ] File I/O system calls for ring-3 programs (through DOS in the
       System VM, behind an `fs_*` interface).
 - [ ] Memory allocation system calls (a user heap).
-- [ ] **IPC**: one message queue per process (thread), `PostMessage` /
-      `SendMessage` across processes through the kernel, shared memory
-      sections, and named events/mutexes -- once several programs run.
+- [ ] IPC: done -- per-process queues, cross-process SendMessage and
+      WM_COPYDATA, wait/wake and kernel locks. Still to do: named shared
+      memory sections, named events, pipes.
 
 ## Graphics
 

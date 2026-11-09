@@ -38,14 +38,13 @@ def main():
     with Machine() as m:
         if not m.wait_log("PS/2 mouse"):
             raise SystemExit("  FAIL  VMM did not boot")
-        m.key("g")
-        check(m.wait_log("GUI: mouse ready"), "GUI started")
+        check(m.start_gui() and m.start_demo(), "GUI started (shell, then the Control Demo)")
         m.goto(60, 30)                             # activate Programs first:
         m.click()                                  # the click below won't change it
         m.goto(120, 109)                           # over "MS-DOS Prompt"
         a = m.screenshot("vga-desktop")
         check(a[:2] == (640, 480), f"desktop is 640x480 (got {a[0]}x{a[1]})")
-        check(near(pixel(a, 630, 470), rgb(DESKTOP)), "desktop drawn with the GUI's palette")
+        check(near(pixel(a, 630, 440), rgb(DESKTOP)), "desktop drawn with the GUI's palette")
 
         m.click()
         check(m.wait_log("Started DOS 1"), "a DOS session takes the screen")
@@ -68,7 +67,8 @@ def main():
         check(n == 0, f"desktop restored pixel-identical after the session ended ({n} pixels differ)")
 
         m.key("esc")
-        check(m.wait_log("USER: exited with code 0"), "Esc leaves the GUI")
+        check(m.wait_log("USER: DEMO.BIN exited with code 0"), "Esc ends the demo")
+        check(m.shut_down(), "Start > Shut Down ends the GUI")
         e = m.screenshot("vga-text")
         check(e[:2] != (640, 480), f"back to the text console ({e[0]}x{e[1]})")
         m.key("x", 1)

@@ -22,8 +22,7 @@ def main():
             raise SystemExit("  FAIL  VMM did not boot")
         check("absolute positions via the VMware port" in m.log(),
               "VMM switched the mouse to absolute mode")
-        m.key("g")
-        check(m.wait_log("GUI: mouse ready"), "GUI started")
+        check(m.start_gui() and m.start_demo(), "GUI started (shell, then the Control Demo)")
 
         for x, y in ((450, 420), (600, 440)):         # empty desktop
             m.abs_move(x, y)
@@ -39,7 +38,8 @@ def main():
         check(m.wait_log("GUI: radio Turbo"), "absolute click hits the radio button")
 
         m.key("esc")
-        check(m.wait_log("USER: exited with code 0"), "Esc leaves the GUI")
+        check(m.wait_log("USER: DEMO.BIN exited with code 0"), "Esc ends the demo")
+        check(m.shut_down(), "Start > Shut Down ends the GUI")
         m.key("x", 1)
         check(m.wait_exit(), "QEMU powered off (absolute mode switched off for DOS)")
     return 1 if check.failures else 0

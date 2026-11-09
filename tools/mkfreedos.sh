@@ -86,8 +86,8 @@ done
 mdel -i "$I" ::/SETUP.BAT ::/FDCONFIG.SYS ::/FDAUTO.BAT
 mcopy -i "$I" "$tmp/FDCONFIG.SYS" "$tmp/FDAUTO.BAT" ::/
 mmd   -i "$I" ::/OS1993
-mcopy -i "$I" "$build/OS1993.COM" "$build/VMM.BIN" "$build/KERNEL.DLL" "$build/GFX.DLL" "$build/UI.DLL" \
-      "$build/GUI.BIN" "$tmp/QEXIT.COM" ::/OS1993/
+mcopy -i "$I" "$build/OS1993.COM" "$build"/*.DLL "$build"/*.BIN \
+      "$tmp/QEXIT.COM" ::/OS1993/
 [ -f "$tmp/AUTOTEST" ] && mcopy -i "$I" "$tmp/AUTOTEST" ::/OS1993/
 [ -f "$tmp/AUTORUN" ] && mcopy -i "$I" "$tmp/AUTORUN" ::/OS1993/
 echo "Built $img ($variant${autotest:+, $autotest})"

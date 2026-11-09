@@ -6,3 +6,4 @@
 -Iuser/gfx
 -Iuser/ui
 -Iuser/krnl
+-Iuser/shell

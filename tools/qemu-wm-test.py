@@ -22,12 +22,12 @@ def main():
         if not m.wait_log("PS/2 mouse"):
             raise SystemExit("  FAIL  VMM did not boot")
         check("MOUSE: PS/2 mouse on IRQ 12" in m.log(), "VMM found the PS/2 mouse")
-        m.key("g")
-        check(m.wait_log("GUI: desktop ready") and m.wait_log("GUI: mouse ready"),
-              "GUI started with the window manager")
+        check(m.start_gui(), "the shell started")
+        check(m.start_demo(), "Start > Programs > Control Demo started the demo")
 
         a = m.screenshot("wm-start")
-        check(near(pixel(a, 630, 470), rgb(DESKTOP)), "desktop uses the custom palette")
+        check(near(pixel(a, 630, 440), rgb(DESKTOP)), "desktop uses the custom palette")
+        check(near(pixel(a, 600, 470), rgb(FACE)), "the taskbar is along the bottom")
         check(near(pixel(a, 275, 47), rgb(GRAY4)) and near(pixel(a, 275, 48), rgb(WHITE)),
               "active title bar (Controls) has pinstripes")
         check(near(pixel(a, 40, 25), rgb(FACE)) and near(pixel(a, 40, 26), rgb(FACE)),
@@ -64,7 +64,8 @@ def main():
         m.goto(595, 54); m.click()
         check(m.wait_log("GUI: maximized Controls"), "maximize box")
         c = m.screenshot("wm-max")
-        check(not near(pixel(c, 630, 470), rgb(DESKTOP)), "maximized window covers the screen")
+        check(not near(pixel(c, 630, 440), rgb(DESKTOP)), "maximized window covers the work area")
+        check(near(pixel(c, 600, 470), rgb(FACE)), "... but not the taskbar")
         m.goto(609, 14); m.click()
         check(m.wait_log("GUI: restored Controls"), "restore box")
 
@@ -76,9 +77,9 @@ def main():
         m.goto(304, 314); m.click()
         check(m.wait_log("GUI: minimized About OS1993"), "minimize box")
         d = m.screenshot("wm-min")
-        check(not near(pixel(d, 10, 460), rgb(DESKTOP)), "minimized window shows as a tile")
-        m.goto(60, 460); m.click()
-        check(m.wait_log("GUI: restored About OS1993"), "clicking the tile restores it")
+        check(near(pixel(d, 150, 380), rgb(DESKTOP)), "the minimized window left the screen")
+        m.goto(300, 466); m.click()                 # its taskbar button (the second)
+        check(m.wait_log("GUI: restored About OS1993"), "clicking its taskbar button restores it")
         m.goto(285, 412); m.click()
         check(m.wait_log("GUI: closed About OS1993"), "About's OK button closes it")
 
@@ -88,14 +89,15 @@ def main():
         m.key("alt-tab")
         m.wait_log("focus -> console")
         e = m.screenshot("wm-back")
-        check(near(pixel(e, 630, 470), rgb(DESKTOP)), "custom palette restored after the session")
+        check(near(pixel(e, 630, 440), rgb(DESKTOP)), "custom palette restored after the session")
         m.key("alt-tab")
         m.wait_log("focus -> DOS 1", 2)
         m.type("exit\n")
         check(m.wait_log("session in VM 1 ended"), "DOS session ended")
 
         m.key("esc")
-        check(m.wait_log("USER: exited with code 0"), "Esc leaves the GUI")
+        check(m.wait_log("USER: DEMO.BIN exited with code 0"), "Esc ends the demo")
+        check(m.shut_down(), "Start > Shut Down ends the GUI")
         m.key("x", 1)
         check(m.wait_exit(), "QEMU powered off")
     return 1 if check.failures else 0

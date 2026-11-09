@@ -39,3 +39,14 @@ void *memcpy(void *d, const void *s, size_t n)
     while (n--) *dp++ = *sp++;
     return d;
 }
+
+void *memmove(void *d, const void *s, size_t n)
+{
+    uint8_t *dp = d;
+    const uint8_t *sp = s;
+    if (dp < sp)
+        while (n--) *dp++ = *sp++;
+    else
+        while (n--) dp[n] = sp[n];
+    return d;
+}

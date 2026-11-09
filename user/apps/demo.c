@@ -5,7 +5,7 @@
  * create windows and child controls, run a message loop.
  *
  * Three windows show the window manager and the controls:
- *   Programs       MS-DOS Prompt (a DOS session VM), About, Exit to VMM
+ *   Programs       MS-DOS Prompt (a DOS session VM), About, Exit
  *   Controls       every control type, live
  *   About OS1993   a small dialog
  * With a self-test flag it instead checks that ring 3 is fenced in.
@@ -66,6 +66,8 @@ static void open_about(void)
 /* ---- Programs ---------------------------------------------------------- */
 
 enum { ID_DOS = 10, ID_ABOUT, ID_EXIT, ID_CONTENTS };
+#define WM_TRAY (WM_USER + 50)
+static HWND controls_wnd;
 
 static HMENU programs_menu(void)
 {
@@ -73,7 +75,7 @@ static HMENU programs_menu(void)
     AppendMenu(file, MF_STRING, ID_DOS, "&MS-DOS Prompt\tCtrl+D");
     AppendMenu(file, MF_STRING, ID_ABOUT, "&About OS1993...");
     AppendMenu(file, MF_SEPARATOR, 0, NULL);
-    AppendMenu(file, MF_STRING, ID_EXIT, "E&xit to VMM\tCtrl+Q");
+    AppendMenu(file, MF_STRING, ID_EXIT, "E&xit\tCtrl+Q");
     AppendMenu(help, MF_STRING, ID_CONTENTS, "&Contents\tF1");
     AppendMenu(help, MF_STRING, ID_ABOUT, "&About OS1993");
     AppendMenu(bar, MF_POPUP, (uintptr_t)file, "&File");
@@ -88,11 +90,11 @@ static LRESULT programs_proc(HWND h, unsigned msg, WPARAM wp, LPARAM lp)
         child(h, WC_STATIC, "Run a program:", 0, 12, 10, 176, 16, 0);
         child(h, WC_BUTTON, "MS-DOS Prompt", WS_TABSTOP, 12, 36, 176, BTN_H, ID_DOS);
         child(h, WC_BUTTON, "About OS1993", WS_TABSTOP, 12, 66, 176, BTN_H, ID_ABOUT);
-        child(h, WC_BUTTON, "Exit to VMM", WS_TABSTOP, 12, 96, 176, BTN_H, ID_EXIT);
+        child(h, WC_BUTTON, "Exit", WS_TABSTOP, 12, 96, 176, BTN_H, ID_EXIT);
         return 0;
     case WM_COMMAND:
         if (!lp) {                      /* menu, or accelerator (HIWORD 1) */
-            static const char *const names[] = { "MS-DOS Prompt", "About OS1993", "Exit to VMM", "Contents" };
+            static const char *const names[] = { "MS-DOS Prompt", "About OS1993", "Exit", "Contents" };
             DebugLog("%s %s", HIWORD(wp) == 1 ? "accel" : "menu", names[LOWORD(wp) - ID_DOS]);
         }
         switch (LOWORD(wp)) {
@@ -111,8 +113,8 @@ static LRESULT programs_proc(HWND h, unsigned msg, WPARAM wp, LPARAM lp)
                                 "(Alt+Space) and right clicks.", "Contents", MB_OK | MB_ICONINFORMATION));
             break;
         case ID_EXIT: {
-            DebugLog("button Exit to VMM");
-            int r = MessageBox(h, "Leave OS1993 and return to the VMM?", "Exit", MB_YESNO | MB_ICONQUESTION);
+            DebugLog("button Exit");
+            int r = MessageBox(h, "Close the Control Demo?", "Exit", MB_YESNO | MB_ICONQUESTION);
             DebugLog("box Exit -> %d", r);
             if (r == IDYES)
                 PostQuitMessage(0);
@@ -120,8 +122,14 @@ static LRESULT programs_proc(HWND h, unsigned msg, WPARAM wp, LPARAM lp)
         }
         }
         return 0;
-    case WM_CLOSE:                      /* closing Programs ends the session */
+    case WM_CLOSE:                      /* closing Programs ends the demo */
         PostQuitMessage(0);
+        return 0;
+    case WM_TRAY:                       /* our icon in the taskbar */
+        if (lp == WM_LBUTTONDOWN) {
+            DebugLog("tray icon clicked");
+            SetForegroundWindow(controls_wnd);
+        }
         return 0;
     }
     return DefWindowProc(h, msg, wp, lp);
@@ -324,7 +332,7 @@ static int selftest(const struct user_info *info)
 
 static void register_class(const char *name, WNDPROC proc, uint8_t background)
 {
-    WNDCLASS wc = { .name = name, .proc = proc, .background = background };
+    WNDCLASS wc = { .name = name, .proc = proc, .background = background, .icon = ICON_DEMO };
     RegisterClass(&wc);
 }
 
@@ -345,7 +353,11 @@ int main(void)
     open_about();
     HWND controls = CreateWindow("Controls", "Controls", FRAMED | WS_THICKFRAME | WS_VISIBLE,
                                  246, 40, 380, 330, NULL, 0, NULL);
+    controls_wnd = controls;
     SetFocus(GetDlgItem(controls, ID_NAME));
+    NOTIFYICONDATA tray = { sizeof tray, programs, 1, NIF_MESSAGE | NIF_ICON | NIF_TIP,
+                            WM_TRAY, ICON_DEMO, "Control Demo" };
+    Shell_NotifyIcon(NIM_ADD, &tray);
 
     static const ACCEL programs_keys[] = {
         { FVIRTKEY | FCONTROL, 'D', ID_DOS },
@@ -382,5 +394,6 @@ int main(void)
             DispatchMessage(&msg);
         }
     }
+    Shell_NotifyIcon(NIM_DELETE, &tray);
     return (int)msg.wParam;
 }

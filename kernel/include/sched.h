@@ -16,6 +16,7 @@
 #define SLICE_TICKS   2         /* ~110 ms at 18.2 Hz */
 
 struct vm;
+struct process;
 
 enum thread_state { T_FREE, T_RUNNABLE, T_BLOCKED, T_DEAD };
 
@@ -28,6 +29,7 @@ struct thread {
     void      (*entry)(void *);
     void       *arg;
     bool        user;           /* runs ring-3 code: TSS.ESP0 = kstack top */
+    struct process *proc;       /* its process (ring-3 threads, and the loader) */
 };
 
 extern struct thread *current;

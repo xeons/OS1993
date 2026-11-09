@@ -1,48 +1,116 @@
 /*
- * paint.c -- invalidation, the paint cycle, and drawing through an HDC.
+ * paint.c -- invalidation, painting, and drawing through an HDC.
  *
- * Invalidated areas collect in one dirty rectangle (screen coordinates).
- * When the message queue runs dry, ui_paint() repaints it back to front --
- * desktop, minimized tiles, windows: each frame, then the client area
- * cleared to its class background and a WM_PAINT to the window, then the
- * same for its children, every one clipped -- into the off-screen buffer,
- * and presents just that rectangle (double buffering).
+ * Every top-level window has its own update rectangle (screen coordinates);
+ * invalidating part of the screen adds to the update rectangle of each
+ * window there, and wakes the processes they belong to. A process paints
+ * only its own windows, each clipped to its visible region -- what's left
+ * of it after taking away the windows above -- so processes can paint in
+ * any order: per region rectangle, the frame, the client area cleared to
+ * its class background and a WM_PAINT, then the same for its children.
+ * Screen areas no window covers (the desktop, until a shell provides one)
+ * are filled by whichever process paints next. Painting goes into the
+ * off-screen copy of the screen in the shared arena, and each finished
+ * rectangle is copied to video memory (double buffering).
  */
 #include "uipriv.h"
 
-struct gfx ui_gfx;                          /* the off-screen buffer */
-static uint8_t back[4 * GFX_PLANE_BYTES];
+#define REGION_MAX 48
 
-static bool dirty;
-static int dx0, dy0, dx1, dy1;
-
+struct gfx ui_gfx;                          /* this process's view of S->back */
 static struct dc paint_dc;
 static struct wnd *painting;
+
+struct region { int n; RECT r[REGION_MAX]; };
 
 void ui_screen_init(void)
 {
     const struct user_info *info = GetStartupInfo();
     gfx_init(&ui_screen, (volatile uint8_t *)info->vga, (const uint8_t *)info->font);
-    gfx_init_mem(&ui_gfx, back, (const uint8_t *)info->font);
+    gfx_init_mem(&ui_gfx, S->back, (const uint8_t *)info->font);
 }
+
+/* ---- regions ------------------------------------------------------------- */
+
+static void region_add(struct region *g, RECT r)
+{
+    if (r.left < r.right && r.top < r.bottom && g->n < REGION_MAX)
+        g->r[g->n++] = r;
+}
+
+/* Take x away from every rectangle (each splits into at most four). */
+static void region_subtract(struct region *g, RECT x)
+{
+    struct region out = { 0 };
+    for (int i = 0; i < g->n; i++) {
+        RECT a = g->r[i], in;
+        if (!rect_intersect(a, x, &in)) {
+            region_add(&out, a);
+            continue;
+        }
+        region_add(&out, (RECT){ a.left, a.top, a.right, in.top });         /* above */
+        region_add(&out, (RECT){ a.left, in.bottom, a.right, a.bottom });   /* below */
+        region_add(&out, (RECT){ a.left, in.top, in.left, in.bottom });     /* left */
+        region_add(&out, (RECT){ in.right, in.top, a.right, in.bottom });   /* right */
+    }
+    *g = out;
+}
+
+/* Does a window cover the screen at frame_outer? (Tiles sit below every
+ * normal window; hidden minimized windows don't exist on screen.) */
+static bool covers(struct wnd *t)
+{
+    return t->visible && frame_shown(t);
+}
+
+/* Windows above t, in t's region */
+static void subtract_above(struct region *g, struct wnd *t)
+{
+    bool tile = t->state == WS_STATE_MIN;
+    bool after = false;
+    for (int i = 0; i < S->ntops; i++) {
+        struct wnd *o = S->tops[i];
+        if (o == t) { after = true; continue; }
+        if (!covers(o))
+            continue;
+        bool otile = o->state == WS_STATE_MIN;
+        bool above = tile ? (!otile || after) : (!otile && after);
+        if (above) {
+            RECT r;
+            frame_outer(o, &r);
+            region_subtract(g, r);
+        }
+    }
+}
+
+/* ---- invalidation ---------------------------------------------------------- */
 
 void ui_invalidate_screen(int x, int y, int w, int h)
 {
-    if (x < 0) { w += x; x = 0; }
-    if (y < 0) { h += y; y = 0; }
-    if (x + w > 640) w = 640 - x;
-    if (y + h > 480) h = 480 - y;
-    if (w <= 0 || h <= 0)
+    RECT r = { x, y, x + w, y + h }, scr = { 0, 0, 640, 480 }, in;
+    if (!rect_intersect(r, scr, &r))
         return;
-    if (!dirty) {
-        dx0 = x; dy0 = y; dx1 = x + w; dy1 = y + h;
-        dirty = true;
-        return;
+    for (int i = 0; i < S->ntops; i++) {
+        struct wnd *t = S->tops[i];
+        RECT o;
+        if (!covers(t))
+            continue;
+        frame_outer(t, &o);
+        if (!rect_intersect(r, o, &in))
+            continue;
+        if (t->has_upd)
+            rect_union(&t->upd, in);
+        else
+            t->upd = in;
+        t->has_upd = true;
+        if (t->pid != ui_pid)
+            WakeProcess(t->pid);
     }
-    if (x < dx0) dx0 = x;
-    if (y < dy0) dy0 = y;
-    if (x + w > dx1) dx1 = x + w;
-    if (y + h > dy1) dy1 = y + h;
+    if (S->desk_dirty)
+        rect_union(&S->desk, r);
+    else
+        S->desk = r;
+    S->desk_dirty = true;
 }
 
 void ui_invalidate_wnd(struct wnd *w)
@@ -67,25 +135,42 @@ bool InvalidateRect(HWND h, const RECT *r)
     return true;
 }
 
-bool ui_paint_pending(void) { return dirty && !ui_background; }
+bool ui_paint_pending(void)
+{
+    if (S->background)
+        return false;
+    if (S->desk_dirty)
+        return true;
+    for (int i = 0; i < S->ntops; i++)
+        if (S->tops[i]->has_upd && wnd_mine(S->tops[i]))
+            return true;
+    return false;
+}
 
 void ui_set_background(bool background)
 {
-    ui_background = background;
+    S->background = background;
     if (!background)                            /* the VDD restored an old image */
         ui_invalidate_screen(0, 0, 640, 480);
 }
 
-/* ---- the paint cycle ------------------------------------------------------- */
+/* ---- presenting ------------------------------------------------------------- */
 
-static bool intersect(RECT a, RECT b, RECT *out)
+void ui_present(int x0, int y0, int x1, int y1)
 {
-    out->left = a.left > b.left ? a.left : b.left;
-    out->top = a.top > b.top ? a.top : b.top;
-    out->right = a.right < b.right ? a.right : b.right;
-    out->bottom = a.bottom < b.bottom ? a.bottom : b.bottom;
-    return out->left < out->right && out->top < out->bottom;
+    if (S->background)
+        return;
+    int px0 = x0 & ~7, px1 = (x1 + 7) & ~7;     /* whole bytes */
+    bool cur = ui_cursor_overlaps(px0, y0, px1, y1);
+    bool outl = S->in.outline_on;
+    if (outl) ui_outline(false);
+    if (cur) ui_cursor(false);
+    gfx_present(&ui_gfx, ui_screen.fb, x0, y0, x1 - x0, y1 - y0);
+    ui_cursor(true);                            /* also after a repaint from scratch */
+    if (outl) ui_outline(true);
 }
+
+/* ---- painting ------------------------------------------------------------------ */
 
 static void clip_to(RECT r)
 {
@@ -109,61 +194,99 @@ static void paint_children(struct wnd *p, RECT clip)
             continue;
         RECT r, cc;
         wnd_screen_rect(c, &r);
-        if (!intersect(r, clip, &cc))
+        if (!rect_intersect(r, clip, &cc))
             continue;
         clip_to(cc);                            /* erase to the parent's background */
         gfx_fill(&ui_gfx, cc.left, cc.top, cc.right - cc.left, cc.bottom - cc.top,
                  p->cls->background);
         send_paint(c, cc);
+        if (!wnd_from(p))
+            return;
         paint_children(c, cc);
+    }
+}
+
+static void paint_rect(struct wnd *t, RECT oc)
+{
+    clip_to(oc);
+    frame_paint(t, t == S->active);
+    if (t->state != WS_STATE_MIN) {
+        RECT c, cc;
+        frame_client(t, &c);
+        if (rect_intersect(c, oc, &cc)) {
+            clip_to(cc);
+            gfx_fill(&ui_gfx, cc.left, cc.top, cc.right - cc.left, cc.bottom - cc.top,
+                     t->cls->background);
+            send_paint(t, cc);
+            if (wnd_from(t)) {
+                paint_children(t, cc);
+                clip_to(cc);
+                frame_paint_grip(t);
+            }
+        }
+    }
+    gfx_noclip(&ui_gfx);
+    ui_present(oc.left, oc.top, oc.right, oc.bottom);
+}
+
+static void paint_window(struct wnd *t)
+{
+    RECT o, u;
+    t->has_upd = false;
+    frame_outer(t, &o);
+    if (!covers(t) || !rect_intersect(t->upd, o, &u))
+        return;
+    struct region g = { 0 };
+    region_add(&g, u);
+    subtract_above(&g, t);
+    for (int i = 0; i < g.n && wnd_from(t); i++)
+        paint_rect(t, g.r[i]);
+}
+
+static void paint_desktop(void)
+{
+    struct region g = { 0 };
+    region_add(&g, S->desk);
+    S->desk_dirty = false;
+    for (int i = 0; i < S->ntops; i++)
+        if (covers(S->tops[i])) {
+            RECT r;
+            frame_outer(S->tops[i], &r);
+            region_subtract(&g, r);
+        }
+    for (int i = 0; i < g.n; i++) {
+        RECT r = g.r[i];
+        gfx_noclip(&ui_gfx);
+        gfx_fill(&ui_gfx, r.left, r.top, r.right - r.left, r.bottom - r.top, C_DESKTOP);
+        ui_present(r.left, r.top, r.right, r.bottom);
     }
 }
 
 void ui_paint(void)
 {
-    if (!dirty || ui_background)
+    if (S->background)
         return;
-    RECT d = { dx0, dy0, dx1, dy1 };
-    dirty = false;
-    struct gfx *g = &ui_gfx;
-    clip_to(d);
-    gfx_fill(g, d.left, d.top, d.right - d.left, d.bottom - d.top, C_DESKTOP);
-
-    struct wnd *list[WND_MAX];
+    struct wnd *list[WND_MAX];                  /* a WM_PAINT may change the list */
     int n = wnd_toplevels(list);
-    struct wnd *active = wnd_active();
-    for (int pass = 0; pass < 2; pass++)        /* tiles, then windows */
-        for (int i = 0; i < n; i++) {
-            struct wnd *t = list[i];
-            if (!t->visible || (t->state == WS_STATE_MIN) != (pass == 0))
-                continue;
-            RECT o, oc, c, cc;
-            frame_outer(t, &o);
-            if (!intersect(o, d, &oc))
-                continue;
-            clip_to(oc);
-            frame_paint(t, t == active);
-            if (t->state == WS_STATE_MIN)
-                continue;
-            frame_client(t, &c);
-            if (!intersect(c, d, &cc))
-                continue;
-            clip_to(cc);
-            gfx_fill(g, cc.left, cc.top, cc.right - cc.left, cc.bottom - cc.top, t->cls->background);
-            send_paint(t, cc);
-            paint_children(t, cc);
-            clip_to(cc);
-            frame_paint_grip(t);
-        }
-    gfx_noclip(g);
+    for (int i = 0; i < n; i++)
+        if (wnd_from(list[i]) && list[i]->has_upd && wnd_mine(list[i]))
+            paint_window(list[i]);
+    if (S->desk_dirty)
+        paint_desktop();
+}
 
-    /* Present whole bytes; hide the cursor only if they overlap it. */
-    int px0 = d.left & ~7, px1 = (d.right + 7) & ~7;
-    bool hit = ui_cursor_overlaps(px0, d.top, px1, d.bottom);
-    if (hit)
-        ui_cursor(false);
-    gfx_present(g, ui_screen.fb, d.left, d.top, d.right - d.left, d.bottom - d.top);
-    ui_cursor(true);
+void ui_paint_now(struct wnd *w)
+{
+    if (wnd_mine(w) && w->has_upd && !S->background)
+        paint_window(w);
+}
+
+bool UpdateWindow(HWND h)
+{
+    struct wnd *w = wnd_top(wnd_from(h));
+    if (!w) return false;
+    ui_paint_now(w);
+    return true;
 }
 
 /* ---- device contexts ----------------------------------------------------------- */
@@ -222,6 +345,74 @@ void SetPixel(HDC dc, int x, int y, uint8_t color)
 {
     dc_apply(dc);
     gfx_pixel(&ui_gfx, dc->ox + x, dc->oy + y, color);
+}
+
+void DrawLineEx(HDC dc, int x0, int y0, int x1, int y1, uint8_t color)
+{
+    dc_apply(dc);
+    int dx = x1 > x0 ? x1 - x0 : x0 - x1, sx = x0 < x1 ? 1 : -1;
+    int dy = y1 > y0 ? y0 - y1 : y1 - y0, sy = y0 < y1 ? 1 : -1;
+    int err = dx + dy;
+    for (;;) {                                  /* Bresenham */
+        gfx_pixel(&ui_gfx, dc->ox + x0, dc->oy + y0, color);
+        if (x0 == x1 && y0 == y1)
+            break;
+        int e2 = 2 * err;
+        if (e2 >= dy) { err += dy; x0 += sx; }
+        if (e2 <= dx) { err += dx; y0 += sy; }
+    }
+}
+
+/* Midpoint ellipse inside r */
+void DrawEllipse(HDC dc, const RECT *r, uint8_t color, bool filled)
+{
+    dc_apply(dc);
+    int w = r->right - r->left - 1, h = r->bottom - r->top - 1;
+    if (w < 0 || h < 0)
+        return;
+    int ox = dc->ox + r->left, oy = dc->oy + r->top;
+    int a = w / 2, b = h / 2, cx = ox + a, cy = oy + b, ex = w & 1, ey = h & 1;
+    int32_t a2 = (int32_t)a * a, b2 = (int32_t)b * b;
+    int x = 0, y = b;
+    int32_t d1 = b2 - a2 * b + a2 / 4;
+    #define PLOT4(px, py) do { \
+        if (filled) { \
+            gfx_hline(&ui_gfx, cx - (px), cy - (py), 2 * (px) + 1 + ex, color); \
+            gfx_hline(&ui_gfx, cx - (px), cy + (py) + ey, 2 * (px) + 1 + ex, color); \
+        } else { \
+            gfx_pixel(&ui_gfx, cx + (px) + ex, cy + (py) + ey, color); \
+            gfx_pixel(&ui_gfx, cx - (px), cy + (py) + ey, color); \
+            gfx_pixel(&ui_gfx, cx + (px) + ex, cy - (py), color); \
+            gfx_pixel(&ui_gfx, cx - (px), cy - (py), color); \
+        } } while (0)
+    while (b2 * x < a2 * y) {
+        PLOT4(x, y);
+        if (d1 < 0) {
+            d1 += b2 * (2 * x + 3);
+        } else {
+            d1 += b2 * (2 * x + 3) + a2 * (2 - 2 * y);
+            y--;
+        }
+        x++;
+    }
+    int32_t d2 = b2 * x * x + b2 * x + b2 / 4 + a2 * (y - 1) * (y - 1) - a2 * b2;
+    while (y >= 0) {
+        PLOT4(x, y);
+        if (d2 > 0) {
+            d2 += a2 * (3 - 2 * y);
+        } else {
+            d2 += b2 * (2 * x + 2) + a2 * (3 - 2 * y);
+            x++;
+        }
+        y--;
+    }
+    #undef PLOT4
+}
+
+void DrawPixels(HDC dc, int x, int y, int w, int h, const uint8_t *pixels, int stride)
+{
+    dc_apply(dc);
+    gfx_blit8(&ui_gfx, dc->ox + x, dc->oy + y, w, h, pixels, stride);
 }
 
 void TextOut(HDC dc, int x, int y, const char *s, uint8_t fg, int bg)

@@ -71,6 +71,7 @@ void interrupt_dispatch(struct regs *r)
             panic("System call from ring 0.");
         syscall_dispatch(r);
         sched_preempt();
+        user_return(r);
         return;
     }
 
@@ -79,7 +80,8 @@ void interrupt_dispatch(struct regs *r)
             v86_exception(r);           /* the V86 monitor */
             vm_check("returning to V86 after a trap");
         } else if (from_user) {
-            user_fault(r);              /* kills the ring-3 program */
+            user_fault(r);              /* kills the ring-3 process */
+            user_return(r);
         } else {
             panic_exception(r);
         }
@@ -98,6 +100,8 @@ void interrupt_dispatch(struct regs *r)
         if (from_v86)
             v86_deliver(r);
         sched_preempt();            /* after the EOI: may switch threads */
+        if (from_user)
+            user_return(r);
         if (from_v86)
             vm_check("returning to V86 after an IRQ");
     }

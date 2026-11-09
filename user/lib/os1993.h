@@ -32,9 +32,27 @@ void     Sleep(uint32_t ms);                    /* 0: give up the time slice */
 const struct user_info *GetStartupInfo(void);
 int      StartDosSession(void);                 /* -> VM number, or -1 */
 
+typedef struct systime SYSTEMTIME;
+void     GetLocalTime(SYSTEMTIME *t);
+
+/* Processes. Each runs a program (a MOD3 .BIN from the OS1993 directory)
+ * in its own address space; the GUI session ends when the shell does. */
+int      CreateProcess(const char *program, const char *args);  /* -> pid, or -1 */
+int      GetCurrentProcessId(void);
+bool     IsProcessAlive(int pid);
+bool     TerminateProcess(int pid);
+uint32_t GetProcessExitCount(void);             /* processes ended so far */
+
+/* Waiting and locks (IPC primitives; UI.DLL builds messages on them) */
+bool     WaitForWake(uint32_t ms, unsigned flags);  /* WAIT_INFINITE, WAIT_INPUT */
+bool     WakeProcess(int pid);
+bool     AcquireLock(int n);                    /* 0-7; 0 is UI.DLL's */
+bool     ReleaseLock(int n);
+void     SetWaitHooks(void (*before)(void), void (*after)(void));
+
 /* Raw input, for UI.DLL */
 bool     GetInputEvent(struct user_event *e);
-void     WaitForInput(void);                    /* sleep until the next tick */
+void     WaitForInput(void);                    /* sleep until input or a tick */
 bool     HasMouse(void);
 
 /* ===================================================================== */
@@ -53,6 +71,12 @@ typedef LRESULT    (*WNDPROC)(HWND, unsigned, WPARAM, LPARAM);
 typedef struct { int left, top, right, bottom; } RECT;
 typedef struct { HWND hwnd; unsigned message; WPARAM wParam; LPARAM lParam; uint32_t time; } MSG;
 typedef struct { HDC hdc; RECT rcPaint; } PAINTSTRUCT;
+typedef struct { uint32_t dwData; uint32_t cbData; void *lpData; } COPYDATASTRUCT;
+typedef bool (*WNDENUMPROC)(HWND, LPARAM);
+static inline bool PtInRect(const RECT *r, int x, int y)
+{
+    return x >= r->left && y >= r->top && x < r->right && y < r->bottom;
+}
 
 typedef struct {
     const char *name;
@@ -60,6 +84,7 @@ typedef struct {
     unsigned    style;          /* CS_* */
     int         extra;          /* bytes for GetWindowLong(hwnd, 0..), max 32 */
     uint8_t     background;     /* colour the client area is cleared to */
+    int         icon;           /* ICON_* (SHELL.DLL's stock icons), for the taskbar */
 } WNDCLASS;
 
 #define LOWORD(l)        ((uint16_t)((uint32_t)(l) & 0xFFFF))
@@ -124,6 +149,10 @@ enum {
 #define WM_INITMENU         0x0116  /* wParam = menu bar or system menu */
 #define WM_INITMENUPOPUP    0x0117  /* wParam = menu, lParam = MAKELPARAM(pos, system) */
 #define WM_VSCROLL          0x0115
+#define WM_COPYDATA         0x004A  /* lParam = COPYDATASTRUCT *: copied across processes */
+#define WM_NCLBUTTONDOWN    0x00A1  /* wParam = HT* part, lParam = screen x,y */
+#define WM_NCLBUTTONDBLCLK  0x00A3
+#define WM_SHELLHOOK        0x0380  /* to the shell hook window: wParam HSHELL_*, lParam HWND */
 #define WM_MOUSEMOVE        0x0200
 #define WM_LBUTTONDOWN      0x0201
 #define WM_LBUTTONUP        0x0202
@@ -145,6 +174,7 @@ enum {
 #define SC_CLOSE            0xF060
 #define SC_RESTORE          0xF120
 #define SC_KEYMENU          0xF100  /* lParam = mnemonic, ' ' system menu, 0 menu bar */
+#define SC_TASKLIST         0xF130  /* Ctrl+Esc: to the shell hook window (the Start menu) */
 
 /* Menus */
 #define MF_STRING           0x0000
@@ -159,6 +189,7 @@ enum {
 #define MF_BYPOSITION       0x0400
 #define MF_SEPARATOR        0x0800
 #define TPM_RETURNCMD       0x0100  /* return the id instead of posting WM_COMMAND */
+#define TPM_BOTTOMALIGN     0x0020  /* y is the menu's bottom edge */
 
 /* WM_HSCROLL / WM_VSCROLL codes */
 #define SB_LINEUP           0
@@ -266,18 +297,37 @@ enum {
 #define SW_SHOWMAXIMIZED    3
 #define SW_SHOW             5
 #define SW_RESTORE          9
+#define SW_MINIMIZE         6
+
+/* Extended styles (CreateWindowEx) */
+#define WS_EX_TOPMOST       0x00000008  /* above all other windows (the taskbar) */
+#define WS_EX_TOOLWINDOW    0x00000080  /* no taskbar button */
+#define WS_EX_NOACTIVATE    0x08000000  /* clicks don't activate it (the taskbar) */
+
+/* Shell hook codes (WM_SHELLHOOK) */
+#define HSHELL_WINDOWCREATED   1
+#define HSHELL_WINDOWDESTROYED 2
+#define HSHELL_WINDOWACTIVATED 4
+#define HSHELL_REDRAW          6        /* title or state changed */
+
+/* SystemParametersInfo */
+#define SPI_SETWORKAREA     0x002F      /* pv = RECT *: where windows maximize */
+#define SPI_GETWORKAREA     0x0030
 
 /* GetWindowLong / SetWindowLong */
 #define GWL_WNDPROC         (-4)
 #define GWL_STYLE           (-16)
 #define GWL_ID              (-12)
 #define GWL_USERDATA        (-21)
+#define GWL_EXSTYLE         (-20)
 
 /* Start-up: call once, before creating windows */
 void    InitUI(void);
 
 /* Classes and windows */
 bool    RegisterClass(const WNDCLASS *wc);
+HWND    CreateWindowEx(unsigned exstyle, const char *cls, const char *text, unsigned style,
+                       int x, int y, int w, int h, HWND parent, int id, void *param);
 HWND    CreateWindow(const char *cls, const char *text, unsigned style,
                      int x, int y, int w, int h, HWND parent, int id, void *param);
 bool    DestroyWindow(HWND hwnd);
@@ -331,6 +381,7 @@ int     GetDlgItemText(HWND dlg, int id, char *buf, int max);
 
 /* Painting */
 bool    InvalidateRect(HWND hwnd, const RECT *r);   /* client coords; NULL: all */
+bool    UpdateWindow(HWND hwnd);                    /* paint it now if it needs it */
 HDC     BeginPaint(HWND hwnd, PAINTSTRUCT *ps);
 bool    EndPaint(HWND hwnd, const PAINTSTRUCT *ps);
 void    FillRect(HDC dc, const RECT *r, uint8_t color);
@@ -342,6 +393,57 @@ void    DrawBitmap(HDC dc, int x, int y, const uint16_t *rows, int h, uint8_t co
 void    DrawBevel(HDC dc, const RECT *r, bool raised);
 void    DrawRoundRect(HDC dc, const RECT *r, uint8_t color);
 int     TextWidth(const char *s);
+void    DrawLineEx(HDC dc, int x0, int y0, int x1, int y1, uint8_t color);
+void    DrawEllipse(HDC dc, const RECT *r, uint8_t color, bool filled);
+void    DrawPixels(HDC dc, int x, int y, int w, int h, const uint8_t *pixels, int stride);  /* 1 byte/pixel, FFh transparent */
+
+/* Windows of every process (the shell's view) */
+bool    EnumWindows(WNDENUMPROC proc, LPARAM l);    /* top-level, top first */
+HWND    FindWindow(const char *cls, const char *title);   /* either may be NULL */
+int     GetWindowProcessId(HWND hwnd);
+bool    IsWindowVisible(HWND hwnd);
+bool    IsIconic(HWND hwnd);                        /* minimized */
+HWND    GetForegroundWindow(void);
+bool    SetForegroundWindow(HWND hwnd);
+bool    RegisterShellHookWindow(HWND hwnd);         /* gets WM_SHELLHOOK */
+bool    SetShellWindow(HWND hwnd);                  /* the desktop: kept at the bottom */
+HWND    GetShellWindow(void);
+bool    SystemParametersInfo(unsigned action, unsigned param, void *pv, unsigned flags);
+int     GetClassIcon(HWND hwnd);                    /* WNDCLASS.icon */
+
+/* ===================================================================== */
+/* SHELL.DLL                                                             */
+/* ===================================================================== */
+
+/* Start a program ("CALC.BIN"; "COMMAND.COM" opens a DOS session).
+ * Returns more than 32 on success, as in Windows. */
+int     ShellExecute(HWND hwnd, const char *verb, const char *file, const char *params,
+                     const char *dir, int show);
+int     ShellAbout(HWND hwnd, const char *app, const char *other);
+
+/* Icons in the taskbar's notification area (the tray). The taskbar
+ * sends uCallbackMessage to hWnd (wParam = uID, lParam = the mouse
+ * message) when one is clicked. */
+#define NIM_ADD     0
+#define NIM_MODIFY  1
+#define NIM_DELETE  2
+#define NIF_MESSAGE 1
+#define NIF_ICON    2
+#define NIF_TIP     4
+typedef struct {
+    uint32_t cbSize;
+    HWND     hWnd;
+    unsigned uID, uFlags, uCallbackMessage;
+    int      hIcon;                                 /* ICON_* */
+    char     szTip[64];
+} NOTIFYICONDATA;
+bool    Shell_NotifyIcon(unsigned msg, const NOTIFYICONDATA *data);
+
+/* Stock icons: 32x32 (desktop) and 16x16 (taskbar, menus) */
+enum { ICON_NONE, ICON_APP, ICON_CALC, ICON_PAINT, ICON_CLOCK, ICON_DEMO, ICON_DOS,
+       ICON_COMPUTER, ICON_INFO, ICON_SHUTDOWN, ICON_COUNT };
+void    DrawIcon(HDC dc, int x, int y, int icon);
+void    DrawSmallIcon(HDC dc, int x, int y, int icon);
 
 /* Menus. Item text marks its mnemonic with '&' and may carry a
  * right-aligned accelerator after a tab: "E&xit\tAlt+F4". Choosing an item
@@ -401,5 +503,6 @@ int     strcmp(const char *a, const char *b);
 char   *strncpy0(char *d, const char *s, size_t size);   /* always terminates */
 void   *memset(void *d, int c, size_t n);
 void   *memcpy(void *d, const void *s, size_t n);
+void   *memmove(void *d, const void *s, size_t n);
 
 #endif
