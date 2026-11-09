@@ -19,6 +19,8 @@
 #define USER_STACK_TOP  0x7FFF0000u
 #define USER_STACK_SIZE 0x00010000u
 #define USER_INFO       0x7FFF0000u     /* struct user_info + the font */
+#define USER_HEAP       0x20000000u     /* the heap (SYS_SBRK) grows up from here ... */
+#define USER_HEAP_LIMIT 0x60000000u     /* ... to here */
 #define USER_SHARED     0x60000000u     /* shared region (one page table): */
 #define USER_VGA        0x60000000u     /*   A000:0000-AFFF, 64 KB */
 #define USER_ARENA      0x60010000u     /*   the shared arena */
@@ -124,6 +126,7 @@ struct user_event {
 #define SYS_TIME        17              /* EBX = struct systime * */
 #define SYS_PROC_EXITS  18              /* -> how many processes have ended so far */
 #define SYS_FILE        19              /* EBX = FOP_*, ECX = struct file_args * -> result, or -error */
+#define SYS_SBRK        20              /* EBX = bytes to add -> the old end of the heap, or 0 */
 #define WAIT_INFINITE   0xFFFFFFFFu
 #define WAIT_INPUT      1               /* also end the wait when input is pending */
 #define LOCK_MAX        8

@@ -95,3 +95,6 @@ EXPORTS
     GetShellWindow
     SystemParametersInfo
     GetClassIcon
+    SetClipboardText
+    GetClipboardText
+    GetClipboardTextLength

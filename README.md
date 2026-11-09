@@ -26,6 +26,7 @@ are for later stages.
 | `make qemu-emm386` | FreeDOS with JEMM386: the loader must refuse to start       |
 | `make qemu-sessions` | types into two concurrent DOS sessions via QEMU's monitor |
 | `make qemu-absmouse` | absolute pointer through QEMU's VMware port: the cursor lands on the exact pixel, and clicks hit their control |
+| `make qemu-notepad` | Notepad: typing, Save As with CR LF, the clipboard between two processes, Open, select/delete/undo, unsaved-changes questions, the file's bytes on disk |
 | `make qemu-files` | file access: Paint saves, opens and replaces a BMP through the file dialogs, a second process reads it, then the file is checked on the disk image |
 | `make qemu-shell` | the shell and its programs as processes: Start menu by mouse and Ctrl+Esc, desktop icons, Calculator, Paint, Clock, taskbar buttons, Run, Shut Down |
 | `make qemu-msgbox` | keyboard accelerators per window, message boxes: modality, default button, Tab, Yes/No letters, Esc, Alt+F4 |
@@ -229,6 +230,8 @@ address space, like Win95's 32-bit side.
   `GetFileSize`, `CloseHandle`, `DeleteFile`, `MoveFile`,
   `Create`/`RemoveDirectory`, `GetFileAttributes`, `Get`/`SetCurrentDirectory`,
   `FindFirstFile`/`FindNextFile`/`FindClose`, `GetLastError`.
+- **Memory.** `SYS_SBRK` grows a per-process heap at `2000_0000`;
+  KERNEL.DLL's `LocalAlloc`/`LocalReAlloc`/`LocalFree` manage it.
 - **Faults and kills.** An exception in ring 3 ends that process with a log
   line; the others carry on, and UI.DLL drops its windows. A killed process
   ends on its way back to ring 3.
@@ -324,6 +327,10 @@ process that created it, and only that process runs its window procedure.
   text selected, so typing replaces it), and a list of subfolders and
   matching files; double-click or type a folder name to move, a pattern
   to filter. Save As asks before replacing a file; Open checks it exists.
+- **NOTEPAD.BIN**: a text editor on the multi-line edit control: File
+  (New, Open, Save, Save As; plain text with CR LF line ends, up to 32 KB),
+  Edit (Undo, Cut, Copy, Paste, Delete, Select All, Time/Date), and the
+  usual question about unsaved changes. `NOTEPAD.BIN name.txt` opens a file.
 - **CLOCK.BIN**: analog (scales with the window; sine table) or digital
   (seven segments and the date), seconds on or off, from the RTC.
 - **DEMO.BIN**: the Control Demo (Programs, Controls and About windows),
@@ -403,7 +410,14 @@ Windows 95 set of window controls and widgets.
   default-button ring, check box, radio button group, group box), `STATIC`,
   `EDIT` (caret, Home/End/Delete), `LISTBOX` with its own scroll bar,
   `SCROLLBAR` (proportional thumb; the parent moves it, as in Windows),
-  `TRACKBAR` and `PROGRESS`. Every control draws inside its own rectangle,
+  `TRACKBAR` and `PROGRESS`. `EDIT` with `ES_MULTILINE` is a text editor
+  control: up to 32 KB in its process's heap, tabs, scrolling with
+  `WS_VSCROLL`/`WS_HSCROLL` bars, selection by mouse (double-click: a word)
+  and Shift+keys, Ctrl+Home/End and word movement, cut/copy/paste through
+  the **clipboard** (shared by every process: `SetClipboardText`,
+  `GetClipboardText`), undo of the last run of typing, and the `EM_*`
+  messages (`EM_GETSEL`, `EM_REPLACESEL`, `EM_GETMODIFY`, `EM_LINEINDEX`...).
+  Single-line edits copy, cut and paste too. Every control draws inside its own rectangle,
   focus and default rings included.
 - **Background behaviour.** When a DOS session takes the screen, the GUI is
   told (`EV_FOCUS`) and stops drawing. Its VGA port accesses are trapped and
@@ -528,8 +542,9 @@ tools/                   check386.sh, check-test.sh
    absolute mouse under emulators, processes with their own address spaces
    sharing one window system, and a Windows 95-style shell with
    Calculator, Paint and Clock, file access for programs with the Open and
-   Save As dialogs. Next: a text editor (multi-line edit), combo boxes and
-   tabs, DLL code shared between processes, VESA truecolor.
+   Save As dialogs, a process heap, the clipboard, a multi-line edit control
+   and Notepad. Next: a task list (Ctrl+Alt+Del), combo boxes and tabs, DLL
+   code shared between processes, VESA truecolor.
 7. **Win16-style API layer.** 16-bit protected-mode apps in ring 3 with LDTs,
    built with Open Watcom.
 8. **Coexisting with EMM386** through VCPI/GEMMIS, and acting as a DPMI host.

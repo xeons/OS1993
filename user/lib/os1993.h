@@ -78,6 +78,14 @@ bool     FindClose(HANDLE h);
 uint32_t GetLastError(void);
 void     SetLastError(uint32_t error);
 
+/* Memory: the process heap (it grows as needed, up to 1 GB) */
+#define LMEM_FIXED      0x0000
+#define LMEM_ZEROINIT   0x0040
+void    *LocalAlloc(unsigned flags, uint32_t size);     /* NULL if out of memory */
+void    *LocalReAlloc(void *p, uint32_t size, unsigned flags);
+void    *LocalFree(void *p);                            /* -> NULL */
+uint32_t LocalSize(void *p);
+
 /* Raw input, for UI.DLL */
 bool     GetInputEvent(struct user_event *e);
 void     WaitForInput(void);                    /* sleep until input or a tick */
@@ -138,6 +146,9 @@ enum {
 #define WS_CAPTION          0x00C00000u
 #define WS_SYSMENU          0x00080000u
 #define WS_THICKFRAME       0x00040000u
+#define WS_HSCROLL          0x00100000u     /* (multi-line edit) scroll bars */
+#define WS_VSCROLL          0x00200000u
+#define WS_BORDER           0x00800000u     /* (multi-line edit) a sunken border */
 #define WS_MINIMIZEBOX      0x00020000u
 #define WS_MAXIMIZEBOX      0x00010000u
 #define WS_GROUP            0x00020000u     /* child windows */
@@ -187,6 +198,11 @@ enum {
 #define WM_LBUTTONDBLCLK    0x0203
 #define WM_RBUTTONDOWN      0x0204
 #define WM_RBUTTONUP        0x0205
+#define WM_CUT              0x0300
+#define WM_COPY             0x0301
+#define WM_PASTE            0x0302
+#define WM_CLEAR            0x0303
+#define WM_UNDO             0x0304
 #define WM_USER             0x0400
 
 #define WA_INACTIVE         0
@@ -287,7 +303,20 @@ enum {
 #define BST_CHECKED         1
 
 /* Edit */
-#define EM_SETSEL           0x00B1  /* (0, -1) selects all the text */
+#define EM_GETSEL           0x00B0  /* -> MAKELONG(start, end); also *(int *)wp, *(int *)lp */
+#define EM_SETSEL           0x00B1  /* (0, -1) selects all the text; (-1, 0) none */
+#define EM_SCROLLCARET      0x00B7
+#define EM_GETMODIFY        0x00B8
+#define EM_SETMODIFY        0x00B9
+#define EM_GETLINECOUNT     0x00BA
+#define EM_LINEINDEX        0x00BB  /* wp = line (-1: the caret's) -> its first character */
+#define EM_REPLACESEL       0x00C2  /* lp = text */
+#define EM_LIMITTEXT        0x00C5  /* wp = most characters */
+#define EM_CANUNDO          0x00C6
+#define EM_UNDO             0x00C7
+#define EM_LINEFROMCHAR     0x00C9  /* wp = character (-1: the caret) -> its line */
+#define ES_MULTILINE        0x0004  /* lines (Enter starts one), tabs, scrolling */
+#define ES_READONLY         0x0800
 #define EN_CHANGE           0x0300
 
 /* List box */
@@ -439,6 +468,11 @@ bool    RegisterShellHookWindow(HWND hwnd);         /* gets WM_SHELLHOOK */
 bool    SetShellWindow(HWND hwnd);                  /* the desktop: kept at the bottom */
 HWND    GetShellWindow(void);
 bool    SystemParametersInfo(unsigned action, unsigned param, void *pv, unsigned flags);
+
+/* The clipboard: text, shared by every process */
+bool    SetClipboardText(const char *text, int len);        /* len -1: up to the NUL */
+int     GetClipboardText(char *buf, int max);               /* -> length copied */
+int     GetClipboardTextLength(void);
 int     GetClassIcon(HWND hwnd);                    /* WNDCLASS.icon */
 
 /* ===================================================================== */
@@ -471,7 +505,7 @@ bool    Shell_NotifyIcon(unsigned msg, const NOTIFYICONDATA *data);
 
 /* Stock icons: 32x32 (desktop) and 16x16 (taskbar, menus) */
 enum { ICON_NONE, ICON_APP, ICON_CALC, ICON_PAINT, ICON_CLOCK, ICON_DEMO, ICON_DOS,
-       ICON_COMPUTER, ICON_INFO, ICON_SHUTDOWN, ICON_COUNT };
+       ICON_COMPUTER, ICON_INFO, ICON_SHUTDOWN, ICON_NOTEPAD, ICON_COUNT };
 void    DrawIcon(HDC dc, int x, int y, int icon);
 
 /* The Open and Save As dialogs */

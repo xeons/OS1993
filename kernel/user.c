@@ -63,6 +63,7 @@ struct process {
     uint32_t       deadline;                /* tick to give up waiting, 0: never */
     int            lock_wait;               /* lock it waits for, -1 none */
     struct proc_files files;                /* open files, current directory */
+    uint32_t       heap_end;                /* SYS_SBRK: USER_HEAP .. heap_end */
 };
 
 void user_enter(uint32_t eip, uint32_t esp, uint32_t ebx);  /* entry.asm */
@@ -164,6 +165,9 @@ static void release_address_space(struct process *p)
     p->nmods = 0;
     unmap_free(USER_STACK_TOP - USER_STACK_SIZE, USER_STACK_SIZE);
     unmap_free(USER_INFO, 2 * PAGE_SIZE);
+    if (p->heap_end > USER_HEAP)
+        unmap_free(USER_HEAP, PAGE_ALIGN_UP(p->heap_end) - USER_HEAP);
+    p->heap_end = USER_HEAP;
     volatile uint32_t *pd = (volatile uint32_t *)PD_WINDOW;
     for (int i = 1; i < USER_PDES; i++) {
         if (i == SHARED_PDE)                    /* shared_destroy's business */
@@ -457,6 +461,7 @@ static int spawn(const char *name, const char *args)
     p->pde = pde;
     p->pid = next_pid++;
     p->lock_wait = -1;
+    p->heap_end = USER_HEAP;
     p->pde[SHARED_PDE] = u.shared_pde;              /* 0 for the first one */
 
     struct thread *self = current;                  /* load into p's space */
@@ -908,6 +913,23 @@ void syscall_dispatch(struct regs *r)
             schedule();
         }
         r->eax = (uint32_t)req.result;
+        break;
+    }
+    case SYS_SBRK: {                                /* grow the heap, zeroed pages */
+        uint32_t old = self->heap_end, add = r->ebx;
+        uint32_t want = old + add;
+        if (add > USER_HEAP_LIMIT - old) {
+            r->eax = 0;
+            break;
+        }
+        uint32_t from = PAGE_ALIGN_UP(old), to = PAGE_ALIGN_UP(want);
+        if (to > from && !map_zeroed(from, to - from)) {
+            unmap_free(from, to - from);
+            r->eax = 0;
+            break;
+        }
+        self->heap_end = want;
+        r->eax = old;
         break;
     }
     case SYS_TIME: {

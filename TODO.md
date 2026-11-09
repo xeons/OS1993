@@ -25,8 +25,12 @@ README.md for what already works.
       vertical banner, taskbar button right-click (the window's system
       menu), tooltips for tray icons, a task list (Ctrl+Alt+Del) that can
       end a hung program (SYS_KILL exists).
-- [ ] Programs: a Notepad (needs a multi-line edit control); Calculator
-      scientific view; Paint: cut/copy/paste, zoom, a canvas size setting.
+- [ ] Notepad: Find/Replace, Word Wrap, Print (no printer yet), files over
+      32 KB. Calculator scientific view; Paint: cut/copy/paste, zoom, a
+      canvas size setting.
+- [ ] Multi-line edit: word wrap, more than one undo step, a blinking caret,
+      auto-scroll while drag-selecting outside the control.
+- [ ] Clipboard: text only (16 KB); bitmaps for Paint.
 - [ ] File dialogs: a drive list, long file names (FreeDOS has no LFN
       here), a file type list.
 - [ ] Layout: controls don't reflow when a window is resized (programs can
@@ -55,7 +59,8 @@ README.md for what already works.
       flight) would let processes do I/O in parallel.
 - [ ] All processes' files share the System VM's PSP handle table (raised
       to 40 with INT 21h 67h); FILES= in CONFIG.SYS bounds them.
-- [ ] Memory allocation system calls (a user heap).
+- [ ] The heap only grows (SYS_SBRK); freed memory is reused but never
+      returned to the system until the process ends.
 - [ ] IPC: done -- per-process queues, cross-process SendMessage and
       WM_COPYDATA, wait/wake and kernel locks. Still to do: named shared
       memory sections, named events, pipes.

@@ -16,7 +16,7 @@ QDIR = os.path.join(BUILD, "qemu")
 IMG = os.path.join(BUILD, "freedos.img")
 
 KEYS = {" ": "spc", "\n": "ret", ".": "dot", ",": "comma", "-": "minus", "/": "slash",
-        "=": "equal", "+": "shift-equal", "*": "shift-8", "%": "shift-5", "@": "shift-2"}
+        "\t": "tab", "=": "equal", "+": "shift-equal", "*": "shift-8", "%": "shift-5", "@": "shift-2"}
 
 
 def near(rgb, want, tol=4):

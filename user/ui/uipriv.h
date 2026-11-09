@@ -45,6 +45,7 @@
 #define MITEM_TEXT  32
 #define MENU_DEPTH  4
 #define COPYDATA_MAX 1024
+#define CLIP_MAX    16384
 
 enum wstate { WS_STATE_NORMAL, WS_STATE_MIN, WS_STATE_MAX };
 
@@ -82,6 +83,7 @@ struct wnd {
     int            bar_sel;                  /* highlighted menu bar item, -1 */
     bool           visible, enabled;
     bool           has_upd;                  /* top level: needs painting */
+    void          *ctl;                      /* a control's data (its process's memory) */
     RECT           upd;                      /* ... this (screen coordinates) */
 
     /* State for the built-in control classes */
@@ -191,6 +193,8 @@ struct ui_shared {
     struct wnd    *shell_hook;               /* RegisterShellHookWindow */
     struct wnd    *desktop;                  /* SetShellWindow: kept at the bottom */
     RECT           work;                     /* SPI_SETWORKAREA */
+    int            clip_len;                 /* the clipboard */
+    char           clip[CLIP_MAX];
     uint8_t        back[4 * GFX_PLANE_BYTES];/* the off-screen copy of the screen */
 };
 
@@ -277,6 +281,7 @@ bool  ui_has_focus(struct wnd *w);            /* focus, in the active window */
 LRESULT button_proc(HWND, unsigned, WPARAM, LPARAM);
 LRESULT static_proc(HWND, unsigned, WPARAM, LPARAM);
 LRESULT edit_proc(HWND, unsigned, WPARAM, LPARAM);
+LRESULT medit_proc(HWND, unsigned, WPARAM, LPARAM);  /* ES_MULTILINE */
 LRESULT listbox_proc(HWND, unsigned, WPARAM, LPARAM);
 LRESULT scrollbar_proc(HWND, unsigned, WPARAM, LPARAM);
 LRESULT trackbar_proc(HWND, unsigned, WPARAM, LPARAM);

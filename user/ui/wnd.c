@@ -135,7 +135,7 @@ void ui_init_classes(void)
 {
     builtin(WC_BUTTON, button_proc, false);
     builtin(WC_STATIC, static_proc, true);
-    builtin(WC_EDIT, edit_proc, false);
+    builtin(WC_EDIT, edit_proc, false)->style |= CS_DBLCLKS;
     builtin(WC_LISTBOX, listbox_proc, false)->style |= CS_DBLCLKS;
     builtin(WC_SCROLLBAR, scrollbar_proc, false);
     builtin(WC_TRACKBAR, trackbar_proc, false);
@@ -763,6 +763,28 @@ bool SetShellWindow(HWND h)
 }
 
 HWND GetShellWindow(void) { return S->desktop; }
+
+bool SetClipboardText(const char *text, int len)
+{
+    if (!text) return false;
+    if (len < 0) len = (int)strlen(text);
+    if (len > CLIP_MAX - 1) len = CLIP_MAX - 1;
+    memcpy(S->clip, text, (size_t)len);
+    S->clip[len] = '\0';
+    S->clip_len = len;
+    return true;
+}
+
+int GetClipboardText(char *buf, int max)
+{
+    if (!buf || max <= 0) return 0;
+    int n = S->clip_len < max - 1 ? S->clip_len : max - 1;
+    memcpy(buf, S->clip, (size_t)n);
+    buf[n] = '\0';
+    return n;
+}
+
+int GetClipboardTextLength(void) { return S->clip_len; }
 
 int GetClassIcon(HWND h)
 {

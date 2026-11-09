@@ -17,7 +17,7 @@
 #define TASK_MAX    16
 #define TRAY_MAX    8
 #define CELL_W      88
-#define CELL_H      64
+#define CELL_H      62
 
 static HWND desktop, taskbar;
 
@@ -29,6 +29,7 @@ static const struct program programs[] = {
     { "&Calculator",    "CALC.BIN",    ICON_CALC },
     { "&Paint",         "PAINT.BIN",   ICON_PAINT },
     { "C&lock",         "CLOCK.BIN",   ICON_CLOCK },
+    { "&Notepad",       "NOTEPAD.BIN", ICON_NOTEPAD },
     { "Control &Demo",  "DEMO.BIN",    ICON_DEMO },
     { "&MS-DOS Prompt", "COMMAND.COM", ICON_DOS },
 };
@@ -389,6 +390,7 @@ static const struct desk_icon icons[] = {
     { "Calculator",     "CALC.BIN",    ICON_CALC },
     { "Paint",          "PAINT.BIN",   ICON_PAINT },
     { "Clock",          "CLOCK.BIN",   ICON_CLOCK },
+    { "Notepad",        "NOTEPAD.BIN", ICON_NOTEPAD },
     { "Control Demo",   "DEMO.BIN",    ICON_DEMO },
     { "MS-DOS Prompt",  "COMMAND.COM", ICON_DOS },
 };

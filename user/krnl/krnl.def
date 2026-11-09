@@ -41,3 +41,7 @@ EXPORTS
     FindClose
     GetLastError
     SetLastError
+    LocalAlloc
+    LocalReAlloc
+    LocalFree
+    LocalSize

@@ -23,6 +23,8 @@ static void changed(struct wnd *w)
 LRESULT edit_proc(HWND h, unsigned msg, WPARAM wp, LPARAM lp)
 {
     struct wnd *w = wnd_from(h);
+    if (w->style & ES_MULTILINE)
+        return medit_proc(h, msg, wp, lp);
     int len = (int)strlen(w->text);
     switch (msg) {
     case WM_CREATE:
@@ -73,14 +75,40 @@ LRESULT edit_proc(HWND h, unsigned msg, WPARAM wp, LPARAM lp)
     case WM_ENABLE:
         InvalidateRect(h, NULL);
         return 0;
+    case WM_LBUTTONDBLCLK:
+        SendMessage(h, EM_SETSEL, 0, -1);
+        return 0;
     case WM_LBUTTONDOWN:
         SetFocus(h);
         w->pressed = false;
         w->caret = clampi(first_visible(w) + (GET_X_LPARAM(lp) - RING - 5 + 4) / 8, 0, len);
         InvalidateRect(h, NULL);
         return 0;
+    case WM_COPY:
+    case WM_CUT:
+        SetClipboardText(w->text, len);             /* one line: the lot */
+        if (msg == WM_CUT && !(w->style & ES_READONLY)) {
+            w->text[0] = '\0';
+            w->caret = 0;
+            w->pressed = false;
+            changed(w);
+        }
+        return 0;
+    case WM_PASTE: {
+        char clip[TEXT_MAX];
+        int n = GetClipboardText(clip, sizeof clip);
+        for (int i = 0; i < n && clip[i] != '\n' && clip[i] != '\r'; i++)
+            SendMessage(h, WM_CHAR, (WPARAM)(uint8_t)clip[i], 0);
+        return 0;
+    }
     case WM_CHAR: {
         char ch = (char)wp;
+        switch (ch) {
+        case 1:  SendMessage(h, EM_SETSEL, 0, -1); return 0;       /* Ctrl+A */
+        case 3:  SendMessage(h, WM_COPY, 0, 0); return 0;          /* Ctrl+C */
+        case 22: SendMessage(h, WM_PASTE, 0, 0); return 0;         /* Ctrl+V */
+        case 24: SendMessage(h, WM_CUT, 0, 0); return 0;           /* Ctrl+X */
+        }
         if (w->pressed && (ch == 8 || (ch >= 32 && ch < 127))) {   /* typing replaces it */
             w->pressed = false;
             w->text[0] = '\0';

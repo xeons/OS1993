@@ -16,6 +16,7 @@
 #   make qemu-msgbox  keyboard accelerators and message boxes
 #   make qemu-shell the shell and its programs, each a process
 #   make qemu-files file access: Paint's Open/Save, the file dialogs, the disk
+#   make qemu-notepad  Notepad and the multi-line edit control, the clipboard
 #   make clean
 
 CC      := i686-elf-gcc
@@ -56,7 +57,7 @@ SHELL_BASE  := $(shell $(MKDEF) user/shell/shell.def base)
 # DLLs: header, code, export table, import libraries of what they call
 KRNL_OBJ  := $(U)/hdr/KERNEL.DLL.o $(U)/krnl/krnl.o $(U)/gen/krnl_exports.o $(U)/lib/lib.o
 GFX_OBJ   := $(U)/hdr/GFX.DLL.o $(U)/gfx/gfx.o $(U)/gen/gfx_exports.o $(U)/lib/lib.o
-UI_SRC    := wnd queue input frame paint menu accel msgbox dialog button static edit listbox \
+UI_SRC    := wnd queue input frame paint menu accel msgbox dialog button static edit medit listbox \
              scroll trackbar kbd theme
 UI_OBJ    := $(U)/hdr/UI.DLL.o $(patsubst %,$(U)/ui/%.o,$(UI_SRC)) \
              $(U)/gen/ui_exports.o $(U)/gen/gfx_imports.o $(U)/gen/krnl_imports.o $(U)/lib/lib.o
@@ -64,7 +65,7 @@ SHELL_OBJ := $(U)/hdr/SHELL.DLL.o $(U)/shell/shell.o $(U)/shell/icons.o $(U)/she
              $(U)/gen/ui_imports.o $(U)/gen/krnl_imports.o $(U)/lib/lib.o
 
 # Programs: user/apps/<name>.c, each a process of its own
-APPS      := SHELL DEMO CALC PAINT CLOCK
+APPS      := SHELL DEMO CALC PAINT CLOCK NOTEPAD
 APP_LIBS  := $(U)/lib/crt0.o $(U)/gen/krnl_imports.o $(U)/gen/ui_imports.o \
              $(U)/gen/shell_imports.o $(U)/lib/lib.o
 app_obj    = $(U)/hdr/$(1).BIN.o $(U)/apps/$(shell echo $(1) | tr A-Z a-z).o $(APP_LIBS)
@@ -80,7 +81,7 @@ KERNEL_ASM := $(wildcard kernel/*.asm)
 KERNEL_OBJ := $(patsubst kernel/%.asm,$(BUILD)/kernel/%.o,$(KERNEL_ASM)) \
               $(patsubst kernel/%.c,$(BUILD)/kernel/%.o,$(KERNEL_C))
 
-.PHONY: all run test check386 qemu qemu-test qemu-emm386 qemu-sessions qemu-vga qemu-wm qemu-absmouse qemu-menu qemu-msgbox qemu-shell qemu-files clean
+.PHONY: all run test check386 qemu qemu-test qemu-emm386 qemu-sessions qemu-vga qemu-wm qemu-absmouse qemu-menu qemu-msgbox qemu-shell qemu-files qemu-notepad clean
 
 all: $(BUILD)/OS1993.COM $(BUILD)/VMM.BIN $(MODULES)
 
@@ -224,6 +225,9 @@ qemu-shell: all
 
 qemu-files: all
 	@tools/qemu-files-test.py
+
+qemu-notepad: all
+	@tools/qemu-notepad-test.py
 
 check386: $(BUILD)/vmm.elf $(MODULE_ELFS)
 	@for f in $^; do tools/check386.sh $(OBJDUMP) $$f || exit 1; done

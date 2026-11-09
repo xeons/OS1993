@@ -206,3 +206,92 @@ bool FindClose(HANDLE h)
     struct file_args a = { .handle = (uint32_t)h };
     return file_call(FOP_FIND_CLOSE, &a) >= 0;
 }
+
+/* ---- memory: a first-fit heap over SYS_SBRK ------------------------------- */
+
+struct block { uint32_t size; uint32_t free; };   /* size includes the header */
+
+#define GROW (16u * 1024)
+
+static struct block *heap_first, *heap_end;
+
+static struct block *next_block(struct block *b) { return (struct block *)((uint8_t *)b + b->size); }
+
+static bool grow(uint32_t need)
+{
+    uint32_t n = need > GROW ? (need + GROW - 1) / GROW * GROW : GROW;
+    uint32_t old = sys_sbrk(n);
+    if (!old)
+        return false;
+    struct block *b = (struct block *)old;
+    if (!heap_first)
+        heap_first = b;
+    b->size = n;
+    b->free = 1;
+    heap_end = next_block(b);
+    /* merge with a free block just before it */
+    for (struct block *p = heap_first; p != b; p = next_block(p))
+        if (next_block(p) == b && p->free) {
+            p->size += b->size;
+            break;
+        }
+    return true;
+}
+
+void *LocalAlloc(unsigned flags, uint32_t size)
+{
+    if (size > 0x3FFFFFFF)
+        return NULL;
+    uint32_t need = (size + sizeof(struct block) + 7) & ~7u;
+    for (int attempt = 0; attempt < 2; attempt++) {
+        for (struct block *b = heap_first; b && b != heap_end; b = next_block(b)) {
+            if (!b->free || b->size < need)
+                continue;
+            if (b->size - need >= 32) {                 /* split */
+                struct block *rest = (struct block *)((uint8_t *)b + need);
+                rest->size = b->size - need;
+                rest->free = 1;
+                b->size = need;
+            }
+            b->free = 0;
+            void *p = b + 1;
+            if (flags & LMEM_ZEROINIT)
+                memset(p, 0, b->size - sizeof *b);
+            return p;
+        }
+        if (!grow(need))
+            return NULL;
+    }
+    return NULL;
+}
+
+void *LocalFree(void *p)
+{
+    if (!p)
+        return NULL;
+    ((struct block *)p - 1)->free = 1;
+    for (struct block *b = heap_first; b && b != heap_end; b = next_block(b))
+        while (b->free && next_block(b) != heap_end && next_block(b)->free)
+            b->size += next_block(b)->size;             /* coalesce */
+    return NULL;
+}
+
+uint32_t LocalSize(void *p)
+{
+    return p ? ((struct block *)p - 1)->size - sizeof(struct block) : 0;
+}
+
+void *LocalReAlloc(void *p, uint32_t size, unsigned flags)
+{
+    if (!p)
+        return LocalAlloc(flags, size);
+    uint32_t have = LocalSize(p);
+    if (size <= have)
+        return p;
+    void *q = LocalAlloc(flags, size);
+    if (!q)
+        return NULL;
+    memcpy(q, p, have);
+    LocalFree(p);
+    return q;
+}
