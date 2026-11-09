@@ -3,20 +3,24 @@
  *
  * A multi-line EDIT control filling the window, with File (New, Open,
  * Save, Save As), Edit (Undo, Cut, Copy, Paste, Delete, Select All,
- * Time/Date) and Help menus. Files are plain text with CR LF line ends
+ * Time/Date, Word Wrap), Search (Find, Find Next, Replace) and Help menus. Files are plain text with CR LF line ends
  * (DOS's), up to 32 KB; the control keeps LF only, so CRs go on the way
  * out. NOTEPAD.BIN name.txt opens a file at start.
  */
 #include "os1993.h"
 
 enum { ID_EDIT = 1, ID_NEW = 100, ID_OPEN, ID_SAVE, ID_SAVEAS, ID_EXIT, ID_UNDO, ID_CUT, ID_COPY,
-       ID_PASTE, ID_DELETE, ID_SELALL, ID_TIMEDATE, ID_ABOUT };
+       ID_PASTE, ID_DELETE, ID_SELALL, ID_TIMEDATE, ID_ABOUT, ID_WRAP, ID_FIND, ID_FINDNEXT,
+       ID_REPLACE };
 
 #define MAX_FILE 32767
 
 static HWND np, edit;
 static HMENU edit_menu;
 static char file_path[128];
+static HWND find_dlg;                       /* Find or Replace, while open */
+static char find_text[64], repl_text[64];
+static FINDREPLACE fr = { 0, FR_DOWN, find_text, repl_text, sizeof find_text };
 
 static const char *base_name(const char *path)
 {
@@ -134,6 +138,147 @@ static bool may_discard(void)
     return r == IDNO || (r == IDYES && save_current());
 }
 
+/* ---- Find and Replace ------------------------------------------------------------ */
+
+static bool is_word(char c) { return (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_'; }
+static char lower(char c)   { return c >= 'A' && c <= 'Z' ? (char)(c + 32) : c; }
+
+static bool match_at(const char *text, int len, int i, unsigned flags)
+{
+    int n = (int)strlen(find_text);
+    if (i < 0 || i + n > len)
+        return false;
+    for (int k = 0; k < n; k++) {
+        char a = text[i + k], b = find_text[k];
+        if (flags & FR_MATCHCASE ? a != b : lower(a) != lower(b))
+            return false;
+    }
+    if (flags & FR_WHOLEWORD)
+        return (i == 0 || !is_word(text[i - 1])) && (i + n == len || !is_word(text[i + n]));
+    return true;
+}
+
+static char *text_copy(int *len)
+{
+    *len = (int)SendMessage(edit, WM_GETTEXTLENGTH, 0, 0);
+    char *t = LocalAlloc(0, (uint32_t)*len + 1);
+    if (t)
+        GetWindowText(edit, t, *len + 1);
+    return t;
+}
+
+/* Select the next match after the selection (before it, going up). */
+static bool find_next(unsigned flags)
+{
+    int len, a, z;
+    char *t = text_copy(&len);
+    if (!t)
+        return false;
+    SendMessage(edit, EM_GETSEL, (WPARAM)&a, (LPARAM)&z);
+    int at = -1;
+    if (flags & FR_DOWN) {
+        for (int i = z; i < len && at < 0; i++)
+            if (match_at(t, len, i, flags)) at = i;
+    } else {
+        for (int i = a - 1; i >= 0 && at < 0; i--)
+            if (match_at(t, len, i, flags)) at = i;
+    }
+    LocalFree(t);
+    if (at < 0) {
+        char text[96] = "Cannot find \"";
+        strncpy0(text + strlen(text), find_text, sizeof text - strlen(text));
+        strncpy0(text + strlen(text), "\"", sizeof text - strlen(text));
+        DebugLog("notepad cannot find %s", find_text);
+        MessageBox(find_dlg ? find_dlg : np, text, "Notepad", MB_OK | MB_ICONINFORMATION);
+        return false;
+    }
+    SendMessage(edit, EM_SETSEL, (WPARAM)at, at + (int)strlen(find_text));
+    SendMessage(edit, EM_SCROLLCARET, 0, 0);
+    DebugLog("notepad found %s at %d", find_text, at);
+    return true;
+}
+
+static void replace_one(unsigned flags)              /* the selection, if it matches */
+{
+    int len, a, z;
+    char *t = text_copy(&len);
+    if (!t)
+        return;
+    SendMessage(edit, EM_GETSEL, (WPARAM)&a, (LPARAM)&z);
+    bool hit = z - a == (int)strlen(find_text) && match_at(t, len, a, flags);
+    LocalFree(t);
+    if (hit) {
+        SendMessage(edit, EM_REPLACESEL, 1, (LPARAM)repl_text);
+        DebugLog("notepad replaced at %d", a);
+    }
+    find_next(flags | FR_DOWN);
+}
+
+static void replace_all(unsigned flags)              /* as one edit: one Undo */
+{
+    int len, count = 0, n = (int)strlen(find_text), rn = (int)strlen(repl_text);
+    char *t = text_copy(&len);
+    if (!t)
+        return;
+    int out_max = len + (rn > n ? (len / (n ? n : 1) + 1) * (rn - n) : 0) + 1;
+    char *out = LocalAlloc(0, (uint32_t)out_max);
+    int k = 0;
+    for (int i = 0; out && i < len; ) {
+        if (match_at(t, len, i, flags)) {
+            memcpy(out + k, repl_text, (size_t)rn);
+            k += rn;
+            i += n;
+            count++;
+        } else {
+            out[k++] = t[i++];
+        }
+    }
+    if (out && count) {
+        out[k] = '\0';
+        SendMessage(edit, EM_SETSEL, 0, -1);
+        SendMessage(edit, EM_REPLACESEL, 1, (LPARAM)out);
+        SendMessage(edit, EM_SETSEL, 0, 0);
+    }
+    LocalFree(out);
+    LocalFree(t);
+    DebugLog("notepad replaced %d", count);
+    if (!count)
+        find_next(flags | FR_DOWN);                 /* says it can't find it */
+}
+
+static void open_find(bool replace)
+{
+    if (find_dlg)
+        DestroyWindow(find_dlg);
+    int a, z;                                       /* start with the selection */
+    SendMessage(edit, EM_GETSEL, (WPARAM)&a, (LPARAM)&z);
+    if (z > a && z - a < (int)sizeof find_text) {
+        int len;
+        char *t = text_copy(&len);
+        if (t) {
+            bool one_line = true;
+            for (int i = a; i < z; i++) if (t[i] == '\n') one_line = false;
+            if (one_line) {
+                memcpy(find_text, t + a, (size_t)(z - a));
+                find_text[z - a] = '\0';
+            }
+            LocalFree(t);
+        }
+    }
+    fr.owner = np;
+    find_dlg = replace ? ReplaceText(&fr) : FindText(&fr);
+}
+
+static void set_wrap(bool on)
+{
+    unsigned style = (unsigned)GetWindowLong(edit, GWL_STYLE);
+    style = on ? style & ~WS_HSCROLL : style | WS_HSCROLL;
+    SetWindowLong(edit, GWL_STYLE, (int32_t)style);
+    CheckMenuItem(edit_menu, ID_WRAP, on ? MF_CHECKED : MF_UNCHECKED);
+    DebugLog("notepad word wrap %s (%d lines)", on ? "on" : "off",
+             (int)SendMessage(edit, EM_GETLINECOUNT, 0, 0));
+}
+
 /* ---- commands ------------------------------------------------------------------ */
 
 static void time_date(void)
@@ -195,6 +340,13 @@ static void command(int id)
     case ID_DELETE:   SendMessage(edit, WM_CLEAR, 0, 0); break;
     case ID_SELALL:   SendMessage(edit, EM_SETSEL, 0, -1); break;
     case ID_TIMEDATE: time_date(); break;
+    case ID_WRAP:     set_wrap(GetWindowLong(edit, GWL_STYLE) & WS_HSCROLL); break;
+    case ID_FIND:     open_find(false); break;
+    case ID_REPLACE:  open_find(true); break;
+    case ID_FINDNEXT:
+        if (find_text[0]) find_next(fr.flags);
+        else open_find(false);
+        break;
     case ID_ABOUT:    ShellAbout(np, "Notepad", NULL); break;
     }
 }
@@ -229,6 +381,20 @@ static LRESULT np_proc(HWND h, unsigned msg, WPARAM wp, LPARAM lp)
         if (LOWORD(wp) != ID_EDIT)
             command(LOWORD(wp));
         return 0;
+    case WM_FINDMSG: {
+        unsigned f = fr.flags;
+        if (f & FR_DIALOGTERM) {
+            find_dlg = NULL;
+            SetFocus(edit);
+        } else if (f & FR_REPLACEALL) {
+            replace_all(f);
+        } else if (f & FR_REPLACE) {
+            replace_one(f);
+        } else if (f & FR_FINDNEXT) {
+            find_next(f);
+        }
+        return 0;
+    }
     case WM_CLOSE:
         if (may_discard())
             PostQuitMessage(0);
@@ -259,9 +425,16 @@ int main(void)
     AppendMenu(edit_menu, MF_SEPARATOR, 0, NULL);
     AppendMenu(edit_menu, MF_STRING, ID_SELALL, "Select &All\tCtrl+A");
     AppendMenu(edit_menu, MF_STRING, ID_TIMEDATE, "Time/&Date\tF5");
+    AppendMenu(edit_menu, MF_SEPARATOR, 0, NULL);
+    AppendMenu(edit_menu, MF_STRING, ID_WRAP, "&Word Wrap");
+    HMENU search = CreatePopupMenu();
+    AppendMenu(search, MF_STRING, ID_FIND, "&Find...\tCtrl+F");
+    AppendMenu(search, MF_STRING, ID_FINDNEXT, "Find &Next\tF3");
+    AppendMenu(search, MF_STRING, ID_REPLACE, "&Replace...\tCtrl+H");
     AppendMenu(help, MF_STRING, ID_ABOUT, "&About Notepad");
     AppendMenu(bar, MF_POPUP, (uintptr_t)file, "&File");
     AppendMenu(bar, MF_POPUP, (uintptr_t)edit_menu, "&Edit");
+    AppendMenu(bar, MF_POPUP, (uintptr_t)search, "&Search");
     AppendMenu(bar, MF_POPUP, (uintptr_t)help, "&Help");
     np = CreateWindow("NotepadWindow", "Untitled - Notepad", WS_OVERLAPPEDWINDOW, 70, 40, 480, 340,
                       NULL, 0, NULL);
@@ -271,8 +444,10 @@ int main(void)
     static const ACCEL keys[] = {
         { FVIRTKEY | FCONTROL, 'N', ID_NEW }, { FVIRTKEY | FCONTROL, 'O', ID_OPEN },
         { FVIRTKEY | FCONTROL, 'S', ID_SAVE }, { FVIRTKEY, VK_F1 + 4, ID_TIMEDATE },
+        { FVIRTKEY | FCONTROL, 'F', ID_FIND }, { FVIRTKEY, VK_F1 + 2, ID_FINDNEXT },
+        { FVIRTKEY | FCONTROL, 'H', ID_REPLACE },
     };
-    HACCEL acc = CreateAcceleratorTable(keys, 4);
+    HACCEL acc = CreateAcceleratorTable(keys, 7);
     const char *arg = GetStartupInfo()->args;
     if (arg[0])
         load(arg);
@@ -280,6 +455,8 @@ int main(void)
 
     MSG msg;
     while (GetMessage(&msg)) {
+        if (find_dlg && IsDialogMessage(find_dlg, &msg))
+            continue;
         if (TranslateAccelerator(np, acc, &msg))
             continue;
         TranslateMessage(&msg);

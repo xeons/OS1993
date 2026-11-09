@@ -4,8 +4,9 @@
  * Lines end with LF (CRs are dropped on the way in); tabs stop every 8
  * columns. The text lives in the owning process's heap (LocalAlloc) and
  * grows up to the limit (EM_LIMITTEXT, 32767 by default, as Win95's edit
- * control). It scrolls both ways, with scroll bars for WS_VSCROLL and
- * WS_HSCROLL; selects with the mouse or Shift and the movement keys;
+ * control). Without WS_HSCROLL (or ES_AUTOHSCROLL) it wraps words at the
+ * window's width, as Win32's does; otherwise it scrolls sideways. Scroll
+ * bars for WS_VSCROLL and WS_HSCROLL; selects with the mouse or Shift and the movement keys;
  * cuts, copies and pastes through the clipboard; and undoes the last run
  * of typing (and undoes the undo). The usual EM_* messages work.
  */
@@ -17,8 +18,9 @@
 struct medit {
     char *buf;
     int   len, cap, limit;
-    int  *line;                         /* where each line starts */
+    int  *line;                         /* where each row (line, or wrapped part) starts */
     int   nlines, lcap;
+    int   wrapw;                        /* wrap at this many columns; 0: don't */
     int   maxw;                         /* the widest line, in columns */
     int   anchor, caret;                /* the selection: between them */
     int   top, left;                    /* first line and column shown */
@@ -50,31 +52,70 @@ static int cols(struct wnd *w) { RECT t = text_rect(w); int c = (t.right - t.lef
 
 /* ---- lines and columns --------------------------------------------------- */
 
-static void relines(struct medit *m)
+static int advance(int col, char c) { return c == '\t' ? (col / TABW + 1) * TABW : col + 1; }
+
+static bool push_row(struct medit *m, int start)
 {
-    int n = 1, w = 0, col = 0;
-    for (int i = 0; i < m->len; i++)
-        if (m->buf[i] == '\n') n++;
-    if (n > m->lcap) {
-        int cap = n + 256;
+    if (m->nlines == m->lcap) {
+        int cap = m->lcap + 256;
         int *p = LocalReAlloc(m->line, (uint32_t)cap * sizeof(int), 0);
-        if (!p) return;
+        if (!p) return false;
         m->line = p;
         m->lcap = cap;
     }
-    m->line[0] = 0;
-    m->nlines = 1;
+    m->line[m->nlines++] = start;
+    return true;
+}
+
+/* Where each row starts: after every LF and, when wrapping, after the last
+ * space that still fits (or hard at the width when a word is longer). */
+static void relines(struct medit *m)
+{
+    int col = 0, maxw = 0, brk = -1, start = 0;
+    m->nlines = 0;
+    if (!push_row(m, 0))
+        return;
     for (int i = 0; i < m->len; i++) {
         char c = m->buf[i];
         if (c == '\n') {
-            if (col > w) w = col;
+            if (col > maxw) maxw = col;
             col = 0;
-            m->line[m->nlines++] = i + 1;
-        } else {
-            col = c == '\t' ? (col / TABW + 1) * TABW : col + 1;
+            brk = -1;
+            start = i + 1;
+            if (!push_row(m, start)) break;
+            continue;
         }
+        int next = advance(col, c);
+        if (m->wrapw && next > m->wrapw && i > start) {
+            int at = brk > start ? brk : i;
+            if (col > maxw) maxw = col;
+            if (!push_row(m, at)) break;
+            start = at;
+            col = 0;
+            for (int k = at; k < i; k++)
+                col = advance(col, m->buf[k]);
+            brk = -1;
+            next = advance(col, c);
+        }
+        if (c == ' ')
+            brk = i + 1;
+        col = next;
     }
-    m->maxw = col > w ? col : w;
+    m->maxw = col > maxw ? col : maxw;
+}
+
+static bool wraps(struct wnd *w)
+{
+    return !(w->style & (WS_HSCROLL | ES_AUTOHSCROLL));
+}
+
+static int cols(struct wnd *w);
+
+static void layout(struct wnd *w)                   /* rows for the current width */
+{
+    struct medit *m = w->ctl;
+    m->wrapw = wraps(w) ? cols(w) : 0;
+    relines(m);
 }
 
 static int line_of(struct medit *m, int idx)
@@ -87,9 +128,17 @@ static int line_of(struct medit *m, int idx)
     return lo;
 }
 
-static int line_end(struct medit *m, int n)
+static int line_end(struct medit *m, int n)            /* where End puts the caret */
 {
     return n + 1 < m->nlines ? m->line[n + 1] - 1 : m->len;
+}
+
+static int row_stop(struct medit *m, int n)            /* the row's text ends here */
+{
+    if (n + 1 >= m->nlines)
+        return m->len;
+    int next = m->line[n + 1];
+    return m->buf[next - 1] == '\n' ? next - 1 : next;
 }
 
 static int vcol(struct medit *m, int idx)
@@ -155,9 +204,9 @@ static void show_caret(struct wnd *w)
 static void changed(struct wnd *w)
 {
     struct medit *m = me(w);
-    relines(m);
     m->modified = true;
     m->want = -1;
+    layout(w);
     show_caret(w);
     InvalidateRect(w, NULL);
     if (w->parent)
@@ -437,7 +486,7 @@ static void paint(struct wnd *w, HDC dc)
     int a = sel_start(m), z = sel_end(m), r = rows(w), k = cols(w);
     char run[96];
     for (int row = 0; row <= r && m->top + row < m->nlines; row++) {
-        int ln = m->top + row, i = m->line[ln], end = line_end(m, ln), col = 0, y = t.top + row * 16;
+        int ln = m->top + row, i = m->line[ln], end = row_stop(m, ln), col = 0, y = t.top + row * 16;
         int n = 0, run_col = 0;
         bool run_sel = false;
         for (;; i++) {
@@ -470,7 +519,7 @@ static void paint(struct wnd *w, HDC dc)
             }
             col = next;
         }
-        if (z > end && a <= end && end < m->len && ln < m->nlines - 1) {   /* the selected newline */
+        if (z > end && a <= end && end < m->len && m->buf[end] == '\n') {   /* the selected newline */
             int x = t.left + (col - m->left) * 8;
             RECT s = { x, y, x + 8, y + 16 };
             if (col >= m->left) FillRect(dc, &s, focus ? C_ACCENT : C_GRAY4);
@@ -506,7 +555,7 @@ LRESULT medit_proc(HWND h, unsigned msg, WPARAM wp, LPARAM lp)
         m->cap = 1024;
         m->limit = LIMIT_DEFAULT;
         m->want = -1;
-        relines(m);
+        layout(w);
         set_text(w, w->text);
         return 0;
     case WM_DESTROY:
@@ -524,7 +573,16 @@ LRESULT medit_proc(HWND h, unsigned msg, WPARAM wp, LPARAM lp)
         return 0;
     }
     case WM_SIZE:
+        layout(w);
         scroll_to(w, m->top, m->left);
+        show_caret(w);
+        InvalidateRect(h, NULL);
+        return 0;
+    case WM_STYLECHANGED:                           /* word wrap on or off */
+        layout(w);
+        m->left = 0;
+        m->top = clampi(m->top, 0, vmax(w));
+        show_caret(w);
         InvalidateRect(h, NULL);
         return 0;
     case WM_SETFOCUS:

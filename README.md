@@ -27,7 +27,7 @@ are for later stages.
 | `make qemu-sessions` | types into two concurrent DOS sessions via QEMU's monitor |
 | `make qemu-absmouse` | absolute pointer through QEMU's VMware port: the cursor lands on the exact pixel, and clicks hit their control |
 | `make qemu-tasklist` | Ctrl+Alt+Del: Close Program ends a program, works from a DOS session, and the VMM's screen ends a program that froze the GUI |
-| `make qemu-notepad` | Notepad: typing, Save As with CR LF, the clipboard between two processes, Open, select/delete/undo, unsaved-changes questions, the file's bytes on disk |
+| `make qemu-notepad` | Notepad: typing, Save As with CR LF, the clipboard between two processes, Open, select/delete/undo, unsaved-changes questions, Find/Find Next/whole words, Replace All and its undo, Word Wrap, the file's bytes on disk |
 | `make qemu-files` | file access: Paint saves, opens and replaces a BMP through the file dialogs, a second process reads it, then the file is checked on the disk image |
 | `make qemu-shell` | the shell and its programs as processes: Start menu by mouse and Ctrl+Esc, desktop icons, Calculator, Paint, Clock, taskbar buttons, Run, Shut Down |
 | `make qemu-msgbox` | keyboard accelerators per window, message boxes: modality, default button, Tab, Yes/No letters, Esc, Alt+F4 |
@@ -275,7 +275,7 @@ system DLLs.
 | `KERNEL.DLL` | `1000_0000` | the userland kernel library: wraps the INT 30h system calls (`user/krnl/`) |
 | `GFX.DLL` | `1010_0000` | the VGA display driver (`user/gfx/`)             |
 | `UI.DLL`  | `1020_0000` | windows, messages, painting, controls (`user/ui/`); imports KERNEL, GFX |
-| `SHELL.DLL` | `1030_0000` | the shell API: `ShellExecute`, `ShellAbout`, `Shell_NotifyIcon`, `GetOpenFileName`/`GetSaveFileName`, stock icons (`user/shell/`) |
+| `SHELL.DLL` | `1030_0000` | the shell API: `ShellExecute`, `ShellAbout`, `Shell_NotifyIcon`, `GetOpenFileName`/`GetSaveFileName`, `FindText`/`ReplaceText`, stock icons (`user/shell/`) |
 | `*.BIN`   | `0040_0000` | programs (`user/apps/`): SHELL, CALC, PAINT, CLOCK, DEMO |
 
 Programs include one header, `user/lib/os1993.h` (the `windows.h` of
@@ -340,8 +340,10 @@ process that created it, and only that process runs its window procedure.
   to filter. Save As asks before replacing a file; Open checks it exists.
 - **NOTEPAD.BIN**: a text editor on the multi-line edit control: File
   (New, Open, Save, Save As; plain text with CR LF line ends, up to 32 KB),
-  Edit (Undo, Cut, Copy, Paste, Delete, Select All, Time/Date), and the
-  usual question about unsaved changes. `NOTEPAD.BIN name.txt` opens a file.
+  Edit (Undo, Cut, Copy, Paste, Delete, Select All, Time/Date, Word Wrap),
+  Search (Find, Find Next F3, Replace; match case, whole words, up/down,
+  Replace All as one undoable edit), and the usual question about unsaved
+  changes. `NOTEPAD.BIN name.txt` opens a file.
 - **CLOCK.BIN**: analog (scales with the window; sine table) or digital
   (seven segments and the date), seconds on or off, from the RTC.
 - **DEMO.BIN**: the Control Demo (Programs, Controls and About windows),
@@ -423,7 +425,9 @@ Windows 95 set of window controls and widgets.
   `SCROLLBAR` (proportional thumb; the parent moves it, as in Windows),
   `TRACKBAR` and `PROGRESS`. `EDIT` with `ES_MULTILINE` is a text editor
   control: up to 32 KB in its process's heap, tabs, scrolling with
-  `WS_VSCROLL`/`WS_HSCROLL` bars, selection by mouse (double-click: a word)
+  `WS_VSCROLL`/`WS_HSCROLL` bars (without a horizontal one or
+  `ES_AUTOHSCROLL`, words wrap at the width, re-wrapped on resize and on
+  `WM_STYLECHANGED`, which `SetWindowLong(GWL_STYLE)` now sends), selection by mouse (double-click: a word)
   and Shift+keys, Ctrl+Home/End and word movement, cut/copy/paste through
   the **clipboard** (shared by every process: `SetClipboardText`,
   `GetClipboardText`), undo of the last run of typing, and the `EM_*`

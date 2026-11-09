@@ -9,3 +9,5 @@ EXPORTS
     DrawSmallIcon
     GetOpenFileName
     GetSaveFileName
+    FindText
+    ReplaceText

@@ -184,7 +184,8 @@ enum {
 #define WM_CHAR             0x0102
 #define WM_SYSKEYDOWN       0x0104
 #define WM_SYSKEYUP         0x0105
-#define WM_CONTEXTMENU      0x007B  /* wParam = window clicked, lParam = screen x,y */
+#define WM_CONTEXTMENU      0x007B
+#define WM_STYLECHANGED     0x007D  /* after SetWindowLong(GWL_STYLE): wParam = GWL_STYLE */  /* wParam = window clicked, lParam = screen x,y */
 #define WM_COMMAND          0x0111
 #define WM_SYSCOMMAND       0x0112
 #define WM_TIMER            0x0113
@@ -323,6 +324,8 @@ enum {
 #define EM_UNDO             0x00C7
 #define EM_LINEFROMCHAR     0x00C9  /* wp = character (-1: the caret) -> its line */
 #define ES_MULTILINE        0x0004  /* lines (Enter starts one), tabs, scrolling */
+#define ES_AUTOHSCROLL      0x0080  /* (multi-line) scroll sideways; without it or
+                                       WS_HSCROLL, words wrap at the width */
 #define ES_READONLY         0x0800
 #define EN_CHANGE           0x0300
 
@@ -604,6 +607,27 @@ typedef struct {
     uint32_t    flags;
 } OPENFILENAME;
 bool    GetOpenFileName(OPENFILENAME *ofn);
+
+/* Find and Replace: modeless dialogs owned by fr->owner, which gets
+ * WM_FINDMSG (lParam = fr) for each button with fr->flags saying which and
+ * how, and does the searching itself; FR_DIALOGTERM when the dialog closes.
+ * Pass the dialog to IsDialogMessage in the message loop. */
+#define WM_FINDMSG      0x0381
+#define FR_DOWN         0x0001
+#define FR_WHOLEWORD    0x0002
+#define FR_MATCHCASE    0x0004
+#define FR_FINDNEXT     0x0008
+#define FR_REPLACE      0x0010
+#define FR_REPLACEALL   0x0020
+#define FR_DIALOGTERM   0x0040
+typedef struct {
+    HWND        owner;
+    unsigned    flags;                  /* in: FR_DOWN etc. to start with */
+    char       *find, *replace;         /* in: the text to start with; out: what was typed */
+    uint32_t    max;                    /* size of each buffer */
+} FINDREPLACE;
+HWND    FindText(FINDREPLACE *fr);
+HWND    ReplaceText(FINDREPLACE *fr);
 bool    GetSaveFileName(OPENFILENAME *ofn);
 void    DrawSmallIcon(HDC dc, int x, int y, int icon);
 

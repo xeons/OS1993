@@ -63,7 +63,7 @@ UI_SRC    := wnd queue input frame paint menu accel msgbox dialog button static 
              scroll trackbar combo tab updown kbd theme
 UI_OBJ    := $(U)/hdr/UI.DLL.o $(patsubst %,$(U)/ui/%.o,$(UI_SRC)) \
              $(U)/gen/ui_exports.o $(U)/gen/gfx_imports.o $(U)/gen/krnl_imports.o $(U)/lib/lib.o
-SHELL_OBJ := $(U)/hdr/SHELL.DLL.o $(U)/shell/shell.o $(U)/shell/icons.o $(U)/shell/filedlg.o $(U)/gen/shell_exports.o \
+SHELL_OBJ := $(U)/hdr/SHELL.DLL.o $(U)/shell/shell.o $(U)/shell/icons.o $(U)/shell/filedlg.o $(U)/shell/findrepl.o $(U)/gen/shell_exports.o \
              $(U)/gen/ui_imports.o $(U)/gen/krnl_imports.o $(U)/lib/lib.o
 
 # Programs: user/apps/<name>.c, each a process of its own

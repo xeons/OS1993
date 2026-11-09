@@ -4,8 +4,9 @@
 Typing with Enter and Tab, saving (Save As, CR LF line ends), the
 clipboard between two Notepad processes, the "has changed" question,
 opening a file, selecting with Shift+End and deleting, undo, closing with
-unsaved changes (Cancel keeps it open, No discards), and the file's exact
-bytes on the disk image afterwards.
+unsaved changes (Cancel keeps it open, No discards), Find (repeatedly, to
+the end; whole words), Replace All and its undo, Word Wrap on and off, and
+the file's exact bytes on the disk image afterwards.
 """
 import os
 import subprocess
@@ -72,6 +73,53 @@ def main():
         m.key("alt-f4")
         m.key("n")
         check(m.wait_log("USER: NOTEPAD.BIN exited with code 0"), "No closes it without saving")
+
+        # --- Find, Replace, Word Wrap (a fresh Notepad; the other is still open) ---
+        check(start_notepad(m, 3), "a third Notepad for searching")
+        m.type("the cat sat on the mat\nthe end\n")
+        m.key("ctrl-home")
+        m.key("ctrl-f")
+        m.type("the\n")                                # Enter: Find Next
+        check(m.wait_log("GUI: notepad found the at 0"), "Find selects the first match")
+        m.key("ret")
+        check(m.wait_log("GUI: notepad found the at 15"), "Find Next: the second")
+        m.key("ret")
+        check(m.wait_log("GUI: notepad found the at 23"), "... the third, on the next line")
+        m.key("ret")
+        check(m.wait_log("GUI: notepad cannot find the"), "... then it says it can't find more")
+        m.key("ret")                                    # the message box
+        m.key("esc")                                    # the dialog
+        m.key("ctrl-home")
+        m.key("ctrl-f")
+        m.type("at")
+        m.key("tab"); m.key("tab"); m.key("spc")        # Whole words
+        m.key("ret")
+        check(m.wait_log("GUI: notepad cannot find at"), "whole words: 'at' isn't in cat, sat, mat")
+        m.key("ret")
+        m.key("esc")
+
+        m.key("ctrl-h")
+        m.type("the")
+        m.key("tab")
+        m.type("a")
+        m.goto(435, 182); m.click()                     # Replace All
+        check(m.wait_log("GUI: notepad replaced 3"), "Replace All replaces every match")
+        m.key("esc")
+        m.key("ctrl-s")
+        m.type("search\n")
+        check(m.wait_log("GUI: notepad saved C:\\OS1993\\SEARCH.TXT (27 bytes)"),
+              "the text reads 'a cat sat on a mat / a end'")
+        m.key("ctrl-z")
+        m.key("ctrl-s")
+        check(m.wait_log("GUI: notepad saved C:\\OS1993\\SEARCH.TXT (33 bytes)"),
+              "one Undo takes the whole Replace All back")
+
+        m.key("ctrl-n")
+        m.type("lorem ipsum " * 8)                      # 96 columns: wider than the window
+        m.key("alt-e"); m.key("w")
+        check(m.wait_log("GUI: notepad word wrap on (2 lines)"), "Word Wrap folds the long line")
+        m.key("alt-e"); m.key("w")
+        check(m.wait_log("GUI: notepad word wrap off (1 lines)"), "... and unfolds it")
 
         check(m.shut_down(), "Start > Shut Down ends the GUI")
         m.key("x", 1)

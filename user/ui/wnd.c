@@ -581,7 +581,11 @@ int32_t SetWindowLong(HWND h, int index, int32_t value)
     int32_t old = GetWindowLong(h, index);
     switch (index) {
     case GWL_WNDPROC:  if (value) w->proc = (WNDPROC)(uintptr_t)value; break;
-    case GWL_STYLE:    w->style = (unsigned)value; ui_invalidate_wnd(w); break;
+    case GWL_STYLE:
+        w->style = (unsigned)value;
+        ui_invalidate_wnd(w);
+        SendMessage(w, WM_STYLECHANGED, (WPARAM)GWL_STYLE, 0);
+        break;
     case GWL_ID:       w->id = value; break;
     case GWL_USERDATA: w->userdata = value; break;
     default:

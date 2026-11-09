@@ -32,10 +32,10 @@ README.md for what already works.
       menu), tooltips for tray icons. Close Program could mark programs
       "Not responding" (queue untouched for seconds) and try WM_CLOSE
       before ending one.
-- [ ] Notepad: Find/Replace, Word Wrap, Print (no printer yet), files over
-      32 KB. Calculator scientific view; Paint: cut/copy/paste, zoom, a
+- [ ] Notepad: Print (no printer yet), files over 32 KB, a status bar. Calculator scientific view; Paint: cut/copy/paste, zoom, a
       canvas size setting.
-- [ ] Multi-line edit: word wrap, more than one undo step, a blinking caret,
+- [ ] Multi-line edit: more than one undo step, a blinking caret, End on a
+      wrapped row (it stops before the row's last character),
       auto-scroll while drag-selecting outside the control.
 - [ ] Clipboard: text only (16 KB); bitmaps for Paint.
 - [ ] File dialogs: a drive list, long file names (FreeDOS has no LFN
