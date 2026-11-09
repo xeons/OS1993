@@ -77,22 +77,26 @@ class Checker:
 
 
 class Machine:
-    def __init__(self, variant="normal", mode="autorun"):
-        self.variant, self.mode = variant, mode
+    def __init__(self, variant="normal", mode="autorun", vmport=False):
+        self.variant, self.mode, self.vmport = variant, mode, vmport
 
     def __enter__(self):
         os.makedirs(QDIR, exist_ok=True)
         os.chdir(QDIR)                              # short monitor socket path
         subprocess.run([os.path.join(ROOT, "tools", "mkfreedos.sh"), self.variant, self.mode],
                        check=True, stdout=subprocess.DEVNULL)
-        for f in ("monitor.sock", "SERIAL.LOG"):
+        for f in ("monitor.sock", "qmp.sock", "SERIAL.LOG"):
             if os.path.exists(f):
                 os.unlink(f)
         self.qemu = subprocess.Popen([
-            "qemu-system-i386", "-M", "isapc", "-cpu", "486", "-m", "16",
+            # vmport is on by default for isapc; off keeps the plain relative
+            # PS/2 path that mouse_move can drive.
+            "qemu-system-i386", "-M", "isapc,vmport=on" if self.vmport else "isapc,vmport=off",
+            "-cpu", "486", "-m", "16",
             "-drive", f"file={IMG},format=raw,if=ide", "-serial", "file:SERIAL.LOG",
             "-device", "isa-debug-exit,iobase=0xf4,iosize=4",
-            "-display", "none", "-monitor", "unix:monitor.sock,server,nowait"])
+            "-display", "none", "-monitor", "unix:monitor.sock,server,nowait",
+            "-qmp", "unix:qmp.sock,server,nowait"])
         for _ in range(50):
             if os.path.exists("monitor.sock"):
                 break
@@ -100,7 +104,39 @@ class Machine:
         self.mon = socket.socket(socket.AF_UNIX)
         self.mon.connect("monitor.sock")
         self.mon.setblocking(False)
+        self.qmp = socket.socket(socket.AF_UNIX)
+        for _ in range(50):
+            try:
+                self.qmp.connect("qmp.sock")
+                break
+            except OSError:
+                time.sleep(0.1)
+        self.qmp_file = self.qmp.makefile("rw")
+        self.qmp_file.readline()                    # greeting
+        self.qmp_cmd({"execute": "qmp_capabilities"})
         return self
+
+    def qmp_cmd(self, msg):
+        import json
+        self.qmp_file.write(json.dumps(msg) + "\n")
+        self.qmp_file.flush()
+        while True:                                 # skip async events
+            reply = json.loads(self.qmp_file.readline())
+            if "return" in reply or "error" in reply:
+                return reply
+
+    # An absolute pointer position (needs vmport=True: the VMware mouse).
+    def abs_move(self, x, y):
+        self.qmp_cmd({"execute": "input-send-event", "arguments": {"events": [
+            {"type": "abs", "data": {"axis": "x", "value": x * 0x7FFF // 639}},
+            {"type": "abs", "data": {"axis": "y", "value": y * 0x7FFF // 479}}]}})
+        time.sleep(0.4)
+
+    def abs_click(self, pause=0.6):
+        for down in (True, False):
+            self.qmp_cmd({"execute": "input-send-event", "arguments": {"events": [
+                {"type": "btn", "data": {"down": down, "button": "left"}}]}})
+            time.sleep(0.3 if down else pause)
 
     def __exit__(self, *exc):
         if self.qemu.poll() is None:

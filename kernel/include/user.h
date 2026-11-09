@@ -18,14 +18,44 @@
 #define USER_VGA        0x7FF00000u     /* A000:0000-AFFF, 64 KB */
 #define USER_INFO       0x7FFF0000u     /* struct user_info + the font */
 
-#define UIMG_MAGIC      0x33495547u     /* "GUI3" */
+/*
+ * Module format, for programs and DLLs alike. Each module is linked at a
+ * fixed base address (programs at USER_BASE, each DLL at its own), so the
+ * loader never relocates. Programs import functions by name; for each one
+ * an import library provides a JMP [slot] thunk, and the loader fills the
+ * slot with the DLL's export.
+ */
+#define MOD_MAGIC       0x33444F4Du     /* "MOD3" */
+#define MOD_PROGRAM     1
+#define MOD_LIBRARY     2
 
-struct user_image_header {              /* first bytes of GUI.BIN */
+struct mod_header {                     /* first bytes of every module */
     uint32_t magic;
-    uint32_t entry;
+    uint32_t kind;
+    uint32_t base;                      /* linked (and loaded) at */
+    uint32_t entry;                     /* programs: entry point */
     uint32_t file_size;                 /* bytes in the file */
     uint32_t mem_size;                  /* including .bss */
+    uint32_t exports;                   /* -> struct mod_exports, or 0 */
+    uint32_t imports;                   /* -> struct mod_import[], 0-terminated */
+    char     name[16];                  /* "UI.DLL" */
 };
+
+struct mod_export { uint32_t name; uint32_t addr; };    /* name -> ASCIIZ */
+struct mod_exports {
+    uint32_t count;
+    struct mod_export e[];
+};
+
+struct mod_import {                     /* one per imported DLL */
+    uint32_t module;                    /* -> "UI.DLL" (0 ends the list) */
+    uint32_t names;                     /* -> name pointers, 0-terminated */
+    uint32_t slots;                     /* -> addresses the loader fills in */
+};
+
+#define DLL_BASE        0x10000000u     /* DLLs live between here ... */
+#define DLL_LIMIT       0x20000000u     /* ... and here */
+#define MOD_MAX         8
 
 #define UINFO_TEST_CLI      0x01        /* self-test: execute CLI (expect #GP) */
 #define UINFO_TEST_KERNEL   0x02        /* self-test: write kernel memory (#PF) */

@@ -2,10 +2,11 @@
  * user.c -- ring-3 programs: loading, the INT 30h system calls, faults.
  *
  * There is one ring-3 program at a time: the GUI, which belongs to the
- * System VM (Windows ran its protected-mode code there too). It's a 32-bit
- * flat binary linked at USER_BASE. The VMM console thread loads it through
- * DOS -- the System VM's own file system -- into fresh user pages and starts
- * a ring-3 thread for it.
+ * System VM (Windows ran its protected-mode code there too). Programs and
+ * the DLLs they import are MOD3 modules (kernel/include/user.h), each
+ * linked at a fixed address. The VMM console thread loads them through
+ * DOS -- the System VM's own file system -- into fresh user pages, fills in
+ * every program's and DLL's imports, and starts a ring-3 thread.
  */
 #include "kernel.h"
 #include "devices.h"
@@ -20,6 +21,13 @@
 
 #define MAX_IMAGE  (2u * 1024 * 1024)
 
+struct module {
+    char     name[16];
+    uint32_t base, end;                 /* mapped [base, end) */
+    uint32_t exports, imports;
+    bool     resolved;
+};
+
 void user_enter(uint32_t eip, uint32_t esp, uint32_t ebx);  /* entry.asm */
 
 static struct {
@@ -27,7 +35,8 @@ static struct {
     volatile bool  running;
     int            result;
     uint32_t       entry;
-    uint32_t       image_end;           /* user pages [USER_BASE, image_end) */
+    struct module  mods[MOD_MAX];       /* mods[0] is the program */
+    int            nmods;
     bool           vga_mapped;
     uint32_t       prints;              /* SYS_PRINT calls (self-test) */
     volatile int   focus_event;         /* -1 none, else EV_FOCUS key */
@@ -88,14 +97,14 @@ static void unmap_free(uint32_t va, uint32_t len)
 
 static void release_address_space(void)
 {
-    if (u.image_end > USER_BASE)
-        unmap_free(USER_BASE, u.image_end - USER_BASE);
+    for (int i = 0; i < u.nmods; i++)
+        unmap_free(u.mods[i].base, u.mods[i].end - u.mods[i].base);
+    u.nmods = 0;
     unmap_free(USER_STACK_TOP - USER_STACK_SIZE, USER_STACK_SIZE);
     unmap_free(USER_INFO, 2 * PAGE_SIZE);
     if (u.vga_mapped)                       /* device memory: unmap, don't free */
         for (uint32_t i = 0; i < 16; i++)
             vmm_unmap(USER_VGA + i * PAGE_SIZE);
-    u.image_end = 0;
     u.vga_mapped = false;
 }
 
@@ -157,6 +166,184 @@ static void user_thread_main(void *arg)
     user_enter(u.entry, USER_STACK_TOP, USER_INFO);
 }
 
+/* ---- modules ------------------------------------------------------------- */
+
+static bool same_name(const char *a, const char *b)
+{
+    for (;; a++, b++) {
+        char x = *a >= 'a' && *a <= 'z' ? (char)(*a - 32) : *a;
+        char y = *b >= 'a' && *b <= 'z' ? (char)(*b - 32) : *b;
+        if (x != y) return false;
+        if (!x) return true;
+    }
+}
+
+static bool in_mod(const struct module *m, uint32_t va, uint32_t len)
+{
+    return va >= m->base && va < m->end && len <= m->end - va;
+}
+
+/* A NUL-terminated string inside the module, at most max bytes; else NULL */
+static const char *mod_str(const struct module *m, uint32_t va, uint32_t max)
+{
+    for (uint32_t n = 0; n < max; n++) {
+        if (!in_mod(m, va + n, 1))
+            return NULL;
+        if (*(const char *)(uintptr_t)(va + n) == '\0')
+            return (const char *)(uintptr_t)va;
+    }
+    return NULL;
+}
+
+static struct module *find_module(const char *name)
+{
+    for (int i = 0; i < u.nmods; i++)
+        if (same_name(u.mods[i].name, name))
+            return &u.mods[i];
+    return NULL;
+}
+
+/* Read a module file into fresh user pages at its own base address. */
+static struct module *load_module(const char *name, uint32_t kind)
+{
+    if (u.nmods == MOD_MAX) {
+        klog("USER: too many modules loading %s\n", name);
+        return NULL;
+    }
+    char path[128];
+    program_path(name, path, sizeof path);
+    int h = dos_open(path);
+    if (h < 0) {
+        klog("USER: cannot open %s\n", path);
+        return NULL;
+    }
+
+    uint32_t chunk = v86_buf_size() & ~0xFFFu;
+    const uint8_t *buf = v86_ptr(v86_buf_seg(), v86_buf_off());
+    int n = dos_read(h, chunk);
+    struct mod_header hdr;
+    memcpy(&hdr, buf, sizeof hdr);
+    uint32_t end = hdr.base + PAGE_ALIGN_UP(hdr.mem_size);
+    bool ok = n >= (int)sizeof hdr && hdr.magic == MOD_MAGIC && hdr.kind == kind &&
+              hdr.mem_size >= hdr.file_size && hdr.mem_size <= MAX_IMAGE &&
+              !(hdr.base & ~PAGE_MASK);
+    if (ok && kind == MOD_PROGRAM)
+        ok = hdr.base == USER_BASE && hdr.entry >= hdr.base && hdr.entry < hdr.base + hdr.file_size;
+    if (ok && kind == MOD_LIBRARY)
+        ok = hdr.base >= DLL_BASE && end <= DLL_LIMIT;
+    for (int i = 0; ok && i < u.nmods; i++)         /* no overlaps */
+        ok = end <= u.mods[i].base || hdr.base >= u.mods[i].end;
+    if (!ok) {
+        klog("USER: %s is not a valid %s module (or overlaps another)\n", path,
+             kind == MOD_PROGRAM ? "program" : "library");
+        dos_close(h);
+        return NULL;
+    }
+
+    struct module *m = &u.mods[u.nmods];
+    memset(m, 0, sizeof *m);
+    m->base = hdr.base;
+    m->end = end;
+    if (!map_zeroed(m->base, m->end - m->base)) {
+        unmap_free(m->base, m->end - m->base);
+        dos_close(h);
+        klog("USER: out of memory loading %s\n", path);
+        return NULL;
+    }
+    u.nmods++;
+
+    uint32_t loaded = 0;
+    while (n > 0 && loaded < hdr.file_size) {
+        uint32_t take = (uint32_t)n;
+        if (take > hdr.file_size - loaded)
+            take = hdr.file_size - loaded;
+        memcpy((void *)(uintptr_t)(m->base + loaded), buf, take);
+        loaded += take;
+        n = dos_read(h, chunk);
+    }
+    dos_close(h);
+    if (loaded != hdr.file_size) {
+        klog("USER: short read on %s (%u of %u bytes)\n", path, loaded, hdr.file_size);
+        return NULL;
+    }
+    memcpy(m->name, name, strlen(name) < sizeof m->name ? strlen(name) + 1 : sizeof m->name - 1);
+    m->exports = hdr.exports;
+    m->imports = hdr.imports;
+    if (kind == MOD_PROGRAM)
+        u.entry = hdr.entry;
+    return m;
+}
+
+static uint32_t find_export(const struct module *dll, const char *name)
+{
+    if (!dll->exports || !in_mod(dll, dll->exports, 4))
+        return 0;
+    const struct mod_exports *ex = (const void *)(uintptr_t)dll->exports;
+    if (!in_mod(dll, dll->exports + 4, ex->count * sizeof(struct mod_export)))
+        return 0;
+    for (uint32_t i = 0; i < ex->count; i++) {
+        const char *s = mod_str(dll, ex->e[i].name, 64);
+        if (s && same_name(s, name) && in_mod(dll, ex->e[i].addr, 1))
+            return ex->e[i].addr;
+    }
+    return 0;
+}
+
+/* Load (if needed) and link every DLL module m imports. */
+static bool resolve(struct module *m, int depth)
+{
+    if (m->resolved)
+        return true;
+    m->resolved = true;                             /* breaks import cycles */
+    if (!m->imports)
+        return true;
+    if (depth > MOD_MAX) {
+        klog("USER: imports nested too deeply in %s\n", m->name);
+        return false;
+    }
+    unsigned linked = 0;
+    for (uint32_t d = m->imports;; d += sizeof(struct mod_import)) {
+        if (!in_mod(m, d, sizeof(struct mod_import)))
+            return false;
+        const struct mod_import *imp = (const void *)(uintptr_t)d;
+        if (!imp->module)
+            break;
+        const char *dll_name = mod_str(m, imp->module, 16);
+        if (!dll_name)
+            return false;
+        struct module *dll = find_module(dll_name);
+        if (!dll) {
+            dll = load_module(dll_name, MOD_LIBRARY);
+            if (!dll)
+                return false;
+            const struct mod_exports *ex = (const void *)(uintptr_t)dll->exports;
+            klog("USER: loaded %s at %08X (%u exports)\n", dll->name, dll->base,
+                 dll->exports && in_mod(dll, dll->exports, 4) ? ex->count : 0);
+        }
+        if (!resolve(dll, depth + 1))
+            return false;
+        for (uint32_t k = 0;; k++) {
+            uint32_t np = imp->names + 4 * k, sp = imp->slots + 4 * k;
+            if (!in_mod(m, np, 4))
+                return false;
+            uint32_t name_va = *(const uint32_t *)(uintptr_t)np;
+            if (!name_va)
+                break;
+            const char *fn = mod_str(m, name_va, 64);
+            uint32_t addr = fn ? find_export(dll, fn) : 0;
+            if (!addr || !in_mod(m, sp, 4)) {
+                klog("USER: %s imports %s from %s, which doesn't export it\n",
+                     m->name, fn ? fn : "?", dll->name);
+                return false;
+            }
+            *(uint32_t *)(uintptr_t)sp = addr;
+            linked++;
+        }
+    }
+    klog("USER: %s: %u imports linked\n", m->name, linked);
+    return true;
+}
+
 int user_start(const char *name, uint32_t flags)
 {
     if (u.running)
@@ -165,49 +352,11 @@ int user_start(const char *name, uint32_t flags)
         u.thread = NULL;
     release_address_space();
 
-    char path[128];
-    program_path(name, path, sizeof path);
-    int h = dos_open(path);
-    if (h < 0) {
-        klog("USER: cannot open %s\n", path);
-        return -1;
-    }
-
-    uint32_t chunk = v86_buf_size() & ~0xFFFu;
-    const uint8_t *buf = v86_ptr(v86_buf_seg(), v86_buf_off());
-    int n = dos_read(h, chunk);
-    struct user_image_header hdr;
-    memcpy(&hdr, buf, sizeof hdr);
-    if (n < (int)sizeof hdr || hdr.magic != UIMG_MAGIC || hdr.mem_size < hdr.file_size ||
-        hdr.mem_size > MAX_IMAGE || hdr.entry < USER_BASE ||
-        hdr.entry >= USER_BASE + hdr.file_size) {
-        klog("USER: %s is not a ring-3 program image\n", path);
-        dos_close(h);
-        return -1;
-    }
-
-    u.image_end = USER_BASE + PAGE_ALIGN_UP(hdr.mem_size);
-    if (!map_zeroed(USER_BASE, u.image_end - USER_BASE) ||
+    struct module *prog = load_module(name, MOD_PROGRAM);
+    if (!prog || !resolve(prog, 0) ||
         !map_zeroed(USER_STACK_TOP - USER_STACK_SIZE, USER_STACK_SIZE) ||
         !map_zeroed(USER_INFO, 2 * PAGE_SIZE)) {
-        klog("USER: out of memory loading %s\n", path);
-        dos_close(h);
-        release_address_space();
-        return -1;
-    }
-
-    uint32_t loaded = 0;
-    while (n > 0 && loaded < hdr.file_size) {
-        uint32_t take = (uint32_t)n;
-        if (take > hdr.file_size - loaded)
-            take = hdr.file_size - loaded;
-        memcpy((void *)(uintptr_t)(USER_BASE + loaded), buf, take);
-        loaded += take;
-        n = dos_read(h, chunk);
-    }
-    dos_close(h);
-    if (loaded != hdr.file_size) {
-        klog("USER: short read on %s (%u of %u bytes)\n", path, loaded, hdr.file_size);
+        klog("USER: could not start %s\n", name);
         release_address_space();
         return -1;
     }
@@ -226,7 +375,6 @@ int user_start(const char *name, uint32_t flags)
         info->vga = USER_VGA;
     }
 
-    u.entry = hdr.entry;
     u.result = 0;
     u.prints = 0;
     u.thread = thread_create("GUI", user_thread_main, NULL, NULL);
@@ -239,7 +387,7 @@ int user_start(const char *name, uint32_t flags)
     u.focus_event = -1;
     u.background = false;
     mouse_set_delivery((flags & UINFO_GRAPHICS) != 0);
-    klog("USER: started %s (%u bytes, entry %08X)\n", path, hdr.file_size, hdr.entry);
+    klog("USER: started %s (entry %08X, %d modules)\n", name, u.entry, u.nmods);
     thread_wake(u.thread);
     return 0;
 }

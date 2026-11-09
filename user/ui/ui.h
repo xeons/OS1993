@@ -50,6 +50,10 @@ void ui_mouse_up(int x, int y);
 bool ui_key(struct window *w, int scancode, char ch);
 void ui_focus_next(struct window *w, int dir);
 
+/* theme.c: call once, before creating windows */
+struct user_info;
+void ui_init(const struct user_info *info);
+
 /* kbd.c */
 char kbd_ascii(int scancode);       /* tracks Shift; 0 if not a character */
 bool kbd_shift(void);

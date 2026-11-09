@@ -12,6 +12,8 @@
 #include "gfx.h"
 #include "io.h"
 
+#include <stdbool.h>
+
 static inline void gc(uint8_t i, uint8_t v) { outb(0x3CE, i); outb(0x3CF, v); }
 
 static void begin(uint8_t color, uint8_t function)
@@ -40,11 +42,56 @@ static inline void put_masked(volatile uint8_t *p, uint8_t mask)
 void gfx_init(struct gfx *g, volatile uint8_t *fb, const uint8_t *font8x16)
 {
     g->fb = fb;
+    g->planes = 0;
     g->width = 640;
     g->height = 480;
     g->stride = 80;
     g->font = font8x16;
     gfx_noclip(g);
+}
+
+void gfx_init_mem(struct gfx *g, uint8_t *planes, const uint8_t *font8x16)
+{
+    gfx_init(g, 0, font8x16);
+    g->planes = planes;
+}
+
+/* Memory target: apply what one Set/Reset write would do to all 4 planes. */
+static inline void mem_put(struct gfx *g, int row, int col, uint8_t mask,
+                           uint8_t color, uint8_t fn)
+{
+    uint8_t *q = g->planes + row * g->stride + col;
+    for (int p = 0; p < 4; p++, q += GFX_PLANE_BYTES) {
+        bool on = (color >> p) & 1;
+        if (fn)
+            { if (on) *q ^= mask; }
+        else
+            *q = on ? (uint8_t)(*q | mask) : (uint8_t)(*q & ~mask);
+    }
+}
+
+void gfx_present(const struct gfx *m, volatile uint8_t *fb, int x, int y, int w, int h)
+{
+    if (x < 0) { w += x; x = 0; }
+    if (y < 0) { h += y; y = 0; }
+    if (x + w > 640) w = 640 - x;
+    if (y + h > 480) h = 480 - y;
+    if (w <= 0 || h <= 0)
+        return;
+    int b1 = x >> 3, b2 = (x + w - 1) >> 3, n = b2 - b1 + 1;
+    gc(5, 0x00);                        /* write mode 0, plain copies */
+    gc(3, 0x00);
+    gc(1, 0x00);
+    gc(8, 0xFF);
+    for (int p = 0; p < 4; p++) {
+        outb(0x3C4, 2); outb(0x3C5, (uint8_t)(1 << p));
+        const uint8_t *src = m->planes + p * GFX_PLANE_BYTES + y * 80 + b1;
+        volatile uint8_t *dst = fb + y * 80 + b1;
+        for (int row = 0; row < h; row++, src += 80, dst += 80)
+            for (int i = 0; i < n; i++)
+                dst[i] = src[i];
+    }
+    outb(0x3C4, 2); outb(0x3C5, 0x0F);
 }
 
 void gfx_noclip(struct gfx *g)
@@ -109,6 +156,12 @@ static void fill_fn(struct gfx *g, int x, int y, int w, int h, uint8_t color, ui
     uint8_t m1 = (uint8_t)(0xFF >> (x & 7));
     uint8_t m2 = (uint8_t)(0xFF << (7 - ((x + w - 1) & 7)));
 
+    if (g->planes) {
+        for (int row = y; row < y + h; row++)
+            for (int b = b1; b <= b2; b++)
+                mem_put(g, row, b, (uint8_t)((b == b1 ? m1 : 0xFF) & (b == b2 ? m2 : 0xFF)), color, fn);
+        return;
+    }
     begin(color, fn);
     for (int row = y; row < y + h; row++) {
         volatile uint8_t *line = g->fb + row * g->stride;
@@ -150,6 +203,10 @@ void gfx_pixel(struct gfx *g, int x, int y, uint8_t color)
 {
     if (x < g->cx0 || y < g->cy0 || x >= g->cx1 || y >= g->cy1)
         return;
+    if (g->planes) {
+        mem_put(g, y, x >> 3, (uint8_t)(0x80 >> (x & 7)), color, 0x00);
+        return;
+    }
     begin(color, 0x00);
     put_masked(g->fb + y * g->stride + (x >> 3), (uint8_t)(0x80 >> (x & 7)));
     end();
@@ -177,20 +234,25 @@ static void blit_rows(struct gfx *g, int x, int y, const uint16_t *rows, int h,
     for (int b = 0; b < 3; b++)
         cm[b] = (col + b >= 0 && col + b < g->stride) ? col_mask(g, col + b) : 0;
 
-    begin(color, fn);
+    if (!g->planes)
+        begin(color, fn);
     for (int r = 0; r < h; r++) {
         int row = y + r;
         if (row < g->cy0 || row >= g->cy1 || !rows[r])
             continue;
         uint32_t bits = (uint32_t)rows[r] << (8 - shift);    /* 24 bits */
-        volatile uint8_t *p = g->fb + row * g->stride + col;
         for (int b = 0; b < 3; b++) {
             uint8_t m = (uint8_t)(bits >> (16 - 8 * b)) & cm[b];
-            if (m)
-                put_masked(p + b, m);
+            if (!m)
+                continue;
+            if (g->planes)
+                mem_put(g, row, col + b, m, color, fn);
+            else
+                put_masked(g->fb + row * g->stride + col + b, m);
         }
     }
-    end();
+    if (!g->planes)
+        end();
 }
 
 void gfx_bitmap(struct gfx *g, int x, int y, const uint16_t *rows, int h, uint8_t color)

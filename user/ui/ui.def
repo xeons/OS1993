@@ -1,0 +1,23 @@
+; UI.DLL -- the window manager and controls
+LIBRARY UI.DLL
+BASE    0x10100000
+EXPORTS
+    ui_init
+    wm_create
+    wm_close
+    wm_activate
+    wm_active
+    wm_client_rect
+    wm_invalidate
+    wm_invalidate_window
+    wm_flush
+    wm_screen
+    wm_mouse
+    wm_key
+    ui_draw
+    ui_draw_all
+    ui_redraw
+    ui_focus_next
+    ui_key
+    kbd_ascii
+    kbd_shift

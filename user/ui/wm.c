@@ -4,16 +4,20 @@
  * Windows live in a z-order (order[0] is the bottom). Anything that
  * changes on screen is invalidated into one dirty rectangle, and
  * wm_flush() repaints it back to front -- desktop, minimized tiles,
- * windows -- clipped to that rectangle. Moving and resizing drag an XOR
- * outline and repaint once at the end. The mouse cursor is an XOR arrow,
- * hidden while repainting.
+ * windows -- clipped to that rectangle, into an off-screen copy of the
+ * screen (wm_gfx), then presents just that rectangle: double buffering, so
+ * no half-drawn layer is ever visible. The mouse cursor and the XOR drag
+ * outlines live only on the real screen (screen_gfx); the cursor is hidden
+ * only when the presented rectangle touches it.
  */
 #include "wm.h"
 #include "os.h"
 #include "theme.h"
 #include "ui.h"
 
-struct gfx wm_gfx;
+struct gfx wm_gfx;                          /* the off-screen buffer */
+static struct gfx screen_gfx;               /* the real screen */
+static uint8_t back[4 * GFX_PLANE_BYTES];
 
 static struct window wins[WIN_MAX];
 static struct window *order[WIN_MAX];
@@ -37,7 +41,7 @@ static void cursor(bool on)
     if (background)
         return;
     if (on != cur_on) {
-        gfx_xor_bitmap(&wm_gfx, cur_x, cur_y, arrow, 16);
+        gfx_xor_bitmap(&screen_gfx, cur_x, cur_y, arrow, 16);
         cur_on = on;
     }
 }
@@ -375,7 +379,6 @@ void wm_flush(void)
     if (!dirty || background)
         return;
     struct gfx *g = &wm_gfx;
-    cursor(false);
     gfx_clip(g, dx0, dy0, dx1 - dx0, dy1 - dy0);
     gfx_fill(g, dx0, dy0, dx1 - dx0, dy1 - dy0, C_DESKTOP);
     struct window *active = wm_active();
@@ -387,7 +390,15 @@ void wm_flush(void)
         }
     gfx_noclip(g);
     dirty = false;
-    cursor(true);
+
+    /* Present whole bytes; hide the cursor only if they overlap it. */
+    int px0 = dx0 & ~7, px1 = (dx1 + 7) & ~7;
+    bool hit = cur_on && cur_x < px1 && cur_x + 16 > px0 && cur_y < dy1 && cur_y + 16 > dy0;
+    if (hit)
+        cursor(false);
+    gfx_present(g, screen_gfx.fb, dx0, dy0, dx1 - dx0, dy1 - dy0);
+    if (hit || !cur_on)
+        cursor(true);
 }
 
 void wm_screen(bool ours)
@@ -402,6 +413,8 @@ void wm_screen(bool ours)
 
 void wm_init(void)
 {
+    screen_gfx = wm_gfx;                    /* ui_init set up the screen target */
+    gfx_init_mem(&wm_gfx, back, screen_gfx.font);
     norder = 0;
     wm_invalidate(0, 0, 640, 480);
 }
@@ -419,7 +432,7 @@ static struct window *last_click_win;
 #define MIN_W 160
 #define MIN_H 100
 
-static void xor_outline(void) { if (!background) gfx_xor_frame(&wm_gfx, outline.x, outline.y, outline.w, outline.h, 2); }
+static void xor_outline(void) { if (!background) gfx_xor_frame(&screen_gfx, outline.x, outline.y, outline.w, outline.h, 2); }
 
 static void press(int x, int y, uint32_t tick)
 {

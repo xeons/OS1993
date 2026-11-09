@@ -25,6 +25,7 @@ are for later stages.
 | `make qemu-test` | headless FreeDOS run of the same checks as `make test`        |
 | `make qemu-emm386` | FreeDOS with JEMM386: the loader must refuse to start       |
 | `make qemu-sessions` | types into two concurrent DOS sessions via QEMU's monitor |
+| `make qemu-absmouse` | absolute pointer through QEMU's VMware port: the cursor lands on the exact pixel, and clicks hit their control |
 | `make qemu-wm`   | drives the window manager through QEMU's mouse and keyboard: every control, activate/move/resize/minimize/maximize/close, palette after a DOS session |
 | `make qemu-vga`  | the VDD: the GUI's desktop must come back pixel-identical after a text DOS session (except its animated progress bar) |
 
@@ -219,6 +220,31 @@ text console. In test mode the same binary is run twice as a self-test:
 executing `CLI` must be killed with #GP, and writing kernel memory must be
 killed with #PF.
 
+## Shared libraries (DLLs)
+
+Ring-3 code is built as **MOD3 modules** (`kernel/include/user.h`):
+programs and DLLs share one format, a header with base address, entry
+point, sizes, and export and import tables. Each DLL is linked at its own
+fixed base, so nothing is ever relocated, as with OS/2's and Windows'
+system DLLs.
+
+- **`.DEF` files and import libraries**, as in Windows. `tools/mkdef.py`
+  reads a `.DEF` (library name, base, exported functions) and generates the
+  DLL's export table, plus an import library for callers: one
+  `JMP [slot]` thunk per function, so calls are ordinary C calls.
+- **The loader** (`kernel/user.c`) loads a program, then the DLLs it
+  imports and theirs, from the program's directory. It fills every slot by
+  name and refuses to start with a clear message if an export is missing.
+  Everything is unmapped when the program exits.
+
+| Module    | Base        | Contents                                         |
+|-----------|-------------|--------------------------------------------------|
+| `GFX.DLL` | `1000_0000` | the VGA display driver (`user/gfx/`)             |
+| `UI.DLL`  | `1010_0000` | window manager, controls, theme (`user/ui/`); imports GFX |
+| `GUI.BIN` | `0040_0000` | the demo applications (`user/apps/`); imports UI |
+
+Each module links its own copy of the tiny C runtime (`user/lib/`).
+
 ## The window manager and controls
 
 The GUI (`user/`) is 32-bit ring-3 code in the System VM. Its look is
@@ -231,15 +257,20 @@ Windows 95 set of window controls and widgets.
   attribute map plus DAC): eight greys for the Platinum ramp, accents, a
   desktop colour. The VDD captures the GUI's live palette when a DOS
   session takes the screen.
-- **Windows** (`user/wm.c`). Overlapping windows in a z-order, painted back
-  to front into a dirty rectangle with clipping. Each title bar has a
+- **Windows** (`user/ui/wm.c`). Overlapping windows in a z-order, painted
+  back to front into a dirty rectangle with clipping, **double-buffered**.
+  Painting goes into an off-screen copy of the screen (four planes in
+  memory), and only the finished rectangle is copied to video memory, so no
+  half-drawn layer is ever visible. The cursor and drag outlines are XOR
+  images on the real screen; the cursor is hidden only when a presented
+  rectangle touches it. Each title bar has a
   system box on the left and minimize, maximize/restore and close on the
   right. Inactive windows are flat and show no boxes. Double-clicking the
   title maximizes; double-clicking the system box closes; Alt+F4 closes.
   Windows resize from their borders, corners and size grip. Moves and
   resizes drag an XOR outline. Minimized windows become title tiles along
   the bottom until the shell gets a taskbar.
-- **Controls** (`user/ui.c`): push button (with default-button ring),
+- **Controls** (`user/ui/ui.c`): push button (with default-button ring),
   check box, radio button group, group box, label, single-line edit
   (caret, Home/End/Delete), list box with scroll bar, horizontal and
   vertical scroll bars (proportional thumb), slider (trackbar) and progress
@@ -272,6 +303,14 @@ Demo windows: **Programs** (MS-DOS Prompt, About, Exit to VMM),
   for a DOS mouse driver).
 - **Exit.** Before returning to DOS, streaming is stopped and the 8042
   command byte restored. Otherwise mouse bytes would jam DOS's keyboard.
+- **Absolute positioning under emulators.** A PS/2 mouse only reports
+  movement, so a guest pointer drifts away from the host's. If the VMware
+  "backdoor" port answers (QEMU, VMware, VirtualBox), the driver switches
+  that pointer to absolute mode. The PS/2 interrupt still signals each
+  event, but the position is read exactly from the port. Real hardware
+  doesn't answer the probe and stays on PS/2. `make qemu` enables QEMU's
+  `vmport`; the scripted tests turn it off to drive the relative path, and
+  `make qemu-absmouse` covers the absolute one.
 
 The GUI draws an XOR arrow cursor (drawing it twice erases it, so it needs
 no save-under), and the demo window can be dragged by its title bar.
@@ -349,9 +388,11 @@ tools/                   check386.sh, check-test.sh
 6. **Graphics and GUI.** Done: the VGA driver and ring-3 support (flat
    user segments, INT 30h system calls, `GUI.BIN` loader, fault
    isolation), the PS/2 mouse, and the window manager with the Windows 95
-   control set in a Platinum-inspired style. Next: shared libraries (the UI
-   as its own DLL), menus, combo boxes and tabs, separate application
-   programs, a shell with a taskbar, and VESA truecolor.
+   control set in a Platinum-inspired style, double-buffered, plus DLLs
+   (GFX.DLL, UI.DLL) and an absolute mouse under emulators. Next: menus,
+   combo boxes and tabs; several application programs running at once,
+   each in its own address space with the DLLs shared; a shell with a
+   taskbar; VESA truecolor.
 7. **Win16-style API layer.** 16-bit protected-mode apps in ring 3 with LDTs,
    built with Open Watcom.
 8. **Coexisting with EMM386** through VCPI/GEMMIS, and acting as a DPMI host.

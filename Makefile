@@ -1,6 +1,7 @@
 # OS1993 -- build with modern tools, run on a 1993 machine.
 #
-#   make            build build/OS1993.COM, build/VMM.BIN and build/GUI.BIN
+#   make            build the loader, the kernel, and the ring-3 modules:
+#                   build/OS1993.COM, VMM.BIN, GFX.DLL, UI.DLL, GUI.BIN
 #   make run        boot it in DOSBox-X (386, 16 MB, HIMEM-style XMS)
 #   make test       headless DOSBox-X run; checks the full round trip to DOS
 #   make check386   verify the kernel contains no post-386 instructions
@@ -10,6 +11,7 @@
 #   make qemu-sessions  type into two concurrent DOS sessions (QEMU sendkey)
 #   make qemu-vga   check the VGA driver with QEMU screendumps
 #   make qemu-wm    drive the window manager and every control (mouse, keys)
+#   make qemu-absmouse  absolute pointer via QEMU's VMware port (exact position)
 #   make clean
 
 CC      := i686-elf-gcc
@@ -32,21 +34,32 @@ LDFLAGS := -T kernel/linker.ld -nostdlib -ffreestanding \
            -Wl,--build-id=none -Wl,--no-warn-rwx-segments -Wl,-Map,$(BUILD)/vmm.map
 NASMFLAGS_K := -f elf32 -g -Ikernel/include/
 
-USER_CFLAGS := $(filter-out -Ikernel/include,$(CFLAGS)) -Iuser -Ikernel/include
-USER_LDFLAGS := -T user/user.ld -nostdlib -ffreestanding \
-           -Wl,--build-id=none -Wl,--no-warn-rwx-segments -Wl,-Map,$(BUILD)/gui.map
-# The GUI links the kernel's display driver unchanged: it runs in ring 3.
-USER_OBJ   := $(BUILD)/user/crt0.o $(BUILD)/user/gui.o $(BUILD)/user/wm.o $(BUILD)/user/ui.o \
-              $(BUILD)/user/kbd.o $(BUILD)/user/lib.o $(BUILD)/user/gfx.o
+# ---- ring 3: MOD3 modules (kernel/include/user.h) -------------------------
+# Each DLL is described by a .DEF file; tools/mkdef.py turns it into the
+# DLL's export table and an import library (JMP [slot] thunks) for callers.
+U           := $(BUILD)/user
+MKDEF       := python3 tools/mkdef.py
+USER_CFLAGS := $(filter-out -Ikernel/include,$(CFLAGS)) -Iuser/lib -Iuser/gfx -Iuser/ui -Ikernel/include
+MOD_LDFLAGS := -T user/lib/module.ld -nostdlib -ffreestanding \
+               -Wl,--build-id=none -Wl,--no-warn-rwx-segments
+GFX_BASE    := $(shell $(MKDEF) user/gfx/gfx.def base)
+UI_BASE     := $(shell $(MKDEF) user/ui/ui.def base)
+
+GFX_OBJ := $(U)/gfx/header.o $(U)/gfx/gfx.o $(U)/gen/gfx_exports.o $(U)/lib/lib.o
+UI_OBJ  := $(U)/ui/header.o $(U)/ui/wm.o $(U)/ui/ui.o $(U)/ui/kbd.o $(U)/ui/theme.o \
+           $(U)/gen/ui_exports.o $(U)/gen/gfx_imports.o $(U)/lib/lib.o
+GUI_OBJ := $(U)/apps/header.o $(U)/lib/crt0.o $(U)/apps/gui.o $(U)/gen/ui_imports.o $(U)/lib/lib.o
+USER_OBJ := $(sort $(GFX_OBJ) $(UI_OBJ) $(GUI_OBJ))
+MODULES := $(BUILD)/GFX.DLL $(BUILD)/UI.DLL $(BUILD)/GUI.BIN
 
 KERNEL_C   := $(wildcard kernel/*.c)
 KERNEL_ASM := $(wildcard kernel/*.asm)
 KERNEL_OBJ := $(patsubst kernel/%.asm,$(BUILD)/kernel/%.o,$(KERNEL_ASM)) \
               $(patsubst kernel/%.c,$(BUILD)/kernel/%.o,$(KERNEL_C))
 
-.PHONY: all run test check386 qemu qemu-test qemu-emm386 qemu-sessions qemu-vga qemu-wm clean
+.PHONY: all run test check386 qemu qemu-test qemu-emm386 qemu-sessions qemu-vga qemu-wm qemu-absmouse clean
 
-all: $(BUILD)/OS1993.COM $(BUILD)/VMM.BIN $(BUILD)/GUI.BIN
+all: $(BUILD)/OS1993.COM $(BUILD)/VMM.BIN $(MODULES)
 
 $(BUILD)/OS1993.COM: loader/os1993.asm | $(BUILD)
 	$(NASM) -f bin -o $@ -l $(BUILD)/os1993.lst $<
@@ -63,22 +76,51 @@ $(BUILD)/kernel/%.o: kernel/%.c | $(BUILD)/kernel
 $(BUILD)/kernel/%.o: kernel/%.asm kernel/include/selectors.inc | $(BUILD)/kernel
 	$(NASM) $(NASMFLAGS_K) -o $@ $<
 
-$(BUILD)/GUI.BIN: $(BUILD)/gui.elf
+$(BUILD)/%.DLL: $(U)/%.elf
 	$(OBJCOPY) -O binary $< $@
 
-$(BUILD)/gui.elf: $(USER_OBJ) user/user.ld
-	$(CC) $(USER_LDFLAGS) -o $@ $(USER_OBJ)
+$(BUILD)/%.BIN: $(U)/%.elf
+	$(OBJCOPY) -O binary $< $@
 
-$(BUILD)/user/%.o: user/%.c | $(BUILD)/user
+$(U)/GFX.elf: $(GFX_OBJ) user/lib/module.ld
+	$(CC) $(MOD_LDFLAGS) -Wl,--defsym=MODBASE=$(GFX_BASE) -o $@ $(GFX_OBJ)
+
+$(U)/UI.elf: $(UI_OBJ) user/lib/module.ld
+	$(CC) $(MOD_LDFLAGS) -Wl,--defsym=MODBASE=$(UI_BASE) -o $@ $(UI_OBJ)
+
+$(U)/GUI.elf: $(GUI_OBJ) user/lib/module.ld
+	$(CC) $(MOD_LDFLAGS) -Wl,--defsym=MODBASE=0x00400000 -o $@ $(GUI_OBJ)
+
+$(U)/%.o: user/%.c
+	@mkdir -p $(dir $@)
 	$(CC) $(USER_CFLAGS) -c -o $@ $<
 
-$(BUILD)/user/gfx.o: kernel/gfx.c | $(BUILD)/user
-	$(CC) $(USER_CFLAGS) -c -o $@ $<
-
-$(BUILD)/user/%.o: user/%.asm | $(BUILD)/user
+$(U)/lib/crt0.o: user/lib/crt0.asm
+	@mkdir -p $(dir $@)
 	$(NASM) -f elf32 -g -o $@ $<
 
-$(BUILD) $(BUILD)/kernel $(BUILD)/user:
+# One header per module: kind 1 = program, 2 = library
+$(U)/gfx/header.o:  MODDEF := -DKIND=2 -DMODNAME='"GFX.DLL"'
+$(U)/ui/header.o:   MODDEF := -DKIND=2 -DMODNAME='"UI.DLL"'
+$(U)/apps/header.o: MODDEF := -DKIND=1 -DMODNAME='"GUI.BIN"'
+$(U)/%/header.o: user/lib/header.asm
+	@mkdir -p $(dir $@)
+	$(NASM) -f elf32 $(MODDEF) -o $@ $<
+
+$(U)/gen/gfx_exports.asm $(U)/gen/gfx_imports.asm: user/gfx/gfx.def tools/mkdef.py
+	@mkdir -p $(dir $@)
+	$(MKDEF) $< exports $(U)/gen/gfx_exports.asm
+	$(MKDEF) $< imports $(U)/gen/gfx_imports.asm
+
+$(U)/gen/ui_exports.asm $(U)/gen/ui_imports.asm: user/ui/ui.def tools/mkdef.py
+	@mkdir -p $(dir $@)
+	$(MKDEF) $< exports $(U)/gen/ui_exports.asm
+	$(MKDEF) $< imports $(U)/gen/ui_imports.asm
+
+$(U)/gen/%.o: $(U)/gen/%.asm
+	$(NASM) -f elf32 -o $@ $<
+
+$(BUILD) $(BUILD)/kernel:
 	mkdir -p $@
 
 DOSBOX_ARGS := -conf test/dosbox-x.conf -fastlaunch \
@@ -94,7 +136,7 @@ test: all
 	@tools/check-test.sh $(BUILD)
 
 # QEMU has no 386 model; a 486 with 16 MB is the closest 1993 machine.
-QEMU_ARGS := -M isapc -cpu 486 -m 16 -drive file=$(BUILD)/freedos.img,format=raw,if=ide \
+QEMU_ARGS := -M isapc,vmport=on -cpu 486 -m 16 -drive file=$(BUILD)/freedos.img,format=raw,if=ide \
              -serial file:$(BUILD)/qemu/SERIAL.LOG -device isa-debug-exit,iobase=0xf4,iosize=4
 QEMU_IMG  := $(BUILD)/freedos.img@@32256
 
@@ -129,9 +171,11 @@ qemu-vga: all
 qemu-wm: all
 	@tools/qemu-wm-test.py
 
-check386: $(BUILD)/vmm.elf $(BUILD)/gui.elf
-	@tools/check386.sh $(OBJDUMP) $(BUILD)/vmm.elf
-	@tools/check386.sh $(OBJDUMP) $(BUILD)/gui.elf
+qemu-absmouse: all
+	@tools/qemu-absmouse-test.py
+
+check386: $(BUILD)/vmm.elf $(U)/GFX.elf $(U)/UI.elf $(U)/GUI.elf
+	@for f in $^; do tools/check386.sh $(OBJDUMP) $$f || exit 1; done
 
 clean:
 	rm -rf $(BUILD)

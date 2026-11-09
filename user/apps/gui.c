@@ -1,5 +1,6 @@
 /*
- * user/gui.c -- the ring-3 GUI: palette, demo applications, event loop.
+ * user/apps/gui.c -- GUI.BIN: the demo applications and the event loop.
+ * The window manager and controls come from UI.DLL, drawing from GFX.DLL.
  *
  * Three windows show the window manager and the controls:
  *   Programs       MS-DOS Prompt (a DOS session VM), About, Exit to VMM
@@ -13,26 +14,6 @@
 #include "wm.h"
 
 #define SC_ESC 0x01
-
-/* 6-bit DAC values */
-const uint8_t theme_palette[16][3] = {
-    [C_BLACK]     = {  0,  0,  0 },
-    [C_GRAY1]     = { 13, 13, 13 },
-    [C_GRAY2]     = { 21, 21, 21 },
-    [C_GRAY3]     = { 30, 30, 30 },
-    [C_GRAY4]     = { 38, 38, 38 },
-    [C_GRAY5]     = { 46, 46, 46 },
-    [C_FACE]      = { 55, 55, 55 },
-    [C_LIGHT]     = { 59, 59, 59 },
-    [C_WHITE]     = { 63, 63, 63 },
-    [C_ACCENT]    = { 26, 26, 50 },
-    [C_ACCENT_LT] = { 50, 50, 63 },
-    [C_DESKTOP]   = { 17, 30, 40 },
-    [C_RED]       = { 52,  8,  8 },
-    [C_GREEN]     = {  8, 40, 12 },
-    [C_YELLOW]    = { 63, 56, 16 },
-    [C_ACCENT_DK] = { 16, 16, 40 },
-};
 
 static bool quit;
 
@@ -210,9 +191,7 @@ int main(struct user_info *info)
     if (info->flags & (UINFO_TEST_CLI | UINFO_TEST_KERNEL))
         return selftest(info);
 
-    gfx_init(&wm_gfx, (volatile uint8_t *)info->vga, (const uint8_t *)info->font);
-    gfx_set_palette(theme_palette);
-    wm_init();
+    ui_init(info);
 
     struct window *p = wm_create("Programs", 16, 16, 210, 160, 0);
     p->ctls = programs_ctls;
