@@ -37,11 +37,31 @@
 #define USER_PDES   512                     /* PDEs 0-511 cover user space */
 #define SHARED_PDE  (USER_SHARED >> 22)
 
+/* A module's image, kept while the session lasts so later processes can
+ * share it: the frames of its read-only pages, mapped into each of them
+ * read-only, and a pristine copy of its writable pages -- taken after its
+ * imports were linked, before any of its code ran -- that each one gets a
+ * copy of. (Every DLL sits at a fixed address, so linked import slots hold
+ * the same values in every process.) */
+#define IMAGE_MAX 16
+
+struct image {
+    char      name[16];
+    uint32_t  kind, base, data, end, entry, exports, imports;
+    uint32_t *code;                         /* frames of [base, data) */
+    uint32_t *pristine;                     /* frames: the first contents of [data, end) */
+    int       refs;                         /* processes using it */
+};
+
+static struct image images[IMAGE_MAX];
+
 struct module {
     char     name[16];
     uint32_t base, end;                     /* mapped [base, end) */
+    uint32_t data;                          /* private from here; before, shared */
     uint32_t exports, imports;
     bool     resolved;
+    struct image *img;                      /* shared from this image, or NULL */
 };
 
 enum pstate { P_FREE, P_RUNNING, P_DEAD };
@@ -64,6 +84,7 @@ struct process {
     int            lock_wait;               /* lock it waits for, -1 none */
     struct proc_files files;                /* open files, current directory */
     uint32_t       heap_end;                /* SYS_SBRK: USER_HEAP .. heap_end */
+    uint32_t       shared_pages;            /* mapped from other processes' images */
 };
 
 void user_enter(uint32_t eip, uint32_t esp, uint32_t ebx);  /* entry.asm */
@@ -165,8 +186,17 @@ static void unmap_free(uint32_t va, uint32_t len)
 /* Free everything p mapped (p must be installed), page tables included. */
 static void release_address_space(struct process *p)
 {
-    for (int i = 0; i < p->nmods; i++)
-        unmap_free(p->mods[i].base, p->mods[i].end - p->mods[i].base);
+    for (int i = 0; i < p->nmods; i++) {
+        struct module *m = &p->mods[i];
+        if (m->img) {                           /* shared pages: the image keeps them */
+            for (uint32_t va = m->base; va < m->data; va += PAGE_SIZE)
+                vmm_unmap(va);
+            m->img->refs--;
+            unmap_free(m->data, m->end - m->data);
+        } else {
+            unmap_free(m->base, m->end - m->base);
+        }
+    }
     p->nmods = 0;
     unmap_free(USER_STACK_TOP - USER_STACK_SIZE, USER_STACK_SIZE);
     unmap_free(USER_INFO, 2 * PAGE_SIZE);
@@ -310,13 +340,133 @@ static struct module *find_module(struct process *p, const char *name)
     return NULL;
 }
 
-/* Read a module file into fresh user pages at its own base address. */
+static struct image *find_image(const char *name, uint32_t kind)
+{
+    for (int i = 0; i < IMAGE_MAX; i++)
+        if (images[i].code && images[i].kind == kind && same_name(images[i].name, name))
+            return &images[i];
+    return NULL;
+}
+
+/* Map a cached image: its read-only pages shared, its writable ones copied. */
+static struct module *map_image(struct process *p, struct image *img)
+{
+    for (int i = 0; i < p->nmods; i++)              /* no overlaps */
+        if (!(img->end <= p->mods[i].base || img->base >= p->mods[i].end))
+            return NULL;
+    struct module *m = &p->mods[p->nmods];
+    memset(m, 0, sizeof *m);
+    m->base = img->base;
+    m->data = img->data;
+    m->end = img->data;                             /* private pages mapped so far */
+    m->img = img;                                   /* release_address_space knows */
+    img->refs++;
+    p->nmods++;
+    for (uint32_t va = img->base; va < img->data; va += PAGE_SIZE)
+        if (vmm_map(va, img->code[(va - img->base) >> PAGE_SHIFT], PTE_U) != 0)
+            return NULL;                            /* read-only for ring 3 */
+    p->shared_pages += (img->data - img->base) >> PAGE_SHIFT;
+    for (uint32_t va = img->data; va < img->end; va += PAGE_SIZE) {
+        uint32_t frame = pmm_alloc();
+        if (!frame || vmm_map(va, frame, PTE_W | PTE_U) != 0) {
+            if (frame) pmm_free(frame);
+            return NULL;
+        }
+        memcpy(phys_to_virt(frame), phys_to_virt(img->pristine[(va - img->data) >> PAGE_SHIFT]),
+               PAGE_SIZE);
+        m->end = va + PAGE_SIZE;
+    }
+    strncpy0(m->name, img->name, sizeof m->name);
+    m->exports = img->exports;
+    m->imports = img->imports;
+    if (img->kind == MOD_PROGRAM)
+        p->entry = img->entry;
+    return m;
+}
+
+/* After a process loaded and linked: keep each module it read from disk
+ * as an image, its read-only pages becoming shared (and read-only). */
+static void keep_images(struct process *p)
+{
+    for (int i = 0; i < p->nmods; i++) {
+        struct module *m = &p->mods[i];
+        struct image *img = NULL;
+        if (m->img || find_image(m->name, i == 0 ? MOD_PROGRAM : MOD_LIBRARY))
+            continue;
+        for (int k = 0; k < IMAGE_MAX && !img; k++)
+            if (!images[k].code)
+                img = &images[k];
+        if (!img)
+            return;                                 /* the cache is full: stays private */
+        uint32_t ncode = (m->data - m->base) >> PAGE_SHIFT, ndata = (m->end - m->data) >> PAGE_SHIFT;
+        uint32_t *code = kzalloc((ncode + 1) * sizeof(uint32_t));
+        uint32_t *pristine = kzalloc((ndata + 1) * sizeof(uint32_t));
+        bool ok = code && pristine;
+        for (uint32_t k = 0; ok && k < ndata; k++) {
+            uint32_t pa, frame = pmm_alloc();
+            if (!frame || !vmm_translate(m->data + (k << PAGE_SHIFT), &pa)) {
+                if (frame) pmm_free(frame);
+                ok = false;
+                break;
+            }
+            memcpy(phys_to_virt(frame), (const void *)(uintptr_t)(m->data + (k << PAGE_SHIFT)), PAGE_SIZE);
+            pristine[k] = frame;
+        }
+        if (!ok) {
+            for (uint32_t k = 0; pristine && k < ndata; k++)
+                if (pristine[k]) pmm_free(pristine[k]);
+            kfree(code);
+            kfree(pristine);
+            return;
+        }
+        for (uint32_t k = 0; k < ncode; k++) {      /* now shared: read-only */
+            uint32_t va = m->base + (k << PAGE_SHIFT);
+            code[k] = vmm_unmap(va);
+            vmm_map(va, code[k], PTE_U);
+        }
+        strncpy0(img->name, m->name, sizeof img->name);
+        img->kind = i == 0 ? MOD_PROGRAM : MOD_LIBRARY;
+        img->base = m->base;
+        img->data = m->data;
+        img->end = m->end;
+        img->entry = i == 0 ? p->entry : 0;
+        img->exports = m->exports;
+        img->imports = m->imports;
+        img->pristine = pristine;
+        img->code = code;
+        img->refs = 1;
+        m->img = img;
+    }
+}
+
+/* At the end of a session: images nobody uses any more go. */
+static void free_images(void)
+{
+    for (int i = 0; i < IMAGE_MAX; i++) {
+        struct image *img = &images[i];
+        if (!img->code || img->refs > 0)
+            continue;
+        for (uint32_t k = 0; k < (img->data - img->base) >> PAGE_SHIFT; k++)
+            pmm_free(img->code[k]);
+        for (uint32_t k = 0; k < (img->end - img->data) >> PAGE_SHIFT; k++)
+            pmm_free(img->pristine[k]);
+        kfree(img->code);
+        kfree(img->pristine);
+        memset(img, 0, sizeof *img);
+    }
+}
+
+/* Read a module file into fresh user pages at its own base address (or
+ * map it from an image another process loaded). */
 static struct module *load_module(struct process *p, const char *name, uint32_t kind)
 {
     if (p->nmods == MOD_MAX) {
         klog("USER: too many modules loading %s\n", name);
         return NULL;
     }
+    struct image *img = find_image(name, kind);
+    if (img)
+        return map_image(p, img);
     char path[128];
     program_path(name, path, sizeof path);
     int h = dos_open(path);
@@ -333,7 +483,8 @@ static struct module *load_module(struct process *p, const char *name, uint32_t 
     uint32_t end = hdr.base + PAGE_ALIGN_UP(hdr.mem_size);
     bool ok = n >= (int)sizeof hdr && hdr.magic == MOD_MAGIC && hdr.kind == kind &&
               hdr.mem_size >= hdr.file_size && hdr.mem_size <= MAX_IMAGE &&
-              !(hdr.base & ~PAGE_MASK);
+              !(hdr.base & ~PAGE_MASK) && !(hdr.data & ~PAGE_MASK) &&
+              hdr.data >= hdr.base && hdr.data <= end;
     if (ok && kind == MOD_PROGRAM)
         ok = hdr.base == USER_BASE && hdr.entry >= hdr.base && hdr.entry < hdr.base + hdr.file_size;
     if (ok && kind == MOD_LIBRARY)
@@ -351,6 +502,7 @@ static struct module *load_module(struct process *p, const char *name, uint32_t 
     memset(m, 0, sizeof *m);
     m->base = hdr.base;
     m->end = end;
+    m->data = hdr.data;
     if (!map_zeroed(m->base, m->end - m->base)) {
         unmap_free(m->base, m->end - m->base);
         dos_close(h);
@@ -506,6 +658,8 @@ static int spawn(const char *name, const char *args)
                 *c = (char)(*c - 32);
         p->thread = thread_create(p->name, user_thread_main, p, NULL);
         ok = p->thread != NULL;
+        if (ok)
+            keep_images(p);                         /* before any of its code runs */
     }
     if (!ok) {
         klog("USER: could not start %s\n", name);
@@ -522,7 +676,8 @@ static int spawn(const char *name, const char *args)
     p->thread->proc = p;
     p->state = P_RUNNING;
     self->proc = was;                               /* stays installed (lazy) */
-    klog("USER: started %s as process %d (%d modules)\n", name, p->pid, p->nmods);
+    klog("USER: started %s as process %d (%d modules, %u KB shared)\n", p->name, p->pid, p->nmods,
+         p->shared_pages * 4);
     thread_wake(p->thread);
     return p->pid;
 }
@@ -703,8 +858,10 @@ void user_service(void)
         for (int k = 0; k < PROC_MAX; k++)
             if (&procs[k] != p && procs[k].state != P_FREE)
                 last = false;
-        if (last)
+        if (last) {
             shared_destroy();
+            free_images();                          /* nobody uses them now */
+        }
         current->proc = NULL;
         installed = NULL;
         kfree(p->pde);
@@ -1192,6 +1349,9 @@ void user_selftest(void)
     rc = run_test(UINFO_TEST_KERNEL);
     if (rc != -(14 + 1))
         panic("Ring-3 kernel-write test: result %d (expected #PF).", rc);
-    kprintf("  Ring 3: system calls work; CLI and kernel writes are refused.\n");
+    rc = run_test(UINFO_TEST_CODE);
+    if (rc != -(14 + 1))
+        panic("Ring-3 code-write test: result %d (expected #PF).", rc);
+    kprintf("  Ring 3: system calls work; CLI, kernel and code writes are refused.\n");
     klog("VMM: ring-3 self-test passed\n");
 }

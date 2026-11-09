@@ -10,6 +10,7 @@ starting a second Calculator, closed again with Alt+F4; and Shut Down,
 which ends the session and the programs still running. Coordinates follow
 user/apps/*.c.
 """
+import re
 import sys
 import os
 
@@ -40,6 +41,8 @@ def main():
         check(m.wait_log("GUI: launch Calculator") and m.wait_log("USER: started CALC.BIN"),
               "Start > Programs > Calculator starts a process")
         check(m.wait_log("GUI: calculator ready"), "the Calculator runs")
+        shared = re.search(r"started CALC.BIN as process \d+ \(\d+ modules, (\d+) KB shared\)", m.log())
+        check(shared and int(shared.group(1)) > 0, "it shares the DLLs' code the shell loaded")
 
         # --- Calculator ---
         m.type("12+30=")
@@ -91,6 +94,10 @@ def main():
         m.type("calc.bin\n")
         check(m.wait_log("GUI: launch calc.bin") and m.wait_log("GUI: calculator ready", 2),
               "the Run dialog starts a second Calculator")
+        second = re.search(r"started CALC.BIN as process \d+ \(\d+ modules, (\d+) KB shared\)",
+                           m.log()[m.log().index("launch calc.bin"):])
+        check(second and shared and int(second.group(1)) > int(shared.group(1)),
+              "the second Calculator shares the first one's code too")
         m.key("alt-f4")
         check(m.wait_log("USER: CALC.BIN exited with code 0"), "Alt+F4 closes it (its process ends)")
 

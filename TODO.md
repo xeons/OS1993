@@ -49,8 +49,10 @@ README.md for what already works.
 
 ## Ring 3 and DLLs
 
-- [ ] DLL code shared between processes (every process loads its own copy
-      today); DLL data per process (copy-on-write or per-process data pages).
+- [ ] Shared code: images are kept for the whole session (at most 16) and
+      freed when it ends, not when their last user does; data pages are
+      copied whole at start, not copy-on-write; a DLL changed on disk during
+      a session isn't noticed.
 - [ ] Several threads per process; per-thread message queues.
 - [ ] The window manager lock is held from a process's first UI call until
       it waits, like Win16Mutex: a program that computes for a long time

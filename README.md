@@ -217,7 +217,16 @@ address space, like Win95's 32-bit side.
   arena.
 - **Loading.** The VMM console thread loads programs through DOS (the
   System VM's own file system): `SYS_EXEC` from a process queues a request
-  and waits. Each process gets its own copy of every DLL it imports.
+  and waits.
+- **Shared code.** A module's read-only part (header, code, constants,
+  exports; the linker ends it on a page boundary, given in the header) is
+  loaded once per session and mapped into every process that uses it,
+  read-only -- a program writing into code is killed. Its writable part
+  (data, import slots, bss) is copied for each process from a pristine
+  copy taken after its imports were linked and before any of its code
+  ran; with every DLL at a fixed address the linked slots are the same
+  everywhere. Programs share too: a second Notepad maps the first one's
+  code. The VMM logs how much each new process shares.
 - **System calls** (`INT 30h`, DPL-3 gate): exit, debug print, ticks,
   yield, wait/wake (`SYS_WAIT` sleeps until another process wakes it,
   input arrives, or a timeout), exec, kill, process liveness, kernel locks
@@ -266,7 +275,8 @@ system DLLs.
 - **The loader** (`kernel/user.c`) loads a program, then the DLLs it
   imports and theirs, from the program's directory. It fills every slot by
   name and refuses to start with a clear message if an export is missing.
-  Everything is unmapped, page tables too, when the process ends.
+  Everything is unmapped, page tables too, when the process ends; shared
+  images stay until the session ends.
 - **`HOOK fn`** in a `.DEF` makes every export call `fn()` first: UI.DLL
   takes its lock that way.
 
@@ -578,8 +588,9 @@ tools/                   check386.sh, check-test.sh
    sharing one window system, and a Windows 95-style shell with
    Calculator, Paint and Clock, file access for programs with the Open and
    Save As dialogs, a process heap, the clipboard, a multi-line edit control
-   and Notepad. Next: a task list (Ctrl+Alt+Del), combo boxes and tabs, DLL
-   code shared between processes, VESA truecolor.
+   and Notepad (word wrap, Find/Replace), a Ctrl+Alt+Del task list, combo
+   boxes, tabs and up-downs, and code shared between processes. Next:
+   VESA truecolor, finer-grained window system locking.
 7. **Win16-style API layer.** 16-bit protected-mode apps in ring 3 with LDTs,
    built with Open Watcom.
 8. **Coexisting with EMM386** through VCPI/GEMMIS, and acting as a DPMI host.

@@ -494,6 +494,8 @@ static void open_more(void)
 
 /* ---- self-test ------------------------------------------------------------ */
 
+int main(void);
+
 static int selftest(const struct user_info *info)
 {
     OutputDebugString("ring-3 self-test running");
@@ -505,6 +507,8 @@ static int selftest(const struct user_info *info)
         __asm__ volatile("cli");                            /* must #GP */
     if (info->flags & UINFO_TEST_KERNEL)
         *(volatile uint32_t *)0x80000000u = 0;              /* must #PF */
+    if (info->flags & UINFO_TEST_CODE)
+        *(volatile uint8_t *)(uintptr_t)main = 0xCC;        /* shared code: must #PF */
     OutputDebugString("privileged operation was allowed!");
     return 1;
 }
@@ -520,7 +524,7 @@ static void register_class(const char *name, WNDPROC proc, uint8_t background)
 int main(void)
 {
     const struct user_info *info = GetStartupInfo();
-    if (info->flags & (UINFO_TEST_CLI | UINFO_TEST_KERNEL))
+    if (info->flags & (UINFO_TEST_CLI | UINFO_TEST_KERNEL | UINFO_TEST_CODE))
         return selftest(info);
 
     InitUI();

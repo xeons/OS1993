@@ -49,6 +49,8 @@ struct mod_header {                     /* first bytes of every module */
     uint32_t exports;                   /* -> struct mod_exports, or 0 */
     uint32_t imports;                   /* -> struct mod_import[], 0-terminated */
     char     name[16];                  /* "UI.DLL" */
+    uint32_t data;                      /* writable from here (page aligned): each process
+                                           gets its own copy; the pages before are shared */
 };
 
 struct mod_export { uint32_t name; uint32_t addr; };    /* name -> ASCIIZ */
@@ -69,6 +71,7 @@ struct mod_import {                     /* one per imported DLL */
 
 #define UINFO_TEST_CLI      0x01        /* self-test: execute CLI (expect #GP) */
 #define UINFO_TEST_KERNEL   0x02        /* self-test: write kernel memory (#PF) */
+#define UINFO_TEST_CODE     0x08        /* self-test: write its own (shared) code (#PF) */
 #define UINFO_GRAPHICS      0x04        /* the screen is in 640x480x16 for us */
 
 struct user_info {                      /* at USER_INFO, pointed to by EBX */
