@@ -1,0 +1,14 @@
+; KERNEL.DLL -- the userland kernel library (wraps INT 30h)
+LIBRARY KERNEL.DLL
+BASE    0x10000000
+EXPORTS
+    ExitProcess
+    OutputDebugString
+    DebugLog
+    GetTickCount
+    Sleep
+    GetStartupInfo
+    StartDosSession
+    GetInputEvent
+    WaitForInput
+    HasMouse

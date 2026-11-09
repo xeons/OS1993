@@ -1,8 +1,5 @@
 /* user/ui/theme.c -- the Platinum-inspired palette, and UI.DLL's start-up. */
-#include "os.h"
-#include "theme.h"
-#include "ui.h"
-#include "wm.h"
+#include "uipriv.h"
 
 /* 6-bit DAC values */
 const uint8_t theme_palette[16][3] = {
@@ -24,11 +21,10 @@ const uint8_t theme_palette[16][3] = {
     [C_ACCENT_DK] = { 16, 16, 40 },
 };
 
-/* Set up drawing for the program: its video memory and font, our palette,
- * an empty desktop. */
-void ui_init(const struct user_info *info)
+void InitUI(void)
 {
-    gfx_init(&wm_gfx, (volatile uint8_t *)info->vga, (const uint8_t *)info->font);
+    ui_screen_init();
     gfx_set_palette(theme_palette);
-    wm_init();
+    ui_init_classes();
+    ui_invalidate_screen(0, 0, 640, 480);
 }

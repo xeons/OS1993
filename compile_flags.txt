@@ -2,3 +2,7 @@
 -m32
 -ffreestanding
 -Ikernel/include
+-Iuser/lib
+-Iuser/gfx
+-Iuser/ui
+-Iuser/krnl

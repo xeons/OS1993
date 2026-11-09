@@ -1,0 +1,65 @@
+/*
+ * user/krnl/krnl.c -- KERNEL.DLL, the userland kernel library.
+ *
+ * The only ring-3 module that knows about INT 30h: every other module calls
+ * these functions, so the system call interface can change without
+ * rebuilding programs (the job KERNEL.EXE did for Win16 programs).
+ */
+#include "os1993.h"
+#include "syscall.h"
+
+#include <stdarg.h>
+
+void ExitProcess(int code)                  { sys_exit(code); }
+void OutputDebugString(const char *s)       { sys_print(s); }
+uint32_t GetTickCount(void)                 { return sys_ticks() * 55; }  /* 18.2 Hz */
+const struct user_info *GetStartupInfo(void){ return (const struct user_info *)USER_INFO; }
+int  StartDosSession(void)                  { return sys_new_session(); }
+bool GetInputEvent(struct user_event *e)    { return sys_get_event(e) == 1; }
+void WaitForInput(void)                     { sys_wait_tick(); }
+bool HasMouse(void)                         { return sys_mouse() != 0; }
+
+void Sleep(uint32_t ms)
+{
+    if (!ms) {
+        sys_yield();
+        return;
+    }
+    uint32_t end = sys_ticks() + (ms + 54) / 55;
+    while ((int32_t)(sys_ticks() - end) < 0)
+        sys_wait_tick();
+}
+
+/* A line for the debug log (COM1): %s %d %u %x %c */
+void DebugLog(const char *fmt, ...)
+{
+    char buf[160];
+    size_t n = 0;
+    va_list ap;
+    va_start(ap, fmt);
+    for (; *fmt && n < sizeof buf - 12; fmt++) {
+        if (*fmt != '%') { buf[n++] = *fmt; continue; }
+        fmt++;
+        if (*fmt == 's') {
+            const char *s = va_arg(ap, const char *);
+            if (!s) s = "(null)";
+            while (*s && n < sizeof buf - 12) buf[n++] = *s++;
+        } else if (*fmt == 'c') {
+            buf[n++] = (char)va_arg(ap, int);
+        } else if (*fmt == 'd' || *fmt == 'u' || *fmt == 'x') {
+            int v = va_arg(ap, int);
+            unsigned base = *fmt == 'x' ? 16 : 10;
+            unsigned u = (*fmt == 'd' && v < 0) ? (unsigned)-v : (unsigned)v;
+            char d[12];
+            int m = 0;
+            do { d[m++] = "0123456789abcdef"[u % base]; u /= base; } while (u);
+            if (*fmt == 'd' && v < 0) buf[n++] = '-';
+            while (m) buf[n++] = d[--m];
+        } else if (!*fmt) {
+            break;
+        }
+    }
+    va_end(ap);
+    buf[n] = '\0';
+    sys_print(buf);
+}

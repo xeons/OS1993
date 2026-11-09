@@ -1,7 +1,7 @@
 # OS1993 -- build with modern tools, run on a 1993 machine.
 #
 #   make            build the loader, the kernel, and the ring-3 modules:
-#                   build/OS1993.COM, VMM.BIN, GFX.DLL, UI.DLL, GUI.BIN
+#                   build/OS1993.COM, VMM.BIN, KERNEL.DLL, GFX.DLL, UI.DLL, GUI.BIN
 #   make run        boot it in DOSBox-X (386, 16 MB, HIMEM-style XMS)
 #   make test       headless DOSBox-X run; checks the full round trip to DOS
 #   make check386   verify the kernel contains no post-386 instructions
@@ -39,18 +39,22 @@ NASMFLAGS_K := -f elf32 -g -Ikernel/include/
 # DLL's export table and an import library (JMP [slot] thunks) for callers.
 U           := $(BUILD)/user
 MKDEF       := python3 tools/mkdef.py
-USER_CFLAGS := $(filter-out -Ikernel/include,$(CFLAGS)) -Iuser/lib -Iuser/gfx -Iuser/ui -Ikernel/include
+USER_CFLAGS := $(filter-out -Ikernel/include,$(CFLAGS)) -Iuser/lib -Iuser/gfx -Iuser/ui -Ikernel/include -MMD -MP
 MOD_LDFLAGS := -T user/lib/module.ld -nostdlib -ffreestanding \
                -Wl,--build-id=none -Wl,--no-warn-rwx-segments
+KRNL_BASE   := $(shell $(MKDEF) user/krnl/krnl.def base)
 GFX_BASE    := $(shell $(MKDEF) user/gfx/gfx.def base)
 UI_BASE     := $(shell $(MKDEF) user/ui/ui.def base)
 
+KRNL_OBJ := $(U)/krnl/header.o $(U)/krnl/krnl.o $(U)/gen/krnl_exports.o $(U)/lib/lib.o
 GFX_OBJ := $(U)/gfx/header.o $(U)/gfx/gfx.o $(U)/gen/gfx_exports.o $(U)/lib/lib.o
-UI_OBJ  := $(U)/ui/header.o $(U)/ui/wm.o $(U)/ui/ui.o $(U)/ui/kbd.o $(U)/ui/theme.o \
-           $(U)/gen/ui_exports.o $(U)/gen/gfx_imports.o $(U)/lib/lib.o
-GUI_OBJ := $(U)/apps/header.o $(U)/lib/crt0.o $(U)/apps/gui.o $(U)/gen/ui_imports.o $(U)/lib/lib.o
-USER_OBJ := $(sort $(GFX_OBJ) $(UI_OBJ) $(GUI_OBJ))
-MODULES := $(BUILD)/GFX.DLL $(BUILD)/UI.DLL $(BUILD)/GUI.BIN
+UI_SRC  := wnd input frame paint dialog button static edit listbox scroll trackbar kbd theme
+UI_OBJ  := $(U)/ui/header.o $(patsubst %,$(U)/ui/%.o,$(UI_SRC)) \
+           $(U)/gen/ui_exports.o $(U)/gen/gfx_imports.o $(U)/gen/krnl_imports.o $(U)/lib/lib.o
+GUI_OBJ := $(U)/apps/header.o $(U)/lib/crt0.o $(U)/apps/gui.o $(U)/gen/ui_imports.o \
+           $(U)/gen/krnl_imports.o $(U)/lib/lib.o
+USER_OBJ := $(sort $(KRNL_OBJ) $(GFX_OBJ) $(UI_OBJ) $(GUI_OBJ))
+MODULES := $(BUILD)/KERNEL.DLL $(BUILD)/GFX.DLL $(BUILD)/UI.DLL $(BUILD)/GUI.BIN
 
 KERNEL_C   := $(wildcard kernel/*.c)
 KERNEL_ASM := $(wildcard kernel/*.asm)
@@ -82,6 +86,9 @@ $(BUILD)/%.DLL: $(U)/%.elf
 $(BUILD)/%.BIN: $(U)/%.elf
 	$(OBJCOPY) -O binary $< $@
 
+$(U)/KERNEL.elf: $(KRNL_OBJ) user/lib/module.ld
+	$(CC) $(MOD_LDFLAGS) -Wl,--defsym=MODBASE=$(KRNL_BASE) -o $@ $(KRNL_OBJ)
+
 $(U)/GFX.elf: $(GFX_OBJ) user/lib/module.ld
 	$(CC) $(MOD_LDFLAGS) -Wl,--defsym=MODBASE=$(GFX_BASE) -o $@ $(GFX_OBJ)
 
@@ -100,12 +107,18 @@ $(U)/lib/crt0.o: user/lib/crt0.asm
 	$(NASM) -f elf32 -g -o $@ $<
 
 # One header per module: kind 1 = program, 2 = library
+$(U)/krnl/header.o: MODDEF := -DKIND=2 -DMODNAME='"KERNEL.DLL"'
 $(U)/gfx/header.o:  MODDEF := -DKIND=2 -DMODNAME='"GFX.DLL"'
 $(U)/ui/header.o:   MODDEF := -DKIND=2 -DMODNAME='"UI.DLL"'
 $(U)/apps/header.o: MODDEF := -DKIND=1 -DMODNAME='"GUI.BIN"'
 $(U)/%/header.o: user/lib/header.asm
 	@mkdir -p $(dir $@)
 	$(NASM) -f elf32 $(MODDEF) -o $@ $<
+
+$(U)/gen/krnl_exports.asm $(U)/gen/krnl_imports.asm: user/krnl/krnl.def tools/mkdef.py
+	@mkdir -p $(dir $@)
+	$(MKDEF) $< exports $(U)/gen/krnl_exports.asm
+	$(MKDEF) $< imports $(U)/gen/krnl_imports.asm
 
 $(U)/gen/gfx_exports.asm $(U)/gen/gfx_imports.asm: user/gfx/gfx.def tools/mkdef.py
 	@mkdir -p $(dir $@)
@@ -174,10 +187,12 @@ qemu-wm: all
 qemu-absmouse: all
 	@tools/qemu-absmouse-test.py
 
-check386: $(BUILD)/vmm.elf $(U)/GFX.elf $(U)/UI.elf $(U)/GUI.elf
+check386: $(BUILD)/vmm.elf $(U)/KERNEL.elf $(U)/GFX.elf $(U)/UI.elf $(U)/GUI.elf
 	@for f in $^; do tools/check386.sh $(OBJDUMP) $$f || exit 1; done
 
 clean:
 	rm -rf $(BUILD)
 
 -include $(KERNEL_OBJ:.o=.d) $(USER_OBJ:.o=.d)
+
+-include $(USER_OBJ:.o=.d)

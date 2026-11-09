@@ -22,7 +22,10 @@ README.md for what already works.
 - [ ] Desktop: icons, wallpaper pattern, and a shell with a **taskbar**
       (minimized windows currently become tiles along the bottom).
 - [ ] Program Manager-style launcher that starts real application programs.
-- [ ] Layout: controls don't reflow when a window is resized.
+- [ ] Layout: controls don't reflow when a window is resized (programs can
+      do it themselves now on `WM_SIZE` with `MoveWindow`).
+- [ ] Dialog templates (`CreateDialog` from a table) and modal loops.
+- [ ] Owner-drawn controls (`WM_DRAWITEM`), `WM_CTLCOLOR*`, `WM_NCHITTEST`.
 - [ ] Repainting: the dirty region is a single bounding rectangle; a region
       list would repaint less when far-apart things change.
 
@@ -39,7 +42,9 @@ README.md for what already works.
 - [ ] File I/O system calls for ring-3 programs (through DOS in the
       System VM, behind an `fs_*` interface).
 - [ ] Memory allocation system calls (a user heap).
-- [ ] Message/event queue per window instead of one global event poll.
+- [ ] **IPC**: one message queue per process (thread), `PostMessage` /
+      `SendMessage` across processes through the kernel, shared memory
+      sections, and named events/mutexes -- once several programs run.
 
 ## Graphics
 

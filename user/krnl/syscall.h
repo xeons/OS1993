@@ -1,5 +1,5 @@
 /*
- * os.h -- the VMM's INT 30h system calls, for ring-3 programs.
+ * syscall.h -- the VMM's INT 30h system calls. Only KERNEL.DLL uses these.
  */
 #ifndef OS1993_USER_OS_H
 #define OS1993_USER_OS_H
@@ -7,7 +7,9 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#ifndef USER_SIDE
 #define USER_SIDE
+#endif
 #include "user.h"
 
 static inline uint32_t syscall3(uint32_t n, uint32_t a, uint32_t b, uint32_t c)
@@ -18,9 +20,6 @@ static inline uint32_t syscall3(uint32_t n, uint32_t a, uint32_t b, uint32_t c)
 }
 
 size_t strlen(const char *s);
-void  *memset(void *d, int c, size_t n);
-void  *memcpy(void *d, const void *s, size_t n);
-void   ulog(const char *fmt, ...);     /* debug log: %s %d %c */
 
 static inline void sys_print(const char *s)  { syscall3(SYS_PRINT, (uint32_t)s, (uint32_t)strlen(s), 0); }
 static inline uint32_t sys_ticks(void)       { return syscall3(SYS_TICKS, 0, 0, 0); }

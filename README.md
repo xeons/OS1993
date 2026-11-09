@@ -239,9 +239,14 @@ system DLLs.
 
 | Module    | Base        | Contents                                         |
 |-----------|-------------|--------------------------------------------------|
-| `GFX.DLL` | `1000_0000` | the VGA display driver (`user/gfx/`)             |
-| `UI.DLL`  | `1010_0000` | window manager, controls, theme (`user/ui/`); imports GFX |
-| `GUI.BIN` | `0040_0000` | the demo applications (`user/apps/`); imports UI |
+| `KERNEL.DLL` | `1000_0000` | the userland kernel library: wraps the INT 30h system calls (`user/krnl/`) |
+| `GFX.DLL` | `1010_0000` | the VGA display driver (`user/gfx/`)             |
+| `UI.DLL`  | `1020_0000` | windows, messages, painting, controls (`user/ui/`); imports KERNEL, GFX |
+| `GUI.BIN` | `0040_0000` | the demo applications (`user/apps/`); imports KERNEL, UI |
+
+Programs include one header, `user/lib/os1993.h` (the `windows.h` of
+OS1993), and call KERNEL.DLL (`GetTickCount`, `Sleep`, `DebugLog`,
+`StartDosSession`, ...) instead of issuing system calls themselves.
 
 Each module links its own copy of the tiny C runtime (`user/lib/`).
 
@@ -257,7 +262,20 @@ Windows 95 set of window controls and widgets.
   attribute map plus DAC): eight greys for the Platinum ramp, accents, a
   desktop colour. The VDD captures the GUI's live palette when a DOS
   session takes the screen.
-- **Windows** (`user/ui/wm.c`). Overlapping windows in a z-order, painted
+- **A Win32-style window system** (`user/ui/wnd.c`). Windows are `HWND`s
+  of a registered class (`RegisterClass`) whose window procedure handles
+  their messages; `DefWindowProc` supplies the defaults. One message queue:
+  `GetMessage` / `TranslateMessage` / `DispatchMessage`, `SendMessage`,
+  `PostMessage`, timers (`SetTimer` -> `WM_TIMER`), mouse capture, focus
+  and activation messages, `WM_PAINT` with `BeginPaint`/`EndPaint` and a
+  clipped `HDC`. Controls are child windows, so anything can be
+  **subclassed** (`SetWindowLong(GWL_WNDPROC)` + `CallWindowProc`) or carry
+  data (`SetProp`/`GetProp`, `GWL_USERDATA`, class extra bytes). Message
+  numbers and control messages (`BM_`, `LB_`, `SBM_`, `TBM_`, `PBM_`, `EN_`,
+  `BN_`, `WM_HSCROLL`...) follow Windows. `IsDialogMessage` gives any window
+  Tab/Shift+Tab, Enter (default button) and Esc (`IDCANCEL`).
+- **Frames and painting** (`user/ui/frame.c`, `paint.c`, `input.c`).
+  Overlapping windows in a z-order, painted
   back to front into a dirty rectangle with clipping, **double-buffered**.
   Painting goes into an off-screen copy of the screen (four planes in
   memory), and only the finished rectangle is copied to video memory, so no
@@ -267,15 +285,17 @@ Windows 95 set of window controls and widgets.
   system box on the left and minimize, maximize/restore and close on the
   right. Inactive windows are flat and show no boxes. Double-clicking the
   title maximizes; double-clicking the system box closes; Alt+F4 closes.
+  The boxes send `WM_SYSCOMMAND` (`SC_CLOSE`, `SC_MINIMIZE`, ...) to the
+  window procedure, so a program can intercept them.
   Windows resize from their borders, corners and size grip. Moves and
   resizes drag an XOR outline. Minimized windows become title tiles along
   the bottom until the shell gets a taskbar.
-- **Controls** (`user/ui/ui.c`): push button (with default-button ring),
-  check box, radio button group, group box, label, single-line edit
-  (caret, Home/End/Delete), list box with scroll bar, horizontal and
-  vertical scroll bars (proportional thumb), slider (trackbar) and progress
-  bar. Tab and Shift+Tab move the focus; Space presses; Enter triggers the
-  default button.
+- **Controls**, one class per file: `BUTTON` (push button with
+  default-button ring, check box, radio button group, group box), `STATIC`,
+  `EDIT` (caret, Home/End/Delete), `LISTBOX` with its own scroll bar,
+  `SCROLLBAR` (proportional thumb; the parent moves it, as in Windows),
+  `TRACKBAR` and `PROGRESS`. Every control draws inside its own rectangle,
+  focus and default rings included.
 - **Background behaviour.** When a DOS session takes the screen, the GUI is
   told (`EV_FOCUS`) and stops drawing. Its VGA port accesses are trapped and
   emulated (writes dropped, reads FFh) instead of reaching the hardware
@@ -352,8 +372,11 @@ kernel/dosmgr.c                          one DOS shared by all VMs
 kernel/vga.c gfx.c                       VGA state (VDD), planar drawing
 kernel/user.c                            ring-3 loader, INT 30h system calls
 kernel/mouse.c                           PS/2 mouse (IRQ 12)
-user/                                    GUI.BIN: window manager (wm.c), controls
-                                         (ui.c), demo apps (gui.c), theme, crt0
+user/lib/os1993.h                        the public API; crt0, header, C runtime
+user/krnl/                               KERNEL.DLL (system call wrappers)
+user/gfx/                                GFX.DLL (planar VGA drawing)
+user/ui/                                 UI.DLL (windows, messages, controls)
+user/apps/gui.c                          GUI.BIN, the demo applications
 kernel/gdt.c idt.c pic.c timer.c keyboard.c console.c serial.c kprintf.c panic.c
 kernel/include/          headers; bootinfo.h is shared with the loader
 kernel/linker.ld         links at 0x80000000, header first
@@ -389,7 +412,8 @@ tools/                   check386.sh, check-test.sh
    user segments, INT 30h system calls, `GUI.BIN` loader, fault
    isolation), the PS/2 mouse, and the window manager with the Windows 95
    control set in a Platinum-inspired style, double-buffered, plus DLLs
-   (GFX.DLL, UI.DLL) and an absolute mouse under emulators. Next: menus,
+   (KERNEL.DLL, GFX.DLL, UI.DLL) with a Win32-style message-based window
+   API, and an absolute mouse under emulators. Next: menus,
    combo boxes and tabs; several application programs running at once,
    each in its own address space with the DLLs shared; a shell with a
    taskbar; VESA truecolor.

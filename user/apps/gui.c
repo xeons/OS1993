@@ -1,6 +1,8 @@
 /*
- * user/apps/gui.c -- GUI.BIN: the demo applications and the event loop.
- * The window manager and controls come from UI.DLL, drawing from GFX.DLL.
+ * user/apps/gui.c -- GUI.BIN: the demo applications.
+ * Windows, messages and controls come from UI.DLL; system services from
+ * KERNEL.DLL. Written the way a Windows program is: register a class,
+ * create windows and child controls, run a message loop.
  *
  * Three windows show the window manager and the controls:
  *   Programs       MS-DOS Prompt (a DOS session VM), About, Exit to VMM
@@ -8,236 +10,278 @@
  *   About OS1993   a small dialog
  * With a self-test flag it instead checks that ring 3 is fenced in.
  */
-#include "os.h"
-#include "theme.h"
-#include "ui.h"
-#include "wm.h"
+#include "os1993.h"
 
-#define SC_ESC 0x01
+#define BTN_H   22
+#define EDIT_H  22
+#define DEF     4               /* a default button's ring */
+#define RING    3               /* an edit or list box's focus ring */
 
-static bool quit;
+#define FRAMED  (WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX)
+#define CHILD   (WS_CHILD | WS_VISIBLE)
 
-/* ---- Programs ---------------------------------------------------------- */
-
-enum { ID_DOS = 1, ID_ABOUT, ID_EXIT };
-
-static struct ctl programs_ctls[] = {
-    { .type = CT_LABEL,  .x = 12, .y = 10, .text = "Run a program:" },
-    { .type = CT_BUTTON, .x = 12, .y = 36,  .w = 176, .h = BTN_H, .id = ID_DOS,   .text = "MS-DOS Prompt" },
-    { .type = CT_BUTTON, .x = 12, .y = 66,  .w = 176, .h = BTN_H, .id = ID_ABOUT, .text = "About OS1993" },
-    { .type = CT_BUTTON, .x = 12, .y = 96,  .w = 176, .h = BTN_H, .id = ID_EXIT,  .text = "Exit to VMM" },
-};
-
-static void open_about(void);
-
-static void programs_command(struct window *w, int id)
+static HWND child(HWND parent, const char *cls, const char *text, unsigned style,
+                  int x, int y, int w, int h, int id)
 {
-    (void)w;
-    switch (id) {
-    case ID_DOS:
-        ulog("button MS-DOS Prompt");
-        sys_new_session();
-        break;
-    case ID_ABOUT:
-        open_about();
-        break;
-    case ID_EXIT:
-        ulog("button Exit to VMM");
-        quit = true;
-        break;
-    }
+    return CreateWindow(cls, text, CHILD | style, x, y, w, h, parent, id, NULL);
 }
 
 /* ---- About -------------------------------------------------------------- */
 
-static struct window *about_win;
+static HWND about;
 
-static struct ctl about_ctls[] = {
-    { .type = CT_LABEL,  .x = 16, .y = 12, .text = "OS1993 Virtual Machine Manager" },
-    { .type = CT_LABEL,  .x = 16, .y = 32, .text = "A 386 enhanced mode VMM with" },
-    { .type = CT_LABEL,  .x = 16, .y = 48, .text = "a ring-3 window manager." },
-    { .type = CT_BUTTON, .x = 200, .y = 76, .w = 80, .h = BTN_H, .id = 1, .text = "OK", .flags = CF_DEFAULT },
-};
-
-static void about_command(struct window *w, int id)
+static LRESULT about_proc(HWND h, unsigned msg, WPARAM wp, LPARAM lp)
 {
-    (void)id;
-    ulog("button About OK");
-    wm_close(w);
-}
-
-static void about_closed(struct window *w)
-{
-    (void)w;
-    about_win = NULL;
+    switch (msg) {
+    case WM_CREATE:
+        child(h, WC_STATIC, "OS1993 Virtual Machine Manager", 0, 16, 12, 260, 16, 0);
+        child(h, WC_STATIC, "A 386 enhanced mode VMM with", 0, 16, 32, 260, 16, 0);
+        child(h, WC_STATIC, "a ring-3 window manager.", 0, 16, 48, 260, 16, 0);
+        child(h, WC_BUTTON, "OK", BS_DEFPUSHBUTTON | WS_TABSTOP,
+              200 - DEF, 76 - DEF, 80 + 2 * DEF, BTN_H + 2 * DEF, IDOK);
+        return 0;
+    case WM_COMMAND:
+        if (LOWORD(wp) == IDOK || LOWORD(wp) == IDCANCEL) {
+            if (LOWORD(wp) == IDOK)
+                DebugLog("button About OK");
+            DestroyWindow(h);
+        }
+        return 0;
+    case WM_DESTROY:
+        about = NULL;
+        return 0;
+    }
+    return DefWindowProc(h, msg, wp, lp);
 }
 
 static void open_about(void)
 {
-    if (about_win) {
-        wm_activate(about_win);
-        return;
+    if (about)
+        SetActiveWindow(about);
+    else
+        about = CreateWindow("About", "About OS1993", FRAMED | WS_VISIBLE,
+                             40, 300, 310, 140, NULL, 0, NULL);
+}
+
+/* ---- Programs ---------------------------------------------------------- */
+
+enum { ID_DOS = 10, ID_ABOUT, ID_EXIT };
+
+static LRESULT programs_proc(HWND h, unsigned msg, WPARAM wp, LPARAM lp)
+{
+    switch (msg) {
+    case WM_CREATE:
+        child(h, WC_STATIC, "Run a program:", 0, 12, 10, 176, 16, 0);
+        child(h, WC_BUTTON, "MS-DOS Prompt", WS_TABSTOP, 12, 36, 176, BTN_H, ID_DOS);
+        child(h, WC_BUTTON, "About OS1993", WS_TABSTOP, 12, 66, 176, BTN_H, ID_ABOUT);
+        child(h, WC_BUTTON, "Exit to VMM", WS_TABSTOP, 12, 96, 176, BTN_H, ID_EXIT);
+        return 0;
+    case WM_COMMAND:
+        switch (LOWORD(wp)) {
+        case ID_DOS:
+            DebugLog("button MS-DOS Prompt");
+            StartDosSession();
+            break;
+        case ID_ABOUT:
+            open_about();
+            break;
+        case ID_EXIT:
+            DebugLog("button Exit to VMM");
+            PostQuitMessage(0);
+            break;
+        }
+        return 0;
+    case WM_CLOSE:                      /* closing Programs ends the session */
+        PostQuitMessage(0);
+        return 0;
     }
-    about_win = wm_create("About OS1993", 40, 300, 310, 140, 0);
-    if (!about_win)
-        return;
-    about_win->ctls = about_ctls;
-    about_win->nctl = sizeof about_ctls / sizeof about_ctls[0];
-    about_win->focus = 3;
-    about_win->on_command = about_command;
-    about_win->on_close = about_closed;
+    return DefWindowProc(h, msg, wp, lp);
 }
 
 /* ---- Controls ----------------------------------------------------------- */
 
-enum { ID_SOUND = 1, ID_CLOCK, ID_SLOW, ID_NORMAL, ID_TURBO, ID_NAME, ID_LIST,
-       ID_VOLUME, ID_SCROLL, ID_OK, ID_CANCEL };
+enum { ID_SOUND = 20, ID_CLOCK, ID_SLOW, ID_NORMAL, ID_TURBO, ID_NAME, ID_LIST,
+       ID_VOLUME, ID_SCROLL, ID_PROGRESS, ID_TIMER };
 
-static char name_buf[32] = "Hello";
 static const char *const colours[] = {
     "Platinum", "Graphite", "Lavender", "Teal", "Ocean", "Forest",
     "Sunset", "Sand", "Midnight", "Rose", "Slate", "Copper",
 };
-static struct ctl *progress;
 
-static struct ctl controls_ctls[] = {
-    { .type = CT_GROUP,  .x = 10,  .y = 6,   .w = 170, .h = 76,  .text = "Options" },
-    { .type = CT_CHECK,  .x = 22,  .y = 28,  .w = 150, .h = 20,  .id = ID_SOUND, .text = "Sound effects" },
-    { .type = CT_CHECK,  .x = 22,  .y = 52,  .w = 150, .h = 20,  .id = ID_CLOCK, .text = "Show clock", .value = 1 },
-    { .type = CT_GROUP,  .x = 190, .y = 6,   .w = 170, .h = 100, .text = "Speed" },
-    { .type = CT_RADIO,  .x = 202, .y = 28,  .w = 150, .h = 20,  .id = ID_SLOW,   .text = "Slow",   .group = 1 },
-    { .type = CT_RADIO,  .x = 202, .y = 52,  .w = 150, .h = 20,  .id = ID_NORMAL, .text = "Normal", .group = 1, .value = 1 },
-    { .type = CT_RADIO,  .x = 202, .y = 76,  .w = 150, .h = 20,  .id = ID_TURBO,  .text = "Turbo",  .group = 1 },
-    { .type = CT_LABEL,  .x = 12,  .y = 96,  .text = "Name:" },
-    { .type = CT_EDIT,   .x = 64,  .y = 92,  .w = 116, .h = EDIT_H, .id = ID_NAME, .buf = name_buf, .buflen = 32, .caret = 5 },
-    { .type = CT_LABEL,  .x = 12,  .y = 124, .text = "Colour scheme:" },
-    { .type = CT_LIST,   .x = 12,  .y = 144, .w = 168, .h = 100, .id = ID_LIST,
-      .items = colours, .nitems = 12 },
-    { .type = CT_LABEL,  .x = 192, .y = 124, .text = "Volume:" },
-    { .type = CT_SLIDER, .x = 192, .y = 146, .w = 166, .h = 22,  .id = ID_VOLUME, .min = 0, .max = 100, .value = 40 },
-    { .type = CT_LABEL,  .x = 192, .y = 180, .text = "Progress:" },
-    { .type = CT_PROGRESS, .x = 192, .y = 200, .w = 166, .h = 16, .min = 0, .max = 100, .value = 0 },
-    { .type = CT_HSCROLL, .x = 192, .y = 228, .w = 166, .h = SCROLL_W, .id = ID_SCROLL,
-      .min = 0, .max = 50, .page = 10, .value = 10 },
-    { .type = CT_BUTTON, .x = 196, .y = 262, .w = 76,  .h = BTN_H, .id = ID_OK, .text = "OK", .flags = CF_DEFAULT },
-    { .type = CT_BUTTON, .x = 282, .y = 262, .w = 76,  .h = BTN_H, .id = ID_CANCEL, .text = "Cancel" },
-};
-
-static struct ctl *find(struct window *w, int id)
+static void controls_create(HWND h)
 {
-    for (int i = 0; i < w->nctl; i++)
-        if (w->ctls[i].id == id && w->ctls[i].type != CT_LABEL && w->ctls[i].type != CT_GROUP)
-            return &w->ctls[i];
-    return NULL;
+    child(h, WC_BUTTON, "Options", BS_GROUPBOX, 10, 6, 170, 76, 0);
+    child(h, WC_BUTTON, "Sound effects", BS_AUTOCHECKBOX | WS_TABSTOP, 22, 28, 150, 20, ID_SOUND);
+    child(h, WC_BUTTON, "Show clock", BS_AUTOCHECKBOX | WS_TABSTOP, 22, 52, 150, 20, ID_CLOCK);
+    child(h, WC_BUTTON, "Speed", BS_GROUPBOX, 190, 6, 170, 100, 0);
+    child(h, WC_BUTTON, "Slow", BS_AUTORADIOBUTTON | WS_GROUP | WS_TABSTOP, 202, 28, 150, 20, ID_SLOW);
+    child(h, WC_BUTTON, "Normal", BS_AUTORADIOBUTTON, 202, 52, 150, 20, ID_NORMAL);
+    child(h, WC_BUTTON, "Turbo", BS_AUTORADIOBUTTON, 202, 76, 150, 20, ID_TURBO);
+    child(h, WC_STATIC, "Name:", WS_GROUP, 12, 96, 48, 16, 0);
+    child(h, WC_EDIT, "Hello", WS_TABSTOP, 64 - RING, 92 - RING, 116 + 2 * RING, EDIT_H + 2 * RING, ID_NAME);
+    child(h, WC_STATIC, "Colour scheme:", 0, 12, 124, 168, 16, 0);
+    HWND list = child(h, WC_LISTBOX, "", LBS_NOTIFY | WS_TABSTOP,
+                      12 - RING, 144 - RING, 168 + 2 * RING, 100 + 2 * RING, ID_LIST);
+    child(h, WC_STATIC, "Volume:", 0, 192, 124, 166, 16, 0);
+    HWND vol = child(h, WC_TRACKBAR, "", WS_TABSTOP, 190, 144, 170, 26, ID_VOLUME);
+    child(h, WC_STATIC, "Progress:", 0, 192, 180, 166, 16, 0);
+    child(h, WC_PROGRESS, "", 0, 192, 200, 166, 16, ID_PROGRESS);
+    HWND sb = child(h, WC_SCROLLBAR, "", SBS_HORZ | WS_TABSTOP, 192, 228, 166, 16, ID_SCROLL);
+    child(h, WC_BUTTON, "OK", BS_DEFPUSHBUTTON | WS_TABSTOP,
+          196 - DEF, 262 - DEF, 76 + 2 * DEF, BTN_H + 2 * DEF, IDOK);
+    child(h, WC_BUTTON, "Cancel", WS_TABSTOP, 282, 262, 76, BTN_H, IDCANCEL);
+
+    CheckDlgButton(h, ID_CLOCK, BST_CHECKED);
+    CheckDlgButton(h, ID_NORMAL, BST_CHECKED);
+    for (unsigned i = 0; i < sizeof colours / sizeof colours[0]; i++)
+        SendMessage(list, LB_ADDSTRING, 0, (LPARAM)colours[i]);
+    SendMessage(list, LB_SETCURSEL, 0, 0);
+    SendMessage(vol, TBM_SETRANGE, 0, MAKELPARAM(0, 100));
+    SendMessage(vol, TBM_SETPOS, 1, 40);
+    SendMessage(sb, SBM_SETRANGE, 0, 50);
+    SendMessage(sb, SBM_SETPAGE, 10, 0);
+    SendMessage(sb, SBM_SETPOS, 10, 0);
+    SetTimer(h, ID_TIMER, 55);
 }
 
-static void controls_command(struct window *w, int id)
+static void controls_ok(HWND h)
 {
-    struct ctl *c = find(w, id);
-    switch (id) {
-    case ID_SOUND: case ID_CLOCK:
-        ulog("check %s %s", c->text, c->value ? "on" : "off");
-        break;
-    case ID_SLOW: case ID_NORMAL: case ID_TURBO:
-        ulog("radio %s", c->text);
-        break;
-    case ID_NAME:
-        ulog("edit %s", c->buf);
-        break;
-    case ID_LIST:
-        ulog("list %s", colours[c->value]);
-        break;
-    case ID_VOLUME:
-        ulog("slider %d", c->value);
-        break;
-    case ID_SCROLL:
-        ulog("scroll %d", c->value);
-        break;
-    case ID_OK: {
-        const char *speed = find(w, ID_SLOW)->value ? "Slow" : find(w, ID_TURBO)->value ? "Turbo" : "Normal";
-        ulog("OK: sound=%d clock=%d speed=%s name=%s colour=%s volume=%d",
-             find(w, ID_SOUND)->value, find(w, ID_CLOCK)->value, speed, name_buf,
-             colours[find(w, ID_LIST)->value], find(w, ID_VOLUME)->value);
-        break;
+    char name[64], colour[32];
+    const char *speed = IsDlgButtonChecked(h, ID_SLOW) ? "Slow" :
+                        IsDlgButtonChecked(h, ID_TURBO) ? "Turbo" : "Normal";
+    GetDlgItemText(h, ID_NAME, name, sizeof name);
+    HWND list = GetDlgItem(h, ID_LIST);
+    colour[0] = '\0';
+    SendMessage(list, LB_GETTEXT, (WPARAM)SendMessage(list, LB_GETCURSEL, 0, 0), (LPARAM)colour);
+    DebugLog("OK: sound=%d clock=%d speed=%s name=%s colour=%s volume=%d",
+             IsDlgButtonChecked(h, ID_SOUND), IsDlgButtonChecked(h, ID_CLOCK), speed, name,
+             colour, (int)SendMessage(GetDlgItem(h, ID_VOLUME), TBM_GETPOS, 0, 0));
+}
+
+static LRESULT controls_proc(HWND h, unsigned msg, WPARAM wp, LPARAM lp)
+{
+    switch (msg) {
+    case WM_CREATE:
+        controls_create(h);
+        return 0;
+    case WM_COMMAND: {
+        HWND c = (HWND)lp;
+        char text[32];
+        switch (LOWORD(wp)) {
+        case ID_SOUND: case ID_CLOCK:
+            GetWindowText(c, text, sizeof text);
+            DebugLog("check %s %s", text, SendMessage(c, BM_GETCHECK, 0, 0) ? "on" : "off");
+            break;
+        case ID_SLOW: case ID_NORMAL: case ID_TURBO:
+            GetWindowText(c, text, sizeof text);
+            DebugLog("radio %s", text);
+            break;
+        case ID_LIST:
+            if (HIWORD(wp) == LBN_SELCHANGE) {
+                SendMessage(c, LB_GETTEXT, (WPARAM)SendMessage(c, LB_GETCURSEL, 0, 0), (LPARAM)text);
+                DebugLog("list %s", text);
+            }
+            break;
+        case IDOK:
+            controls_ok(h);
+            break;
+        case IDCANCEL:
+            if (lp)                     /* the button, not the Esc key */
+                DebugLog("button Cancel");
+            break;
+        }
+        return 0;
     }
-    case ID_CANCEL:
-        ulog("button Cancel");
-        break;
+    case WM_HSCROLL: {
+        HWND c = (HWND)lp;
+        int code = LOWORD(wp);
+        if (GetDlgCtrlID(c) == ID_VOLUME) {
+            if (code != TB_ENDTRACK)
+                DebugLog("slider %d", (int)SendMessage(c, TBM_GETPOS, 0, 0));
+            return 0;
+        }
+        int pos = (int)SendMessage(c, SBM_GETPOS, 0, 0);
+        switch (code) {                 /* a scroll bar leaves moving to us */
+        case SB_LINEUP:        pos -= 1; break;
+        case SB_LINEDOWN:      pos += 1; break;
+        case SB_PAGEUP:        pos -= 10; break;
+        case SB_PAGEDOWN:      pos += 10; break;
+        case SB_THUMBTRACK:
+        case SB_THUMBPOSITION: pos = (int16_t)HIWORD(wp); break;
+        default:               return 0;
+        }
+        int old = (int)SendMessage(c, SBM_SETPOS, (WPARAM)pos, 0);
+        pos = (int)SendMessage(c, SBM_GETPOS, 0, 0);
+        if (pos != old)
+            DebugLog("scroll %d", pos);
+        return 0;
     }
+    case WM_TIMER: {                    /* animate the progress bar */
+        HWND p = GetDlgItem(h, ID_PROGRESS);
+        SendMessage(p, PBM_SETPOS, (WPARAM)((SendMessage(p, PBM_GETPOS, 0, 0) + 1) % 101), 0);
+        return 0;
+    }
+    }
+    return DefWindowProc(h, msg, wp, lp);
 }
 
 /* ---- self-test ------------------------------------------------------------ */
 
 static int selftest(const struct user_info *info)
 {
-    sys_print("ring-3 self-test running");
-    uint32_t t0 = sys_ticks();
-    sys_wait_tick();
-    sys_wait_tick();
-    if (sys_ticks() > t0)
-        sys_print("timer ticks advance");
+    OutputDebugString("ring-3 self-test running");
+    uint32_t t0 = GetTickCount();
+    Sleep(110);
+    if (GetTickCount() > t0)
+        OutputDebugString("timer ticks advance");
     if (info->flags & UINFO_TEST_CLI)
         __asm__ volatile("cli");                            /* must #GP */
     if (info->flags & UINFO_TEST_KERNEL)
         *(volatile uint32_t *)0x80000000u = 0;              /* must #PF */
-    sys_print("privileged operation was allowed!");
+    OutputDebugString("privileged operation was allowed!");
     return 1;
 }
 
 /* ---- main ------------------------------------------------------------------- */
 
-int main(struct user_info *info)
+static void register_class(const char *name, WNDPROC proc, uint8_t background)
 {
+    WNDCLASS wc = { .name = name, .proc = proc, .background = background };
+    RegisterClass(&wc);
+}
+
+int main(void)
+{
+    const struct user_info *info = GetStartupInfo();
     if (info->flags & (UINFO_TEST_CLI | UINFO_TEST_KERNEL))
         return selftest(info);
 
-    ui_init(info);
+    InitUI();
+    register_class("Programs", programs_proc, C_FACE);
+    register_class("Controls", controls_proc, C_FACE);
+    register_class("About", about_proc, C_FACE);
 
-    struct window *p = wm_create("Programs", 16, 16, 210, 160, 0);
-    p->ctls = programs_ctls;
-    p->nctl = sizeof programs_ctls / sizeof programs_ctls[0];
-    p->focus = 1;
-    p->on_command = programs_command;
-
+    CreateWindow("Programs", "Programs", FRAMED | WS_VISIBLE, 16, 16, 210, 160, NULL, 0, NULL);
     open_about();
+    HWND controls = CreateWindow("Controls", "Controls", FRAMED | WS_THICKFRAME | WS_VISIBLE,
+                                 246, 40, 380, 330, NULL, 0, NULL);
+    SetFocus(GetDlgItem(controls, ID_NAME));
 
-    struct window *c = wm_create("Controls", 246, 40, 380, 330, WF_RESIZABLE);
-    c->ctls = controls_ctls;
-    c->nctl = sizeof controls_ctls / sizeof controls_ctls[0];
-    c->focus = 8;                                           /* the Name field */
-    c->on_command = controls_command;
-    for (int i = 0; i < c->nctl; i++)
-        if (controls_ctls[i].type == CT_PROGRESS)
-            progress = &controls_ctls[i];
+    MSG msg;
+    PeekMessage(&msg, false);                               /* first paint */
+    OutputDebugString("desktop ready");
+    if (HasMouse())
+        OutputDebugString("mouse ready");
 
-    wm_flush();
-    sys_print("desktop ready");
-    if (sys_mouse())
-        sys_print("mouse ready");
-
-    uint32_t last = sys_ticks();
-    while (!quit) {
-        struct user_event e;
-        if (sys_get_event(&e)) {
-            if (e.type == EV_KEY && e.key == SC_ESC)
-                break;
-            if (e.type == EV_FOCUS)
-                wm_screen(e.key != 0);
-            else if (e.type == EV_KEY)
-                wm_key(e.key);
-            else
-                wm_mouse(e.x, e.y, e.buttons, sys_ticks());
+    while (GetMessage(&msg)) {
+        if (msg.message == WM_KEYDOWN && msg.wParam == VK_ESCAPE) {  /* Esc leaves the GUI */
+            PostQuitMessage(0);
             continue;
         }
-        uint32_t now = sys_ticks();
-        if (now != last && progress) {                      /* animate the progress bar */
-            last = now;
-            progress->value = (progress->value + 1) % 101;
-            if (c->used && c->state != WS_MIN)
-                ui_redraw(c, progress);
-            wm_flush();
+        if (!IsDialogMessage(GetActiveWindow(), &msg)) {
+            TranslateMessage(&msg);
+            DispatchMessage(&msg);
         }
-        sys_wait_tick();
     }
-    return 0;
+    return (int)msg.wParam;
 }

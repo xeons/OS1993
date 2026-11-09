@@ -1,6 +1,6 @@
 ; GFX.DLL -- the 640x480x16 VGA display driver
 LIBRARY GFX.DLL
-BASE    0x10000000
+BASE    0x10100000
 EXPORTS
     gfx_init
     gfx_clip
