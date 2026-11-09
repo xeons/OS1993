@@ -23,3 +23,21 @@ EXPORTS
     ReleaseLock
     GetLocalTime
     SetWaitHooks
+    CreateFile
+    ReadFile
+    WriteFile
+    CloseHandle
+    SetFilePointer
+    GetFileSize
+    DeleteFile
+    MoveFile
+    CreateDirectory
+    RemoveDirectory
+    GetFileAttributes
+    GetCurrentDirectory
+    SetCurrentDirectory
+    FindFirstFile
+    FindNextFile
+    FindClose
+    GetLastError
+    SetLastError

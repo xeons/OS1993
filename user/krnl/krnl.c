@@ -101,3 +101,108 @@ void DebugLog(const char *fmt, ...)
     buf[n] = '\0';
     sys_print(buf);
 }
+
+/* ---- files ------------------------------------------------------------- */
+
+static uint32_t last_error;
+
+uint32_t GetLastError(void)        { return last_error; }
+void     SetLastError(uint32_t e)  { last_error = e; }
+
+/* The VMM does it through DOS, which takes a while: let go of locks. */
+static int file_call(uint32_t op, struct file_args *a)
+{
+    if (before_wait) before_wait();
+    int rc = sys_file(op, a);
+    if (after_wait) after_wait();
+    last_error = rc < 0 ? (uint32_t)-rc : 0;
+    return rc;
+}
+
+HANDLE CreateFile(const char *path, uint32_t access, uint32_t creation)
+{
+    struct file_args a = { .path = path, .a = access, .b = creation };
+    int rc = file_call(FOP_OPEN, &a);
+    return rc < 0 ? INVALID_HANDLE_VALUE : rc;
+}
+
+bool ReadFile(HANDLE h, void *buf, uint32_t n, uint32_t *done)
+{
+    struct file_args a = { .handle = (uint32_t)h, .buf = buf, .len = n };
+    int rc = file_call(FOP_READ, &a);
+    if (done) *done = rc < 0 ? 0 : (uint32_t)rc;
+    return rc >= 0;
+}
+
+bool WriteFile(HANDLE h, const void *buf, uint32_t n, uint32_t *done)
+{
+    struct file_args a = { .handle = (uint32_t)h, .buf = (void *)buf, .len = n };
+    int rc = file_call(FOP_WRITE, &a);
+    if (done) *done = rc < 0 ? 0 : (uint32_t)rc;
+    return rc >= 0;
+}
+
+bool CloseHandle(HANDLE h)
+{
+    struct file_args a = { .handle = (uint32_t)h };
+    return file_call(FOP_CLOSE, &a) >= 0;
+}
+
+uint32_t SetFilePointer(HANDLE h, int32_t distance, int method)
+{
+    struct file_args a = { .handle = (uint32_t)h, .a = (uint32_t)distance, .b = (uint32_t)method };
+    int rc = file_call(FOP_SEEK, &a);
+    return rc < 0 ? INVALID_SET_FILE_POINTER : (uint32_t)rc;
+}
+
+uint32_t GetFileSize(HANDLE h)
+{
+    struct file_args a = { .handle = (uint32_t)h };
+    int rc = file_call(FOP_SIZE, &a);
+    return rc < 0 ? 0xFFFFFFFFu : (uint32_t)rc;
+}
+
+static bool path_op(uint32_t op, const char *path, const char *path2)
+{
+    struct file_args a = { .path = path, .path2 = path2 };
+    return file_call(op, &a) >= 0;
+}
+
+bool DeleteFile(const char *path)                   { return path_op(FOP_DELETE, path, NULL); }
+bool MoveFile(const char *from, const char *to)     { return path_op(FOP_RENAME, from, to); }
+bool CreateDirectory(const char *path)              { return path_op(FOP_MKDIR, path, NULL); }
+bool RemoveDirectory(const char *path)              { return path_op(FOP_RMDIR, path, NULL); }
+bool SetCurrentDirectory(const char *path)          { return path_op(FOP_SETCWD, path, NULL); }
+
+uint32_t GetFileAttributes(const char *path)
+{
+    struct file_args a = { .path = path };
+    int rc = file_call(FOP_ATTRIB, &a);
+    return rc < 0 ? INVALID_FILE_ATTRIBUTES : (uint32_t)rc;
+}
+
+uint32_t GetCurrentDirectory(uint32_t size, char *buf)
+{
+    struct file_args a = { .buf = buf, .len = size };
+    int rc = file_call(FOP_GETCWD, &a);
+    return rc < 0 ? 0 : (uint32_t)rc;
+}
+
+HANDLE FindFirstFile(const char *pattern, WIN32_FIND_DATA *fd)
+{
+    struct file_args a = { .path = pattern, .buf = fd };
+    int rc = file_call(FOP_FIND_FIRST, &a);
+    return rc < 0 ? INVALID_HANDLE_VALUE : rc;
+}
+
+bool FindNextFile(HANDLE h, WIN32_FIND_DATA *fd)
+{
+    struct file_args a = { .handle = (uint32_t)h, .buf = fd };
+    return file_call(FOP_FIND_NEXT, &a) >= 0;
+}
+
+bool FindClose(HANDLE h)
+{
+    struct file_args a = { .handle = (uint32_t)h };
+    return file_call(FOP_FIND_CLOSE, &a) >= 0;
+}

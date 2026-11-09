@@ -26,6 +26,7 @@ are for later stages.
 | `make qemu-emm386` | FreeDOS with JEMM386: the loader must refuse to start       |
 | `make qemu-sessions` | types into two concurrent DOS sessions via QEMU's monitor |
 | `make qemu-absmouse` | absolute pointer through QEMU's VMware port: the cursor lands on the exact pixel, and clicks hit their control |
+| `make qemu-files` | file access: Paint saves, opens and replaces a BMP through the file dialogs, a second process reads it, then the file is checked on the disk image |
 | `make qemu-shell` | the shell and its programs as processes: Start menu by mouse and Ctrl+Esc, desktop icons, Calculator, Paint, Clock, taskbar buttons, Run, Shut Down |
 | `make qemu-msgbox` | keyboard accelerators per window, message boxes: modality, default button, Tab, Yes/No letters, Esc, Alt+F4 |
 | `make qemu-menu` | menu bar, system menu and right-click menus by mouse and keyboard (mnemonics, F10, Alt+Space, keyboard Move) |
@@ -219,6 +220,15 @@ address space, like Win95's 32-bit side.
   input arrives, or a timeout), exec, kill, process liveness, kernel locks
   (handed to the next waiter, released if their owner dies), the RTC time,
   input events, start a DOS session. User pointers are checked.
+- **Files** (`kernel/files.c`). Programs use DOS's files: the console
+  thread makes the INT 21h calls for them (the process waits), copying the
+  data through the V86 transfer buffer. Each process has its own handle
+  table (closed when it ends, however it ends), its own searches, and its
+  own current directory, at first the OS1993 directory. KERNEL.DLL wraps
+  it Win32-style: `CreateFile`, `ReadFile`, `WriteFile`, `SetFilePointer`,
+  `GetFileSize`, `CloseHandle`, `DeleteFile`, `MoveFile`,
+  `Create`/`RemoveDirectory`, `GetFileAttributes`, `Get`/`SetCurrentDirectory`,
+  `FindFirstFile`/`FindNextFile`/`FindClose`, `GetLastError`.
 - **Faults and kills.** An exception in ring 3 ends that process with a log
   line; the others carry on, and UI.DLL drops its windows. A killed process
   ends on its way back to ring 3.
@@ -251,7 +261,7 @@ system DLLs.
 | `KERNEL.DLL` | `1000_0000` | the userland kernel library: wraps the INT 30h system calls (`user/krnl/`) |
 | `GFX.DLL` | `1010_0000` | the VGA display driver (`user/gfx/`)             |
 | `UI.DLL`  | `1020_0000` | windows, messages, painting, controls (`user/ui/`); imports KERNEL, GFX |
-| `SHELL.DLL` | `1030_0000` | the shell API: `ShellExecute`, `ShellAbout`, `Shell_NotifyIcon`, stock icons (`user/shell/`) |
+| `SHELL.DLL` | `1030_0000` | the shell API: `ShellExecute`, `ShellAbout`, `Shell_NotifyIcon`, `GetOpenFileName`/`GetSaveFileName`, stock icons (`user/shell/`) |
 | `*.BIN`   | `0040_0000` | programs (`user/apps/`): SHELL, CALC, PAINT, CLOCK, DEMO |
 
 Programs include one header, `user/lib/os1993.h` (the `windows.h` of
@@ -306,7 +316,14 @@ process that created it, and only that process runs its window procedure.
   digits) with its own division.
 - **PAINT.BIN**: a 400×280 canvas, pencil, brush, eraser, flood fill,
   line, rectangle, filled rectangle and ellipse (rubber-banded), a 16-colour
-  palette (left button foreground, right button background).
+  palette (left button foreground, right button background). Open, Save and
+  Save As (Ctrl+O, Ctrl+S) through the file dialogs: it writes 16-colour
+  BMP files and opens 16- and 256-colour ones (colours mapped to the
+  nearest of the 16); it asks before discarding changes.
+- **The file dialogs** (SHELL.DLL): the folder, a file name field (its
+  text selected, so typing replaces it), and a list of subfolders and
+  matching files; double-click or type a folder name to move, a pattern
+  to filter. Save As asks before replacing a file; Open checks it exists.
 - **CLOCK.BIN**: analog (scales with the window; sine table) or digital
   (seven segments and the date), seconds on or off, from the RTC.
 - **DEMO.BIN**: the Control Demo (Programs, Controls and About windows),
@@ -510,8 +527,9 @@ tools/                   check386.sh, check-test.sh
    message-based window API, menus, accelerators and message boxes, an
    absolute mouse under emulators, processes with their own address spaces
    sharing one window system, and a Windows 95-style shell with
-   Calculator, Paint and Clock. Next: file I/O for programs, combo boxes
-   and tabs, DLL code shared between processes, VESA truecolor.
+   Calculator, Paint and Clock, file access for programs with the Open and
+   Save As dialogs. Next: a text editor (multi-line edit), combo boxes and
+   tabs, DLL code shared between processes, VESA truecolor.
 7. **Win16-style API layer.** 16-bit protected-mode apps in ring 3 with LDTs,
    built with Open Watcom.
 8. **Coexisting with EMM386** through VCPI/GEMMIS, and acting as a DPMI host.

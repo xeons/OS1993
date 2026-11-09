@@ -63,6 +63,8 @@ bool IsDialogMessage(HWND dlg, const MSG *m)
         int dir = GetKeyState(VK_SHIFT) < 0 ? -1 : 1;
         i = i == n ? 0 : (i + dir + n) % n;
         SetFocus(list[i]);
+        if (list[i]->cls->proc == edit_proc)        /* tabbing into a field selects it */
+            SendMessage(list[i], EM_SETSEL, 0, -1);
         return true;
     }
     case VK_RETURN: {

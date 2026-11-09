@@ -44,8 +44,16 @@ LRESULT edit_proc(HWND h, unsigned msg, WPARAM wp, LPARAM lp)
         FrameRect(dc, &k, C_GRAY1);
         FillRect(dc, &in, w->enabled ? C_WHITE : C_FACE);
         int first = first_visible(w);
-        TextOut(dc, x + 5, y + (fh - 16) / 2, w->text + first, w->enabled ? C_BLACK : C_GRAY3, -1);
-        if (focus)
+        bool all = w->pressed && len > 0;               /* everything selected */
+        if (all) {
+            int sw = (len - first) * 8;
+            if (sw > fw - 10) sw = fw - 10;
+            RECT sel = { x + 4, y + (fh - 16) / 2, x + 6 + sw, y + (fh - 16) / 2 + 16 };
+            FillRect(dc, &sel, focus ? C_ACCENT : C_GRAY4);
+        }
+        TextOut(dc, x + 5, y + (fh - 16) / 2, w->text + first,
+                all ? C_WHITE : w->enabled ? C_BLACK : C_GRAY3, -1);
+        if (focus && !all)
             DrawLine(dc, x + 5 + (w->caret - first) * 8, y + 4, fh - 8, true, C_BLACK);
         EndPaint(h, &ps);
         return 0;
@@ -53,7 +61,13 @@ LRESULT edit_proc(HWND h, unsigned msg, WPARAM wp, LPARAM lp)
     case WM_SETTEXT:
         DefWindowProc(h, msg, wp, lp);
         w->caret = (int)strlen(w->text);
+        w->pressed = false;
         return 1;
+    case EM_SETSEL:                                     /* (0, -1): all; (-1, ...): none */
+        w->pressed = (int)wp == 0 && (int)lp == -1;
+        w->caret = (int)strlen(w->text);
+        InvalidateRect(h, NULL);
+        return 0;
     case WM_SETFOCUS:
     case WM_KILLFOCUS:
     case WM_ENABLE:
@@ -61,11 +75,21 @@ LRESULT edit_proc(HWND h, unsigned msg, WPARAM wp, LPARAM lp)
         return 0;
     case WM_LBUTTONDOWN:
         SetFocus(h);
+        w->pressed = false;
         w->caret = clampi(first_visible(w) + (GET_X_LPARAM(lp) - RING - 5 + 4) / 8, 0, len);
         InvalidateRect(h, NULL);
         return 0;
     case WM_CHAR: {
         char ch = (char)wp;
+        if (w->pressed && (ch == 8 || (ch >= 32 && ch < 127))) {   /* typing replaces it */
+            w->pressed = false;
+            w->text[0] = '\0';
+            w->caret = len = 0;
+            if (ch == 8) {
+                changed(w);
+                return 0;
+            }
+        }
         if (ch >= 32 && ch < 127 && len < TEXT_MAX - 1) {
             for (int i = len; i >= w->caret; i--)
                 w->text[i + 1] = w->text[i];
@@ -80,6 +104,16 @@ LRESULT edit_proc(HWND h, unsigned msg, WPARAM wp, LPARAM lp)
         return 0;
     }
     case WM_KEYDOWN:
+        if (w->pressed && (wp == VK_DELETE || wp == VK_LEFT || wp == VK_RIGHT ||
+                           wp == VK_HOME || wp == VK_END)) {
+            w->pressed = false;
+            if (wp == VK_DELETE) {
+                w->text[0] = '\0';
+                w->caret = 0;
+                changed(w);
+                return 0;
+            }
+        }
         switch (wp) {
         case VK_DELETE:
             if (w->caret < len) {

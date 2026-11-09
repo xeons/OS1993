@@ -133,6 +133,19 @@ LRESULT listbox_proc(HWND h, unsigned msg, WPARAM wp, LPARAM lp)
         }
         return 0;
     }
+    case WM_LBUTTONDBLCLK: {
+        int x = GET_X_LPARAM(lp), y = GET_Y_LPARAM(lp);
+        struct sbar s = bar_of(w);
+        int item = w->top + (y - RING - 2) / ITEM_H;
+        if (x < s.x && y >= RING + 2 && item < w->max) {
+            select(w, item, true);
+            if ((w->style & LBS_NOTIFY) && w->parent)
+                SendMessage(w->parent, WM_COMMAND, MAKEWPARAM(w->id, LBN_DBLCLK), (LPARAM)w);
+        } else {
+            SendMessage(h, WM_LBUTTONDOWN, wp, lp);     /* the scroll bar: a click */
+        }
+        return 0;
+    }
     case WM_MOUSEMOVE:
         if (w->tracking && w->part == SB_PART_THUMB) {
             struct sbar s = bar_of(w);

@@ -8,6 +8,7 @@
 #define OS1993_USER_H
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 /* Each process has its own address space below 2 GB; the shared region is
@@ -122,9 +123,57 @@ struct user_event {
 #define SYS_UNLOCK      16              /* EBX = lock */
 #define SYS_TIME        17              /* EBX = struct systime * */
 #define SYS_PROC_EXITS  18              /* -> how many processes have ended so far */
+#define SYS_FILE        19              /* EBX = FOP_*, ECX = struct file_args * -> result, or -error */
 #define WAIT_INFINITE   0xFFFFFFFFu
 #define WAIT_INPUT      1               /* also end the wait when input is pending */
 #define LOCK_MAX        8
+
+/* File access (SYS_FILE). Files are DOS's, reached through the System VM;
+ * values match Win32 where Win32 has them. */
+enum { FOP_OPEN, FOP_READ, FOP_WRITE, FOP_CLOSE, FOP_SEEK, FOP_SIZE, FOP_DELETE,
+       FOP_RENAME, FOP_MKDIR, FOP_RMDIR, FOP_ATTRIB, FOP_GETCWD, FOP_SETCWD,
+       FOP_FIND_FIRST, FOP_FIND_NEXT, FOP_FIND_CLOSE };
+
+struct file_args {
+    const char *path, *path2;           /* OPEN, DELETE, RENAME, ..., FIND_FIRST */
+    uint32_t    handle;                 /* READ, WRITE, CLOSE, SEEK, SIZE, FIND_* */
+    void       *buf;                    /* READ, WRITE, GETCWD, FIND_* (struct find_data) */
+    uint32_t    len;
+    uint32_t    a, b;                   /* OPEN: access, creation; SEEK: offset, method */
+};
+
+struct find_data {                      /* a directory entry (FIND_FIRST/NEXT) */
+    uint32_t attrib;                    /* FILE_ATTRIBUTE_* (DOS attributes) */
+    uint32_t size;
+    uint16_t time, date;                /* DOS format */
+    char     name[13];                  /* 8.3 */
+};
+
+#define GENERIC_READ        0x80000000u
+#define GENERIC_WRITE       0x40000000u
+#define CREATE_NEW          1
+#define CREATE_ALWAYS       2
+#define OPEN_EXISTING       3
+#define OPEN_ALWAYS         4
+#define TRUNCATE_EXISTING   5
+#define FILE_BEGIN          0
+#define FILE_CURRENT        1
+#define FILE_END            2
+#define FILE_ATTRIBUTE_READONLY  0x01
+#define FILE_ATTRIBUTE_HIDDEN    0x02
+#define FILE_ATTRIBUTE_SYSTEM    0x04
+#define FILE_ATTRIBUTE_DIRECTORY 0x10
+#define FILE_ATTRIBUTE_ARCHIVE   0x20
+#define ERROR_FILE_NOT_FOUND     2
+#define ERROR_PATH_NOT_FOUND     3
+#define ERROR_TOO_MANY_OPEN_FILES 4
+#define ERROR_ACCESS_DENIED      5
+#define ERROR_INVALID_HANDLE     6
+#define ERROR_NO_MORE_FILES      18
+#define ERROR_FILE_EXISTS        80
+#define ERROR_INVALID_PARAMETER  87
+#define ERROR_INVALID_NAME       123
+#define ERROR_NOACCESS           998     /* a bad user pointer */
 
 #ifndef USER_SIDE                       /* kernel only */
 struct regs;
@@ -132,6 +181,8 @@ void syscall_dispatch(struct regs *r);
 void user_fault(struct regs *r);
 
 void user_return(struct regs *r);       /* about to return to ring 3 */
+bool user_range_ok(uint32_t p, uint32_t len);       /* mapped user memory? */
+bool user_string(uint32_t p, char *out, size_t size);  /* copy in a string */
 struct process;
 void proc_switch(struct process *p);    /* scheduler: install its address space */
 

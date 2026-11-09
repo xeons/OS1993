@@ -7,3 +7,5 @@ EXPORTS
     Shell_NotifyIcon
     DrawIcon
     DrawSmallIcon
+    GetOpenFileName
+    GetSaveFileName

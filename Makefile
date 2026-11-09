@@ -15,6 +15,7 @@
 #   make qemu-menu  menu bar, system menu and context menus (mouse, keys)
 #   make qemu-msgbox  keyboard accelerators and message boxes
 #   make qemu-shell the shell and its programs, each a process
+#   make qemu-files file access: Paint's Open/Save, the file dialogs, the disk
 #   make clean
 
 CC      := i686-elf-gcc
@@ -59,7 +60,7 @@ UI_SRC    := wnd queue input frame paint menu accel msgbox dialog button static 
              scroll trackbar kbd theme
 UI_OBJ    := $(U)/hdr/UI.DLL.o $(patsubst %,$(U)/ui/%.o,$(UI_SRC)) \
              $(U)/gen/ui_exports.o $(U)/gen/gfx_imports.o $(U)/gen/krnl_imports.o $(U)/lib/lib.o
-SHELL_OBJ := $(U)/hdr/SHELL.DLL.o $(U)/shell/shell.o $(U)/shell/icons.o $(U)/gen/shell_exports.o \
+SHELL_OBJ := $(U)/hdr/SHELL.DLL.o $(U)/shell/shell.o $(U)/shell/icons.o $(U)/shell/filedlg.o $(U)/gen/shell_exports.o \
              $(U)/gen/ui_imports.o $(U)/gen/krnl_imports.o $(U)/lib/lib.o
 
 # Programs: user/apps/<name>.c, each a process of its own
@@ -79,7 +80,7 @@ KERNEL_ASM := $(wildcard kernel/*.asm)
 KERNEL_OBJ := $(patsubst kernel/%.asm,$(BUILD)/kernel/%.o,$(KERNEL_ASM)) \
               $(patsubst kernel/%.c,$(BUILD)/kernel/%.o,$(KERNEL_C))
 
-.PHONY: all run test check386 qemu qemu-test qemu-emm386 qemu-sessions qemu-vga qemu-wm qemu-absmouse qemu-menu qemu-msgbox qemu-shell clean
+.PHONY: all run test check386 qemu qemu-test qemu-emm386 qemu-sessions qemu-vga qemu-wm qemu-absmouse qemu-menu qemu-msgbox qemu-shell qemu-files clean
 
 all: $(BUILD)/OS1993.COM $(BUILD)/VMM.BIN $(MODULES)
 
@@ -220,6 +221,9 @@ qemu-msgbox: all
 
 qemu-shell: all
 	@tools/qemu-shell-test.py
+
+qemu-files: all
+	@tools/qemu-files-test.py
 
 check386: $(BUILD)/vmm.elf $(MODULE_ELFS)
 	@for f in $^; do tools/check386.sh $(OBJDUMP) $$f || exit 1; done

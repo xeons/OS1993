@@ -25,8 +25,10 @@ README.md for what already works.
       vertical banner, taskbar button right-click (the window's system
       menu), tooltips for tray icons, a task list (Ctrl+Alt+Del) that can
       end a hung program (SYS_KILL exists).
-- [ ] Programs: Paint and the others can't save or open files yet (no
-      file I/O for ring 3); Calculator scientific view; a Notepad.
+- [ ] Programs: a Notepad (needs a multi-line edit control); Calculator
+      scientific view; Paint: cut/copy/paste, zoom, a canvas size setting.
+- [ ] File dialogs: a drive list, long file names (FreeDOS has no LFN
+      here), a file type list.
 - [ ] Layout: controls don't reflow when a window is resized (programs can
       do it themselves now on `WM_SIZE` with `MoveWindow`).
 - [ ] Dialog templates (`CreateDialog` from a table) and modal loops.
@@ -48,8 +50,11 @@ README.md for what already works.
 - [ ] DLL initialization / termination entry points (DllMain-style).
 - [ ] Import by ordinal; versioning; a loader error shown in the GUI
       instead of only the debug log.
-- [ ] File I/O system calls for ring-3 programs (through DOS in the
-      System VM, behind an `fs_*` interface).
+- [ ] File I/O goes through one request queue to the console thread, one
+      operation at a time: a native FAT driver (or several DOS calls in
+      flight) would let processes do I/O in parallel.
+- [ ] All processes' files share the System VM's PSP handle table (raised
+      to 40 with INT 21h 67h); FILES= in CONFIG.SYS bounds them.
 - [ ] Memory allocation system calls (a user heap).
 - [ ] IPC: done -- per-process queues, cross-process SendMessage and
       WM_COPYDATA, wait/wake and kernel locks. Still to do: named shared

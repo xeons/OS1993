@@ -136,7 +136,7 @@ void ui_init_classes(void)
     builtin(WC_BUTTON, button_proc, false);
     builtin(WC_STATIC, static_proc, true);
     builtin(WC_EDIT, edit_proc, false);
-    builtin(WC_LISTBOX, listbox_proc, false);
+    builtin(WC_LISTBOX, listbox_proc, false)->style |= CS_DBLCLKS;
     builtin(WC_SCROLLBAR, scrollbar_proc, false);
     builtin(WC_TRACKBAR, trackbar_proc, false);
     builtin(WC_PROGRESS, progress_proc, true);

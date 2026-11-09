@@ -22,6 +22,7 @@
  */
 #include "kernel.h"
 #include "devices.h"
+#include "files.h"
 #include "gdt.h"
 #include "interrupts.h"
 #include "io.h"
@@ -61,6 +62,7 @@ struct process {
     bool           wait_input;              /* ... and input ends it */
     uint32_t       deadline;                /* tick to give up waiting, 0: never */
     int            lock_wait;               /* lock it waits for, -1 none */
+    struct proc_files files;                /* open files, current directory */
 };
 
 void user_enter(uint32_t eip, uint32_t esp, uint32_t ebx);  /* entry.asm */
@@ -82,12 +84,19 @@ static struct {
     int            lock_owner[LOCK_MAX];    /* pid, 0 = free */
 } u = { .focus_event = -1 };
 
-static struct {                             /* one exec request at a time */
+/* Work only the console thread can do (it owns the System VM's DOS):
+ * starting programs and file access. One request at a time. */
+enum { REQ_EXEC, REQ_FILE };
+static struct {
     volatile bool  pending;
-    char           name[16];
+    int            kind;
+    char           name[16];                /* REQ_EXEC */
     char           args[ARGS_MAX];
+    struct process *proc;                   /* REQ_FILE */
+    uint32_t       op;
+    struct file_args fa;
     struct thread *waiter;
-    int            pid;
+    int            result;                  /* pid, or the file operation's */
 } req;
 
 static void strncpy0(char *d, const char *s, size_t size)
@@ -193,7 +202,7 @@ static void shared_destroy(void)                /* the last process is installed
 }
 
 /* Is [p, p+len) ordinary mapped user memory? */
-static bool user_range_ok(uint32_t p, uint32_t len)
+bool user_range_ok(uint32_t p, uint32_t len)
 {
     if (p < USER_BASE || p >= USER_LIMIT || len > USER_LIMIT - p)
         return false;
@@ -203,7 +212,7 @@ static bool user_range_ok(uint32_t p, uint32_t len)
     return true;
 }
 
-static bool user_string(uint32_t p, char *out, size_t size)
+bool user_string(uint32_t p, char *out, size_t size)
 {
     for (size_t n = 0; n < size; n++) {
         if (!user_range_ok(p + n, 1))
@@ -474,6 +483,12 @@ static int spawn(const char *name, const char *args)
             info->arena_size = USER_ARENA_SIZE;
         }
         strncpy0(info->name, name, sizeof info->name);
+        char dir[128];                              /* the OS1993 directory */
+        program_path("", dir, sizeof dir);
+        size_t dn = strlen(dir);
+        if (dn > 3 && dir[dn - 1] == '\\')
+            dir[dn - 1] = '\0';
+        files_init(&p->files, dir);
         strncpy0(info->args, args ? args : "", sizeof info->args);
         strncpy0(p->name, name, sizeof p->name);
         for (char *c = p->name; *c; c++)            /* DOS names: upper case */
@@ -559,6 +574,7 @@ void user_service(void)
         thread_reap(p->thread);
         current->proc = p;                          /* free its pages */
         proc_switch(p);
+        files_close_all(&p->files);
         release_address_space(p);
         bool last = true;
         for (int k = 0; k < PROC_MAX; k++)
@@ -584,9 +600,18 @@ void user_service(void)
     irq_restore(f);
 
     if (req.pending) {
-        int pid = u.running ? spawn(req.name, req.args) : -1;
+        int result;
+        if (req.kind == REQ_EXEC) {
+            result = u.running ? spawn(req.name, req.args) : -1;
+        } else {                                    /* in the process's address space */
+            struct process *was = current->proc;
+            current->proc = req.proc;
+            proc_switch(req.proc);
+            result = file_op(&req.proc->files, req.op, &req.fa);
+            current->proc = was;
+        }
         f = irq_save();
-        req.pid = pid;
+        req.result = result;
         req.pending = false;
         thread_wake(req.waiter);
         irq_restore(f);
@@ -849,9 +874,9 @@ void syscall_dispatch(struct regs *r)
         }
         if (!r->ecx)
             args[0] = '\0';
-        while (req.pending) {                       /* one request at a time */
+        while (req.pending)                         /* one request at a time */
             schedule();
-        }
+        req.kind = REQ_EXEC;
         memcpy(req.name, name, sizeof name);
         memcpy(req.args, args, sizeof args);
         req.waiter = current;
@@ -860,7 +885,29 @@ void syscall_dispatch(struct regs *r)
             current->state = T_BLOCKED;
             schedule();
         }
-        r->eax = (uint32_t)req.pid;
+        r->eax = (uint32_t)req.result;
+        break;
+    }
+    case SYS_FILE: {
+        struct file_args fa;
+        if (!user_range_ok(r->ecx, sizeof fa)) {
+            r->eax = (uint32_t)-ERROR_NOACCESS;
+            break;
+        }
+        memcpy(&fa, (const void *)(uintptr_t)r->ecx, sizeof fa);
+        while (req.pending)
+            schedule();
+        req.kind = REQ_FILE;
+        req.proc = self;
+        req.op = r->ebx;
+        req.fa = fa;
+        req.waiter = current;
+        req.pending = true;
+        while (req.pending) {                       /* the console calls DOS */
+            current->state = T_BLOCKED;
+            schedule();
+        }
+        r->eax = (uint32_t)req.result;
         break;
     }
     case SYS_TIME: {

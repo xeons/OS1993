@@ -6,7 +6,9 @@
  * the left button paints in the foreground colour, the right button in the
  * background colour (and picks it on the palette). Shapes rubber-band while
  * the button is held. The picture lives in the process's own memory, one
- * byte per pixel, and reaches the screen through DrawPixels.
+ * byte per pixel, and reaches the screen through DrawPixels. Pictures are
+ * saved as 16-colour BMP files and 16- or 256-colour BMPs can be opened
+ * (their colours mapped to the nearest of the 16).
  */
 #include "os1993.h"
 
@@ -19,7 +21,7 @@
 #define PAL_Y   (CY + CH + 8)
 
 enum { T_PENCIL, T_BRUSH, T_ERASER, T_FILL, T_LINE, T_RECT, T_FRECT, T_ELLIPSE, T_COUNT };
-enum { ID_NEW = 100, ID_EXIT, ID_CLEAR, ID_ABOUT };
+enum { ID_NEW = 100, ID_EXIT, ID_CLEAR, ID_ABOUT, ID_OPEN, ID_SAVE, ID_SAVEAS };
 
 static const char *const tool_names[T_COUNT] = {
     "pencil", "brush", "eraser", "fill", "line", "rectangle", "filled rectangle", "ellipse",
@@ -151,11 +153,200 @@ static void flood(int x, int y, uint8_t c)              /* scanline fill */
     }
 }
 
+static bool dirty;                      /* changed since it was saved */
+static char file_path[128];             /* "" while untitled */
+
 static void clear_canvas(void)
 {
     memset(canvas, C_WHITE, sizeof canvas);
     RECT r = { CX, CY, CX + CW, CY + CH };
     InvalidateRect(paint_wnd, &r);
+}
+
+/* ---- BMP files ------------------------------------------------------------------ */
+
+/* The theme's colours (6-bit DAC values, as UI.DLL loads them) */
+static const uint8_t theme[16][3] = {
+    {  0,  0,  0 }, { 13, 13, 13 }, { 21, 21, 21 }, { 30, 30, 30 }, { 38, 38, 38 }, { 46, 46, 46 },
+    { 55, 55, 55 }, { 59, 59, 59 }, { 63, 63, 63 }, { 26, 26, 50 }, { 50, 50, 63 }, { 17, 30, 40 },
+    { 52,  8,  8 }, {  8, 40, 12 }, { 63, 56, 16 }, { 16, 16, 40 },
+};
+
+#define BMP_HEADER 118                  /* file and info headers, 16 palette entries */
+#define ROW4       ((CW * 4 + 31) / 32 * 4)
+static uint8_t file_buf[1078 + CW * CH + 1024];     /* big enough for 256 colours */
+
+static void put16(uint8_t *p, uint32_t v) { p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); }
+static void put32(uint8_t *p, uint32_t v) { put16(p, v); put16(p + 2, v >> 16); }
+static uint32_t get16(const uint8_t *p) { return (uint32_t)p[0] | (uint32_t)p[1] << 8; }
+static uint32_t get32(const uint8_t *p) { return get16(p) | get16(p + 2) << 16; }
+
+static const char *base_name(const char *path)
+{
+    const char *b = path;
+    for (; *path; path++)
+        if (*path == '\\' || *path == ':') b = path + 1;
+    return b;
+}
+
+static void set_title(void)
+{
+    char title[64];
+    strncpy0(title, file_path[0] ? base_name(file_path) : "untitled", sizeof title);
+    strncpy0(title + strlen(title), " - Paint", sizeof title - strlen(title));
+    SetWindowText(paint_wnd, title);
+}
+
+static void error_box(const char *what, const char *path)
+{
+    char text[160];
+    strncpy0(text, what, sizeof text);
+    strncpy0(text + strlen(text), path, sizeof text - strlen(text));
+    MessageBox(paint_wnd, text, "Paint", MB_OK | MB_ICONERROR);
+}
+
+static bool save(const char *path)
+{
+    uint32_t size = BMP_HEADER + ROW4 * CH;
+    memset(file_buf, 0, BMP_HEADER);
+    file_buf[0] = 'B'; file_buf[1] = 'M';
+    put32(file_buf + 2, size);
+    put32(file_buf + 10, BMP_HEADER);
+    put32(file_buf + 14, 40);                           /* BITMAPINFOHEADER */
+    put32(file_buf + 18, CW);
+    put32(file_buf + 22, CH);
+    put16(file_buf + 26, 1);
+    put16(file_buf + 28, 4);
+    put32(file_buf + 34, ROW4 * CH);
+    put32(file_buf + 38, 2835);                         /* 72 dpi */
+    put32(file_buf + 42, 2835);
+    put32(file_buf + 46, 16);
+    put32(file_buf + 50, 16);
+    for (int i = 0; i < 16; i++) {                      /* B, G, R, 0 */
+        uint8_t *q = file_buf + 54 + i * 4;
+        q[0] = (uint8_t)(theme[i][2] * 255 / 63);
+        q[1] = (uint8_t)(theme[i][1] * 255 / 63);
+        q[2] = (uint8_t)(theme[i][0] * 255 / 63);
+    }
+    for (int y = 0; y < CH; y++) {                      /* bottom row first */
+        uint8_t *row = file_buf + BMP_HEADER + (CH - 1 - y) * ROW4;
+        for (int x = 0; x < CW; x += 2)
+            row[x / 2] = (uint8_t)(canvas[y * CW + x] << 4 | canvas[y * CW + x + 1]);
+    }
+    HANDLE f = CreateFile(path, GENERIC_WRITE, CREATE_ALWAYS);
+    uint32_t done = 0;
+    bool ok = f != INVALID_HANDLE_VALUE && WriteFile(f, file_buf, size, &done) && done == size;
+    if (f != INVALID_HANDLE_VALUE)
+        CloseHandle(f);
+    if (!ok) {
+        DebugLog("paint could not save %s (error %d)", path, (int)GetLastError());
+        error_box("Could not save ", path);
+        return false;
+    }
+    strncpy0(file_path, path, sizeof file_path);
+    dirty = false;
+    set_title();
+    DebugLog("paint saved %s", path);
+    return true;
+}
+
+static uint8_t nearest(const uint8_t *bgr)              /* the closest theme colour */
+{
+    int best = 0;
+    int32_t best_d = 0x7FFFFFFF;
+    for (int i = 0; i < 16; i++) {
+        int32_t d = 0;
+        for (int c = 0; c < 3; c++) {
+            int32_t diff = (int32_t)bgr[2 - c] - theme[i][c] * 255 / 63;
+            d += diff * diff;
+        }
+        if (d < best_d) { best_d = d; best = i; }
+    }
+    return (uint8_t)best;
+}
+
+static bool open_bmp(const char *path)
+{
+    HANDLE f = CreateFile(path, GENERIC_READ, OPEN_EXISTING);
+    if (f == INVALID_HANDLE_VALUE) {
+        error_box("Cannot open ", path);
+        return false;
+    }
+    uint32_t size = GetFileSize(f), got = 0;
+    bool ok = size >= 54 && size <= sizeof file_buf && ReadFile(f, file_buf, size, &got) && got == size;
+    CloseHandle(f);
+    int32_t w = 0, h = 0;
+    uint32_t bpp = 0, off = 0, colours = 0;
+    if (ok) {
+        w = (int32_t)get32(file_buf + 18);
+        h = (int32_t)get32(file_buf + 22);
+        bpp = get16(file_buf + 28);
+        off = get32(file_buf + 10);
+        colours = get32(file_buf + 46);
+        if (!colours) colours = 1u << bpp;
+        ok = file_buf[0] == 'B' && file_buf[1] == 'M' && get32(file_buf + 30) == 0 &&
+             (bpp == 4 || bpp == 8) && w > 0 && w <= CW && h != 0 && (h < 0 ? -h : h) <= CH &&
+             colours <= (1u << bpp) && 54 + colours * 4 <= off;
+    }
+    uint32_t stride = ((uint32_t)w * bpp + 31) / 32 * 4;
+    int rows = h < 0 ? -h : h;
+    if (ok && off + stride * (uint32_t)rows > size)
+        ok = false;
+    if (!ok) {
+        error_box("Paint can open 16- and 256-colour BMP files up to 400x280.\n", path);
+        return false;
+    }
+    uint8_t map[256];
+    for (uint32_t i = 0; i < colours; i++)
+        map[i] = nearest(file_buf + 14 + get32(file_buf + 14) + i * 4);
+    memset(canvas, C_WHITE, sizeof canvas);
+    for (int y = 0; y < rows; y++) {
+        const uint8_t *row = file_buf + off + (uint32_t)(h < 0 ? y : rows - 1 - y) * stride;
+        for (int x = 0; x < w; x++) {
+            uint32_t v = bpp == 8 ? row[x] : (x & 1 ? row[x / 2] & 15 : row[x / 2] >> 4);
+            canvas[y * CW + x] = v < colours ? map[v] : C_WHITE;
+        }
+    }
+    strncpy0(file_path, path, sizeof file_path);
+    dirty = false;
+    set_title();
+    RECT r = { CX, CY, CX + CW, CY + CH };
+    InvalidateRect(paint_wnd, &r);
+    DebugLog("paint opened %s (%dx%d)", path, (int)w, rows);
+    return true;
+}
+
+static bool save_as(void)
+{
+    char path[128];
+    strncpy0(path, file_path[0] ? file_path : "untitled.bmp", sizeof path);
+    OPENFILENAME ofn = { paint_wnd, "*.BMP", path, sizeof path, NULL, "BMP", OFN_OVERWRITEPROMPT };
+    return GetSaveFileName(&ofn) && save(path);
+}
+
+static bool save_current(void) { return file_path[0] ? save(file_path) : save_as(); }
+
+/* Unsaved changes: save, discard, or (false) cancel what was asked for. */
+static bool may_discard(void)
+{
+    if (!dirty)
+        return true;
+    char text[96] = "Save changes to ";
+    strncpy0(text + strlen(text), file_path[0] ? base_name(file_path) : "untitled",
+             sizeof text - strlen(text));
+    strncpy0(text + strlen(text), "?", sizeof text - strlen(text));
+    int r = MessageBox(paint_wnd, text, "Paint", MB_YESNOCANCEL | MB_ICONWARNING);
+    return r == IDNO || (r == IDYES && save_current());
+}
+
+static void open_file(void)
+{
+    if (!may_discard())
+        return;
+    char path[128] = "";
+    OPENFILENAME ofn = { paint_wnd, "*.BMP", path, sizeof path, NULL, "BMP", OFN_FILEMUSTEXIST };
+    if (GetOpenFileName(&ofn))
+        open_bmp(path);
 }
 
 /* ---- the window ------------------------------------------------------------------ */
@@ -218,6 +409,7 @@ static void canvas_point(LPARAM lp, int *x, int *y)
 
 static void stroke_to(int x, int y)
 {
+    dirty = true;
     int size = tool == T_BRUSH ? 3 : tool == T_ERASER ? 8 : 1;
     line(lx, ly, x, y, ink, size);
     RECT r = norm(lx, ly, x, y);
@@ -257,6 +449,7 @@ static void begin(HWND h, LPARAM lp, bool right)
     ly = sy;
     ink = tool == T_ERASER ? bg : right ? bg : fg;
     if (tool == T_FILL) {
+        dirty = true;
         flood(sx, sy, ink);
         DebugLog("paint fill at %d,%d", sx, sy);
         InvalidateRect(h, &canvas_r);
@@ -275,6 +468,8 @@ static void end(void)
     drawing = false;
     ReleaseCapture();
     RECT r = norm(sx, sy, lx, ly);
+    if (is_shape(tool))
+        dirty = true;
     switch (tool) {
     case T_LINE:    line(sx, sy, lx, ly, ink, 1); break;
     case T_RECT:    rect(r, ink, false); break;
@@ -315,13 +510,25 @@ static LRESULT paint_proc(HWND h, unsigned msg, WPARAM wp, LPARAM lp)
     case WM_COMMAND:
         switch (LOWORD(wp)) {
         case ID_NEW:
-        case ID_CLEAR: clear_canvas(); DebugLog("paint cleared"); break;
-        case ID_EXIT:  PostQuitMessage(0); break;
+            if (may_discard()) {
+                clear_canvas();
+                file_path[0] = '\0';
+                dirty = false;
+                set_title();
+                DebugLog("paint new");
+            }
+            break;
+        case ID_CLEAR:  clear_canvas(); dirty = true; DebugLog("paint cleared"); break;
+        case ID_OPEN:   open_file(); break;
+        case ID_SAVE:   save_current(); break;
+        case ID_SAVEAS: save_as(); break;
+        case ID_EXIT:   SendMessage(h, WM_CLOSE, 0, 0); break;
         case ID_ABOUT: ShellAbout(h, "Paint", NULL); break;
         }
         return 0;
     case WM_CLOSE:
-        PostQuitMessage(0);
+        if (may_discard())
+            PostQuitMessage(0);
         return 0;
     }
     return DefWindowProc(h, msg, wp, lp);
@@ -335,6 +542,9 @@ int main(void)
     RegisterClass(&wc);
     HMENU file = CreatePopupMenu(), image = CreatePopupMenu(), help = CreatePopupMenu(), bar = CreateMenu();
     AppendMenu(file, MF_STRING, ID_NEW, "&New\tCtrl+N");
+    AppendMenu(file, MF_STRING, ID_OPEN, "&Open...\tCtrl+O");
+    AppendMenu(file, MF_STRING, ID_SAVE, "&Save\tCtrl+S");
+    AppendMenu(file, MF_STRING, ID_SAVEAS, "Save &As...");
     AppendMenu(file, MF_SEPARATOR, 0, NULL);
     AppendMenu(file, MF_STRING, ID_EXIT, "E&xit");
     AppendMenu(image, MF_STRING, ID_CLEAR, "&Clear Image");
@@ -346,8 +556,13 @@ int main(void)
                              CX + CW + 8 + 10, PAL_Y + 2 * SWATCH + 10 + 25 + 21 + 5, NULL, 0, NULL);
     SetMenu(paint_wnd, bar);
     ShowWindow(paint_wnd, SW_SHOW);
-    static const ACCEL keys[] = { { FVIRTKEY | FCONTROL, 'N', ID_NEW } };
-    HACCEL acc = CreateAcceleratorTable(keys, 1);
+    static const ACCEL keys[] = { { FVIRTKEY | FCONTROL, 'N', ID_NEW },
+                                  { FVIRTKEY | FCONTROL, 'O', ID_OPEN },
+                                  { FVIRTKEY | FCONTROL, 'S', ID_SAVE } };
+    HACCEL acc = CreateAcceleratorTable(keys, 3);
+    const char *arg = GetStartupInfo()->args;           /* PAINT.BIN picture.bmp */
+    if (arg[0])
+        open_bmp(arg);
     DebugLog("paint ready");
 
     MSG msg;

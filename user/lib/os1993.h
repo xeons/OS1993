@@ -50,6 +50,34 @@ bool     AcquireLock(int n);                    /* 0-7; 0 is UI.DLL's */
 bool     ReleaseLock(int n);
 void     SetWaitHooks(void (*before)(void), void (*after)(void));
 
+/* Files: DOS's (FAT, 8.3 names), reached through the VMM. Relative paths
+ * start from the process's current directory, at first the OS1993
+ * directory. Calls that fail return FALSE / INVALID_HANDLE_VALUE / ~0 and
+ * leave the reason (ERROR_*) for GetLastError. */
+typedef int HANDLE;
+typedef struct find_data WIN32_FIND_DATA;
+#define INVALID_HANDLE_VALUE    (-1)
+#define INVALID_FILE_ATTRIBUTES 0xFFFFFFFFu
+#define INVALID_SET_FILE_POINTER 0xFFFFFFFFu
+HANDLE   CreateFile(const char *path, uint32_t access, uint32_t creation);  /* GENERIC_*, CREATE_* ... */
+bool     ReadFile(HANDLE h, void *buf, uint32_t n, uint32_t *done);
+bool     WriteFile(HANDLE h, const void *buf, uint32_t n, uint32_t *done);
+bool     CloseHandle(HANDLE h);
+uint32_t SetFilePointer(HANDLE h, int32_t distance, int method);    /* FILE_BEGIN ... */
+uint32_t GetFileSize(HANDLE h);
+bool     DeleteFile(const char *path);
+bool     MoveFile(const char *from, const char *to);
+bool     CreateDirectory(const char *path);
+bool     RemoveDirectory(const char *path);
+uint32_t GetFileAttributes(const char *path);
+uint32_t GetCurrentDirectory(uint32_t size, char *buf);
+bool     SetCurrentDirectory(const char *path);
+HANDLE   FindFirstFile(const char *pattern, WIN32_FIND_DATA *fd);     /* "*.BMP" */
+bool     FindNextFile(HANDLE h, WIN32_FIND_DATA *fd);
+bool     FindClose(HANDLE h);
+uint32_t GetLastError(void);
+void     SetLastError(uint32_t error);
+
 /* Raw input, for UI.DLL */
 bool     GetInputEvent(struct user_event *e);
 void     WaitForInput(void);                    /* sleep until input or a tick */
@@ -259,6 +287,7 @@ enum {
 #define BST_CHECKED         1
 
 /* Edit */
+#define EM_SETSEL           0x00B1  /* (0, -1) selects all the text */
 #define EN_CHANGE           0x0300
 
 /* List box */
@@ -270,6 +299,7 @@ enum {
 #define LB_GETTEXT          0x0189
 #define LB_GETCOUNT         0x018B
 #define LBN_SELCHANGE       1
+#define LBN_DBLCLK          2
 #define LB_ERR              (-1)
 
 /* Scroll bar */
@@ -443,6 +473,21 @@ bool    Shell_NotifyIcon(unsigned msg, const NOTIFYICONDATA *data);
 enum { ICON_NONE, ICON_APP, ICON_CALC, ICON_PAINT, ICON_CLOCK, ICON_DEMO, ICON_DOS,
        ICON_COMPUTER, ICON_INFO, ICON_SHUTDOWN, ICON_COUNT };
 void    DrawIcon(HDC dc, int x, int y, int icon);
+
+/* The Open and Save As dialogs */
+#define OFN_OVERWRITEPROMPT 0x0002      /* Save: ask before replacing a file */
+#define OFN_FILEMUSTEXIST   0x1000      /* Open: the file must exist */
+typedef struct {
+    HWND        owner;
+    const char *filter;                 /* the files listed: "*.BMP" */
+    char       *file;                   /* in: a name to start with; out: the full path */
+    uint32_t    max;
+    const char *title;                  /* NULL: "Open" / "Save As" */
+    const char *defext;                 /* "BMP": added to a name without one */
+    uint32_t    flags;
+} OPENFILENAME;
+bool    GetOpenFileName(OPENFILENAME *ofn);
+bool    GetSaveFileName(OPENFILENAME *ofn);
 void    DrawSmallIcon(HDC dc, int x, int y, int icon);
 
 /* Menus. Item text marks its mnemonic with '&' and may carry a
