@@ -6,19 +6,19 @@
  * colour goes in Set/Reset (enabled for all planes), the Bit Mask selects
  * which pixels of a byte change, and a dummy read first loads the latches
  * so the other pixels keep their colours. One CPU write then updates all
- * four planes at once.
+ * four planes at once. Function Select = XOR turns the same path into an
+ * inverter (cursor, drag outlines).
  */
 #include "gfx.h"
 #include "io.h"
 
 static inline void gc(uint8_t i, uint8_t v) { outb(0x3CE, i); outb(0x3CF, v); }
 
-/* Put the hardware into our drawing setup; undone by end(). */
-static void begin(uint8_t color)
+static void begin(uint8_t color, uint8_t function)
 {
     outb(0x3C4, 2); outb(0x3C5, 0x0F);  /* write all planes */
     gc(5, 0x00);                        /* write mode 0 */
-    gc(3, 0x00);                        /* replace, no rotate */
+    gc(3, function);                    /* 0x00 replace, 0x18 XOR */
     gc(1, 0x0F);                        /* Set/Reset drives all planes */
     gc(0, color);
 }
@@ -26,6 +26,7 @@ static void begin(uint8_t color)
 static void end(void)
 {
     gc(1, 0x00);
+    gc(3, 0x00);
     gc(8, 0xFF);
 }
 
@@ -43,26 +44,72 @@ void gfx_init(struct gfx *g, volatile uint8_t *fb, const uint8_t *font8x16)
     g->height = 480;
     g->stride = 80;
     g->font = font8x16;
+    gfx_noclip(g);
 }
 
-static int clip(struct gfx *g, int *x, int *y, int *w, int *h)
+void gfx_noclip(struct gfx *g)
 {
-    if (*x < 0) { *w += *x; *x = 0; }
-    if (*y < 0) { *h += *y; *y = 0; }
-    if (*x + *w > g->width)  *w = g->width - *x;
-    if (*y + *h > g->height) *h = g->height - *y;
+    g->cx0 = 0;
+    g->cy0 = 0;
+    g->cx1 = g->width;
+    g->cy1 = g->height;
+}
+
+void gfx_clip(struct gfx *g, int x, int y, int w, int h)
+{
+    g->cx0 = x < 0 ? 0 : x;
+    g->cy0 = y < 0 ? 0 : y;
+    g->cx1 = x + w > g->width ? g->width : x + w;
+    g->cy1 = y + h > g->height ? g->height : y + h;
+}
+
+void gfx_set_palette(const uint8_t rgb[16][3])
+{
+    for (uint8_t i = 0; i < 16; i++) {  /* attribute palette: identity */
+        (void)inb(0x3DA);
+        outb(0x3C0, i);
+        outb(0x3C0, i);
+    }
+    (void)inb(0x3DA);
+    outb(0x3C0, 0x20);                  /* display on */
+    outb(0x3C8, 0);
+    for (int i = 0; i < 16; i++)
+        for (int c = 0; c < 3; c++)
+            outb(0x3C9, rgb[i][c]);
+}
+
+/* Bits of byte column `col` that lie inside the clip rectangle. */
+static uint8_t col_mask(const struct gfx *g, int col)
+{
+    int lo = g->cx0 - col * 8, hi = g->cx1 - col * 8;
+    if (lo < 0) lo = 0;
+    if (hi > 8) hi = 8;
+    if (lo >= hi)
+        return 0;
+    return (uint8_t)((0xFF >> lo) & (0xFF << (8 - hi)));
+}
+
+static int clip_rect(const struct gfx *g, int *x, int *y, int *w, int *h)
+{
+    int x1 = *x + *w, y1 = *y + *h;
+    if (*x < g->cx0) *x = g->cx0;
+    if (*y < g->cy0) *y = g->cy0;
+    if (x1 > g->cx1) x1 = g->cx1;
+    if (y1 > g->cy1) y1 = g->cy1;
+    *w = x1 - *x;
+    *h = y1 - *y;
     return *w > 0 && *h > 0;
 }
 
-void gfx_fill(struct gfx *g, int x, int y, int w, int h, uint8_t color)
+static void fill_fn(struct gfx *g, int x, int y, int w, int h, uint8_t color, uint8_t fn)
 {
-    if (!clip(g, &x, &y, &w, &h))
+    if (!clip_rect(g, &x, &y, &w, &h))
         return;
     int b1 = x >> 3, b2 = (x + w - 1) >> 3;
     uint8_t m1 = (uint8_t)(0xFF >> (x & 7));
     uint8_t m2 = (uint8_t)(0xFF << (7 - ((x + w - 1) & 7)));
 
-    begin(color);
+    begin(color, fn);
     for (int row = y; row < y + h; row++) {
         volatile uint8_t *line = g->fb + row * g->stride;
         if (b1 == b2) {
@@ -71,18 +118,39 @@ void gfx_fill(struct gfx *g, int x, int y, int w, int h, uint8_t color)
         }
         put_masked(line + b1, m1);
         gc(8, 0xFF);
-        for (int b = b1 + 1; b < b2; b++)
-            line[b] = 0xFF;             /* whole bytes: no latch read needed */
+        for (int b = b1 + 1; b < b2; b++) {
+            if (fn)
+                (void)line[b];          /* XOR needs the old pixels latched */
+            line[b] = 0xFF;
+        }
         put_masked(line + b2, m2);
     }
     end();
 }
 
+void gfx_fill(struct gfx *g, int x, int y, int w, int h, uint8_t color)
+{
+    fill_fn(g, x, y, w, h, color, 0x00);
+}
+
+void gfx_xor_fill(struct gfx *g, int x, int y, int w, int h)
+{
+    fill_fn(g, x, y, w, h, 0x0F, 0x18);
+}
+
+void gfx_xor_frame(struct gfx *g, int x, int y, int w, int h, int t)
+{
+    gfx_xor_fill(g, x, y, w, t);                        /* top */
+    gfx_xor_fill(g, x, y + h - t, w, t);                /* bottom */
+    gfx_xor_fill(g, x, y + t, t, h - 2 * t);            /* left, between them */
+    gfx_xor_fill(g, x + w - t, y + t, t, h - 2 * t);    /* right */
+}
+
 void gfx_pixel(struct gfx *g, int x, int y, uint8_t color)
 {
-    if (x < 0 || y < 0 || x >= g->width || y >= g->height)
+    if (x < g->cx0 || y < g->cy0 || x >= g->cx1 || y >= g->cy1)
         return;
-    begin(color);
+    begin(color, 0x00);
     put_masked(g->fb + y * g->stride + (x >> 3), (uint8_t)(0x80 >> (x & 7)));
     end();
 }
@@ -98,49 +166,56 @@ void gfx_rect(struct gfx *g, int x, int y, int w, int h, uint8_t color)
     gfx_vline(g, x + w - 1, y, h, color);
 }
 
-void gfx_text(struct gfx *g, int x, int y, const char *s, uint8_t fg, uint8_t bg)
+/* Draw rows of up to 16 pixels (MSB left) at x,y through the clip. */
+static void blit_rows(struct gfx *g, int x, int y, const uint16_t *rows, int h,
+                      uint8_t color, uint8_t fn)
 {
-    for (; *s; s++, x += 8) {
-        if (x + 8 <= 0 || y + 16 <= 0 || x >= g->width || y >= g->height)
+    if (x >= g->cx1 || y >= g->cy1 || x + 16 <= g->cx0 || y + h <= g->cy0)
+        return;
+    int shift = x & 7, col = x >> 3;
+    uint8_t cm[3];
+    for (int b = 0; b < 3; b++)
+        cm[b] = (col + b >= 0 && col + b < g->stride) ? col_mask(g, col + b) : 0;
+
+    begin(color, fn);
+    for (int r = 0; r < h; r++) {
+        int row = y + r;
+        if (row < g->cy0 || row >= g->cy1 || !rows[r])
             continue;
-        if (bg != GFX_TRANSPARENT)
-            gfx_fill(g, x, y, 8, 16, bg);
-        const uint8_t *glyph = g->font + (uint8_t)*s * 16;
-        int shift = x & 7, col = x >> 3;
-        begin(fg);
-        for (int r = 0; r < 16; r++) {
-            int row = y + r;
-            uint8_t bits = glyph[r];
-            if (row < 0 || row >= g->height || !bits)
-                continue;
-            volatile uint8_t *p = g->fb + row * g->stride + col;
-            if (x >= 0 && (bits >> shift))
-                put_masked(p, (uint8_t)(bits >> shift));
-            if (shift && col + 1 < g->stride && (uint8_t)(bits << (8 - shift)))
-                put_masked(p + 1, (uint8_t)(bits << (8 - shift)));
+        uint32_t bits = (uint32_t)rows[r] << (8 - shift);    /* 24 bits */
+        volatile uint8_t *p = g->fb + row * g->stride + col;
+        for (int b = 0; b < 3; b++) {
+            uint8_t m = (uint8_t)(bits >> (16 - 8 * b)) & cm[b];
+            if (m)
+                put_masked(p + b, m);
         }
-        end();
     }
+    end();
+}
+
+void gfx_bitmap(struct gfx *g, int x, int y, const uint16_t *rows, int h, uint8_t color)
+{
+    blit_rows(g, x, y, rows, h, color, 0x00);
 }
 
 void gfx_xor_bitmap(struct gfx *g, int x, int y, const uint16_t *rows, int h)
 {
-    begin(0x0F);                        /* XOR with all-ones inverts */
-    gc(3, 0x18);                        /* function select: XOR */
-    int shift = x & 7, col = x >> 3;
-    for (int r = 0; r < h; r++) {
-        int row = y + r;
-        if (row < 0 || row >= g->height)
+    blit_rows(g, x, y, rows, h, 0x0F, 0x18);
+}
+
+void gfx_text(struct gfx *g, int x, int y, const char *s, uint8_t fg, uint8_t bg)
+{
+    for (; *s; s++, x += 8) {
+        if (x >= g->cx1)
+            break;
+        if (x + 8 <= g->cx0)
             continue;
-        /* 16 pixels starting at a byte boundary - shift: up to 3 bytes */
-        uint32_t bits = (uint32_t)rows[r] << (8 - shift);
-        volatile uint8_t *p = g->fb + row * g->stride + col;
-        for (int b = 0; b < 3; b++) {
-            uint8_t m = (uint8_t)(bits >> (16 - 8 * b));
-            if (m && col + b >= 0 && col + b < g->stride)
-                put_masked(p + b, m);
-        }
+        if (bg != GFX_TRANSPARENT)
+            gfx_fill(g, x, y, 8, 16, bg);
+        const uint8_t *glyph = g->font + (uint8_t)*s * 16;
+        uint16_t rows[16];
+        for (int r = 0; r < 16; r++)
+            rows[r] = (uint16_t)(glyph[r] << 8);
+        blit_rows(g, x, y, rows, 16, fg, 0x00);
     }
-    gc(3, 0x00);
-    end();
 }

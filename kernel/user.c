@@ -30,7 +30,37 @@ static struct {
     uint32_t       image_end;           /* user pages [USER_BASE, image_end) */
     bool           vga_mapped;
     uint32_t       prints;              /* SYS_PRINT calls (self-test) */
-} u;
+    volatile int   focus_event;         /* -1 none, else EV_FOCUS key */
+    bool           background;          /* VGA ports trapped */
+} u = { .focus_event = -1 };
+
+/* VGA ports the display driver uses */
+static bool vga_port(uint16_t p)
+{
+    return (p >= 0x3C0 && p <= 0x3CF) || p == 0x3D4 || p == 0x3D5 || p == 0x3DA;
+}
+
+static void trap_vga(bool trap)
+{
+    for (uint16_t p = 0x3C0; p <= 0x3DA; p++)
+        if (vga_port(p))
+            tss_trap_port(p, trap);
+}
+
+/* While a DOS session has the screen the GUI must not touch the VGA: its
+ * port accesses trap and are emulated (writes dropped, reads FFh), and it
+ * is told to stop drawing, then to repaint when the screen comes back --
+ * what Windows' VDD did for a System VM in the background. */
+void user_screen(bool ours)
+{
+    if (!u.running || ours == !u.background)
+        return;
+    u.background = !ours;
+    trap_vga(!ours);
+    u.focus_event = ours ? 1 : 0;
+    if (u.thread)
+        thread_wake(u.thread);
+}
 
 /* ---- user address space ------------------------------------------------ */
 
@@ -206,6 +236,8 @@ int user_start(const char *name, uint32_t flags)
     }
     u.thread->user = true;
     u.running = true;
+    u.focus_event = -1;
+    u.background = false;
     mouse_set_delivery((flags & UINFO_GRAPHICS) != 0);
     klog("USER: started %s (%u bytes, entry %08X)\n", path, hdr.file_size, hdr.entry);
     thread_wake(u.thread);
@@ -226,6 +258,10 @@ __attribute__((noreturn))
 static void finish(int result)
 {
     mouse_set_delivery(false);
+    if (u.background) {
+        trap_vga(false);
+        u.background = false;
+    }
     u.result = result;
     u.running = false;
     thread_exit();
@@ -271,7 +307,11 @@ void syscall_dispatch(struct regs *r)
     case SYS_GET_EVENT: {
         struct user_event e = { 0 };
         int sc = vm_focus() == NULL ? keyboard_read() : -1;
-        if (sc >= 0) {
+        if (u.focus_event >= 0) {
+            e.type = EV_FOCUS;
+            e.key = (uint16_t)u.focus_event;
+            u.focus_event = -1;
+        } else if (sc >= 0) {
             e.type = EV_KEY;
             e.key = (uint16_t)sc;
         } else if (!mouse_get_event(&e)) {
@@ -299,8 +339,38 @@ void syscall_dispatch(struct regs *r)
     }
 }
 
+/* Emulate IN/OUT to a VGA port from a GUI in the background. */
+static bool emulate_vga_io(struct regs *r)
+{
+    if (!u.background || r->int_no != 13 || !user_range_ok(r->eip, 2))
+        return false;
+    const uint8_t *code = (const uint8_t *)(uintptr_t)r->eip;
+    int len = 0, size = 1;
+    if (code[0] == 0x66) { size = 4; len = 1; }
+    uint8_t op = code[len++];
+    uint16_t port;
+    switch (op) {
+    case 0xE4: case 0xE5: case 0xE6: case 0xE7: port = code[len++]; break;
+    case 0xEC: case 0xED: case 0xEE: case 0xEF: port = (uint16_t)r->edx; break;
+    default: return false;
+    }
+    if (op & 1)
+        size = size == 4 ? 4 : 2;
+    if (!vga_port(port))
+        return false;
+    if (!(op & 2)) {                            /* IN */
+        if (size == 1)      r->eax = (r->eax & ~0xFFu) | 0xFF;
+        else if (size == 2) r->eax = (r->eax & ~0xFFFFu) | 0xFFFF;
+        else                r->eax = 0xFFFFFFFFu;
+    }
+    r->eip += (uint32_t)len;
+    return true;
+}
+
 void user_fault(struct regs *r)
 {
+    if (emulate_vga_io(r))
+        return;
     if (r->int_no == 14)
         klog("USER: GUI killed by exception 0E (page fault, %s %08X) at %04X:%08X\n",
              (r->err_code & 2) ? "write to" : "read from", read_cr2(),

@@ -61,7 +61,7 @@ static bool mouse_cmd(uint8_t c)
 
 static void enqueue(const struct user_event *e)
 {
-    if (!deliver)
+    if (!deliver || vm_focus() != NULL)         /* only while the GUI shows */
         return;
     if (qhead != qtail) {           /* merge with a queued move */
         struct user_event *last = &queue[(qhead + QUEUE - 1) % QUEUE];

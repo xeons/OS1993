@@ -177,6 +177,7 @@ void vga_console_suspend(void)
 {
     if (!console_gfx || !gfx_on_screen)
         return;
+    vga_save_regs(&gfx_regs);       /* as the GUI left them: its palette too */
     plane_access();
     for (int p = 0; p < 4; p++)
         plane_read(p, gfx_planes + p * VGA_PLANE_BYTES, VGA_PLANE_BYTES);

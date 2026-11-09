@@ -25,8 +25,8 @@ are for later stages.
 | `make qemu-test` | headless FreeDOS run of the same checks as `make test`        |
 | `make qemu-emm386` | FreeDOS with JEMM386: the loader must refuse to start       |
 | `make qemu-sessions` | types into two concurrent DOS sessions via QEMU's monitor |
-| `make qemu-mouse` | moves and clicks QEMU's PS/2 mouse via its monitor; checks the cursor and a window drag with screendumps |
-| `make qemu-vga`  | VGA driver: checks desktop pixels with QEMU screendumps, and pixel-identical restores after switching to a text DOS session and back |
+| `make qemu-wm`   | drives the window manager through QEMU's mouse and keyboard: every control, activate/move/resize/minimize/maximize/close, palette after a DOS session |
+| `make qemu-vga`  | the VDD: the GUI's desktop must come back pixel-identical after a text DOS session (except its animated progress bar) |
 
 There are two test machines because they catch different bugs:
 
@@ -219,6 +219,41 @@ text console. In test mode the same binary is run twice as a self-test:
 executing `CLI` must be killed with #GP, and writing kernel memory must be
 killed with #PF.
 
+## The window manager and controls
+
+The GUI (`user/`) is 32-bit ring-3 code in the System VM. Its look is
+inspired by the Mac OS 8 "Platinum" appearance (drawn from scratch: light
+grey bevels, pinstriped active title bars, rounded push buttons, inset
+fields with an accent focus ring, lavender selection), and it has the
+Windows 95 set of window controls and widgets.
+
+- **Palette.** `gfx_set_palette` loads 16 custom colours (an identity
+  attribute map plus DAC): eight greys for the Platinum ramp, accents, a
+  desktop colour. The VDD captures the GUI's live palette when a DOS
+  session takes the screen.
+- **Windows** (`user/wm.c`). Overlapping windows in a z-order, painted back
+  to front into a dirty rectangle with clipping. Each title bar has a
+  system box on the left and minimize, maximize/restore and close on the
+  right. Inactive windows are flat and show no boxes. Double-clicking the
+  title maximizes; double-clicking the system box closes; Alt+F4 closes.
+  Windows resize from their borders, corners and size grip. Moves and
+  resizes drag an XOR outline. Minimized windows become title tiles along
+  the bottom until the shell gets a taskbar.
+- **Controls** (`user/ui.c`): push button (with default-button ring),
+  check box, radio button group, group box, label, single-line edit
+  (caret, Home/End/Delete), list box with scroll bar, horizontal and
+  vertical scroll bars (proportional thumb), slider (trackbar) and progress
+  bar. Tab and Shift+Tab move the focus; Space presses; Enter triggers the
+  default button.
+- **Background behaviour.** When a DOS session takes the screen, the GUI is
+  told (`EV_FOCUS`) and stops drawing. Its VGA port accesses are trapped and
+  emulated (writes dropped, reads FFh) instead of reaching the hardware
+  under the session's text mode, as Windows' VDD did. Back in front, it
+  repaints everything.
+
+Demo windows: **Programs** (MS-DOS Prompt, About, Exit to VMM),
+**Controls** (one of each control) and **About OS1993**. Esc leaves the GUI.
+
 ## Mouse
 
 `kernel/mouse.c` drives a PS/2 mouse on the 8042's auxiliary port (IRQ 12):
@@ -278,7 +313,8 @@ kernel/dosmgr.c                          one DOS shared by all VMs
 kernel/vga.c gfx.c                       VGA state (VDD), planar drawing
 kernel/user.c                            ring-3 loader, INT 30h system calls
 kernel/mouse.c                           PS/2 mouse (IRQ 12)
-user/                                    GUI.BIN: ring-3 desktop (crt0, gui.c)
+user/                                    GUI.BIN: window manager (wm.c), controls
+                                         (ui.c), demo apps (gui.c), theme, crt0
 kernel/gdt.c idt.c pic.c timer.c keyboard.c console.c serial.c kprintf.c panic.c
 kernel/include/          headers; bootinfo.h is shared with the loader
 kernel/linker.ld         links at 0x80000000, header first
@@ -312,11 +348,10 @@ tools/                   check386.sh, check-test.sh
    ports for background VMs, graphics modes, mouse, serial and printer ports.
 6. **Graphics and GUI.** Done: the VGA driver and ring-3 support (flat
    user segments, INT 30h system calls, `GUI.BIN` loader, fault
-   isolation) and the PS/2 mouse with a draggable demo window. Next: the
-   GUI itself in ring 3, meaning a window manager (overlapping windows,
-   z-order, clipping, redraw), an event queue per window, and a Program
-   Manager-style shell. A mouse for DOS sessions (virtual aux device) can
-   come later.
+   isolation), the PS/2 mouse, and the window manager with the Windows 95
+   control set in a Platinum-inspired style. Next: shared libraries (the UI
+   as its own DLL), menus, combo boxes and tabs, separate application
+   programs, a shell with a taskbar, and VESA truecolor.
 7. **Win16-style API layer.** 16-bit protected-mode apps in ring 3 with LDTs,
    built with Open Watcom.
 8. **Coexisting with EMM386** through VCPI/GEMMIS, and acting as a DPMI host.

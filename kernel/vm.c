@@ -9,6 +9,7 @@
 #include "mm.h"
 #include "sched.h"
 #include "v86.h"
+#include "user.h"
 #include "vga.h"
 #include "vm.h"
 
@@ -400,6 +401,7 @@ void vm_set_focus(struct vm *target)
         con_attach();
     }
     tlb_flush();
+    user_screen(target == NULL);
     klog("VMM: focus -> %s\n", target ? target->name : "console");
     irq_restore(f);
 }

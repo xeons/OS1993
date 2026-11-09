@@ -41,6 +41,8 @@ struct user_info {                      /* at USER_INFO, pointed to by EBX */
 /* An input event (SYS_GET_EVENT) */
 #define EV_KEY      1                   /* key: scancode */
 #define EV_MOUSE    2                   /* x, y: pointer position; buttons */
+#define EV_FOCUS    3                   /* key = 1: the screen is ours again (repaint),
+                                           key = 0: a DOS session took it (stop drawing) */
 #define MB_LEFT     0x01
 #define MB_RIGHT    0x02
 #define MB_MIDDLE   0x04
@@ -73,6 +75,7 @@ void user_fault(struct regs *r);
 int  user_start(const char *name, uint32_t flags);
 bool user_running(void);
 void user_tick(void);                   /* timer: wake a waiting program */
+void user_screen(bool ours);            /* the GUI gained/lost the screen */
 /* After it ended: exit code (>= 0) or -(exception number + 1). */
 int  user_result(void);
 void user_selftest(void);

@@ -9,7 +9,7 @@
 #   make qemu-emm386  OS1993 must refuse to run with JEMM386 loaded
 #   make qemu-sessions  type into two concurrent DOS sessions (QEMU sendkey)
 #   make qemu-vga   check the VGA driver with QEMU screendumps
-#   make qemu-mouse move and click the PS/2 mouse; drag the GUI's window
+#   make qemu-wm    drive the window manager and every control (mouse, keys)
 #   make clean
 
 CC      := i686-elf-gcc
@@ -36,14 +36,15 @@ USER_CFLAGS := $(filter-out -Ikernel/include,$(CFLAGS)) -Iuser -Ikernel/include
 USER_LDFLAGS := -T user/user.ld -nostdlib -ffreestanding \
            -Wl,--build-id=none -Wl,--no-warn-rwx-segments -Wl,-Map,$(BUILD)/gui.map
 # The GUI links the kernel's display driver unchanged: it runs in ring 3.
-USER_OBJ   := $(BUILD)/user/crt0.o $(BUILD)/user/gui.o $(BUILD)/user/lib.o $(BUILD)/user/gfx.o
+USER_OBJ   := $(BUILD)/user/crt0.o $(BUILD)/user/gui.o $(BUILD)/user/wm.o $(BUILD)/user/ui.o \
+              $(BUILD)/user/kbd.o $(BUILD)/user/lib.o $(BUILD)/user/gfx.o
 
 KERNEL_C   := $(wildcard kernel/*.c)
 KERNEL_ASM := $(wildcard kernel/*.asm)
 KERNEL_OBJ := $(patsubst kernel/%.asm,$(BUILD)/kernel/%.o,$(KERNEL_ASM)) \
               $(patsubst kernel/%.c,$(BUILD)/kernel/%.o,$(KERNEL_C))
 
-.PHONY: all run test check386 qemu qemu-test qemu-emm386 qemu-sessions qemu-vga qemu-mouse clean
+.PHONY: all run test check386 qemu qemu-test qemu-emm386 qemu-sessions qemu-vga qemu-wm clean
 
 all: $(BUILD)/OS1993.COM $(BUILD)/VMM.BIN $(BUILD)/GUI.BIN
 
@@ -125,8 +126,8 @@ qemu-sessions: all
 qemu-vga: all
 	@tools/qemu-vga-test.py
 
-qemu-mouse: all
-	@tools/qemu-mouse-test.py
+qemu-wm: all
+	@tools/qemu-wm-test.py
 
 check386: $(BUILD)/vmm.elf $(BUILD)/gui.elf
 	@tools/check386.sh $(OBJDUMP) $(BUILD)/vmm.elf

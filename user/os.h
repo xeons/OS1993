@@ -20,6 +20,7 @@ static inline uint32_t syscall3(uint32_t n, uint32_t a, uint32_t b, uint32_t c)
 size_t strlen(const char *s);
 void  *memset(void *d, int c, size_t n);
 void  *memcpy(void *d, const void *s, size_t n);
+void   ulog(const char *fmt, ...);     /* debug log: %s %d %c */
 
 static inline void sys_print(const char *s)  { syscall3(SYS_PRINT, (uint32_t)s, (uint32_t)strlen(s), 0); }
 static inline uint32_t sys_ticks(void)       { return syscall3(SYS_TICKS, 0, 0, 0); }
