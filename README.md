@@ -26,6 +26,7 @@ are for later stages.
 | `make qemu-emm386` | FreeDOS with JEMM386: the loader must refuse to start       |
 | `make qemu-sessions` | types into two concurrent DOS sessions via QEMU's monitor |
 | `make qemu-absmouse` | absolute pointer through QEMU's VMware port: the cursor lands on the exact pixel, and clicks hit their control |
+| `make qemu-msgbox` | keyboard accelerators per window, message boxes: modality, default button, Tab, Yes/No letters, Esc, Alt+F4 |
 | `make qemu-menu` | menu bar, system menu and right-click menus by mouse and keyboard (mnemonics, F10, Alt+Space, keyboard Move) |
 | `make qemu-wm`   | drives the window manager through QEMU's mouse and keyboard: every control, activate/move/resize/minimize/maximize/close, palette after a DOS session |
 | `make qemu-vga`  | the VDD: the GUI's desktop must come back pixel-identical after a text DOS session (except its animated progress bar) |
@@ -305,6 +306,20 @@ Windows 95 set of window controls and widgets.
   state requires, from the system box or Alt+Space; it sends
   `WM_SYSCOMMAND`. Move and Size from the menu work from the keyboard
   (arrow keys, Enter, Esc), as in Windows.
+- **Keyboard accelerators** (`user/ui/accel.c`):
+  `CreateAcceleratorTable` and `TranslateAccelerator`, as in Windows: a key
+  with Shift/Ctrl/Alt becomes `WM_COMMAND` (`HIWORD(wParam)` = 1), unless
+  the command is a greyed item of the window's menu.
+- **Message boxes** (`user/ui/msgbox.c`): `MessageBox` with the Windows
+  button sets (OK, OK/Cancel, Yes/No, Yes/No/Cancel, Abort/Retry/Ignore,
+  Retry/Cancel), `MB_DEFBUTTONn`, and stop / caution / note / question
+  icons. Modal to its owner, which is disabled meanwhile (clicking it brings
+  the box forward), through a message loop of its own, so other windows
+  keep working. Mac-style layout: buttons bottom right, the default (ringed,
+  Enter) rightmost. Esc and the close box mean Cancel when there is one;
+  Yes/No/Abort/Retry/Ignore answer to their initial letters. Windows can
+  own other windows (`CreateWindow` with a parent but no `WS_CHILD`);
+  owned windows go when their owner does.
 - **Controls**, one class per file: `BUTTON` (push button with
   default-button ring, check box, radio button group, group box), `STATIC`,
   `EDIT` (caret, Home/End/Delete), `LISTBOX` with its own scroll bar,
@@ -318,7 +333,7 @@ Windows 95 set of window controls and widgets.
   repaints everything.
 
 Demo windows: **Programs** (MS-DOS Prompt, About, Exit to VMM, and a
-File / Help menu bar), **Controls** (one of each control, and a right-click
+File / Help menu bar; F1, Ctrl+D and Ctrl+Q; Exit asks first), **Controls** (one of each control, and a right-click
 menu with a Speed submenu) and **About OS1993**. Esc leaves the GUI.
 
 ## Mouse

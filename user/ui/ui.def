@@ -73,3 +73,7 @@ EXPORTS
     GetSystemMenu
     TrackPopupMenu
     DrawMenuBar
+    CreateAcceleratorTable
+    DestroyAcceleratorTable
+    TranslateAccelerator
+    MessageBox

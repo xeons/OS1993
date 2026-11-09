@@ -85,7 +85,7 @@ static void key_event(int sc)
     bool sys = alt || vk == VK_MENU || vk == VK_F10;
     unsigned msg = up ? (sys ? WM_SYSKEYUP : WM_KEYUP) : (sys ? WM_SYSKEYDOWN : WM_KEYDOWN);
     uint32_t lp = 1u | ((uint32_t)code << 16) | (alt ? 1u << 29 : 0) |
-                  (shift ? 1u << 25 : 0) | (alone ? 1u << 26 : 0) |
+                  (shift ? 1u << 25 : 0) | (alone ? 1u << 26 : 0) | (ctrl ? 1u << 27 : 0) |
                   (up ? (1u << 30) | (1u << 31) : 0);
     PostMessage(target, msg, (WPARAM)vk, (LPARAM)lp);
 }
@@ -148,6 +148,12 @@ static void press(int x, int y)
     struct wnd *t = window_at(x, y, &part, &edges);
     if (!t)
         return;
+    if (!t->enabled) {                          /* modal: go to its dialog */
+        struct wnd *p = wnd_owned_popup(t);
+        if (p)
+            wnd_activate(p);
+        return;
+    }
     uint32_t now = GetTickCount();
     if (part == HT_TILE) {
         SendMessage(t, WM_SYSCOMMAND, SC_RESTORE, 0);
@@ -339,7 +345,7 @@ static void mouse_event(int x, int y, uint8_t buttons)
     }
     int part, edges;
     struct wnd *t = window_at(x, y, &part, &edges);
-    if (!t || part != HT_CLIENT)
+    if (!t || part != HT_CLIENT || !t->enabled)
         return;
     struct wnd *c = client_target(t, x, y);
     if (moved) ui_post_mouse(c, WM_MOUSEMOVE, x, y, keys);

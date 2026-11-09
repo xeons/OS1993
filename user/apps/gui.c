@@ -70,10 +70,10 @@ enum { ID_DOS = 10, ID_ABOUT, ID_EXIT, ID_CONTENTS };
 static HMENU programs_menu(void)
 {
     HMENU file = CreatePopupMenu(), help = CreatePopupMenu(), bar = CreateMenu();
-    AppendMenu(file, MF_STRING, ID_DOS, "&MS-DOS Prompt");
+    AppendMenu(file, MF_STRING, ID_DOS, "&MS-DOS Prompt\tCtrl+D");
     AppendMenu(file, MF_STRING, ID_ABOUT, "&About OS1993...");
     AppendMenu(file, MF_SEPARATOR, 0, NULL);
-    AppendMenu(file, MF_STRING, ID_EXIT, "E&xit to VMM");
+    AppendMenu(file, MF_STRING, ID_EXIT, "E&xit to VMM\tCtrl+Q");
     AppendMenu(help, MF_STRING, ID_CONTENTS, "&Contents\tF1");
     AppendMenu(help, MF_STRING, ID_ABOUT, "&About OS1993");
     AppendMenu(bar, MF_POPUP, (uintptr_t)file, "&File");
@@ -91,22 +91,33 @@ static LRESULT programs_proc(HWND h, unsigned msg, WPARAM wp, LPARAM lp)
         child(h, WC_BUTTON, "Exit to VMM", WS_TABSTOP, 12, 96, 176, BTN_H, ID_EXIT);
         return 0;
     case WM_COMMAND:
-        if (!lp) {                      /* from the menu */
+        if (!lp) {                      /* menu, or accelerator (HIWORD 1) */
             static const char *const names[] = { "MS-DOS Prompt", "About OS1993", "Exit to VMM", "Contents" };
-            DebugLog("menu %s", names[LOWORD(wp) - ID_DOS]);
+            DebugLog("%s %s", HIWORD(wp) == 1 ? "accel" : "menu", names[LOWORD(wp) - ID_DOS]);
         }
         switch (LOWORD(wp)) {
         case ID_DOS:
             DebugLog("button MS-DOS Prompt");
-            StartDosSession();
+            if (StartDosSession() < 0)
+                MessageBox(h, "Could not start a DOS session: not enough memory for another "
+                           "virtual machine.", "MS-DOS Prompt", MB_OK | MB_ICONERROR);
             break;
         case ID_ABOUT:
             open_about();
             break;
-        case ID_EXIT:
-            DebugLog("button Exit to VMM");
-            PostQuitMessage(0);
+        case ID_CONTENTS:
+            DebugLog("box Contents -> %d",
+                     MessageBox(h, "OS1993 has no help file yet.\nTry the menus, the system menu "
+                                "(Alt+Space) and right clicks.", "Contents", MB_OK | MB_ICONINFORMATION));
             break;
+        case ID_EXIT: {
+            DebugLog("button Exit to VMM");
+            int r = MessageBox(h, "Leave OS1993 and return to the VMM?", "Exit", MB_YESNO | MB_ICONQUESTION);
+            DebugLog("box Exit -> %d", r);
+            if (r == IDYES)
+                PostQuitMessage(0);
+            break;
+        }
         }
         return 0;
     case WM_CLOSE:                      /* closing Programs ends the session */
@@ -122,20 +133,28 @@ enum { ID_SOUND = 20, ID_CLOCK, ID_SLOW, ID_NORMAL, ID_TURBO, ID_NAME, ID_LIST,
        ID_VOLUME, ID_SCROLL, ID_PROGRESS, ID_TIMER, ID_RESET };
 
 /* The right-click menu: a Speed submenu mirroring the radio buttons. */
+static void controls_menu_command(HWND h, int id);
+
 static void context_menu(HWND h, int x, int y)
 {
     HMENU speed = CreatePopupMenu(), menu = CreatePopupMenu();
-    AppendMenu(speed, MF_STRING, ID_SLOW, "&Slow");
-    AppendMenu(speed, MF_STRING, ID_NORMAL, "&Normal");
-    AppendMenu(speed, MF_STRING, ID_TURBO, "&Turbo");
+    AppendMenu(speed, MF_STRING, ID_SLOW, "&Slow\tCtrl+1");
+    AppendMenu(speed, MF_STRING, ID_NORMAL, "&Normal\tCtrl+2");
+    AppendMenu(speed, MF_STRING, ID_TURBO, "&Turbo\tCtrl+3");
     int cur = IsDlgButtonChecked(h, ID_SLOW) ? ID_SLOW : IsDlgButtonChecked(h, ID_TURBO) ? ID_TURBO : ID_NORMAL;
     CheckMenuRadioItem(speed, ID_SLOW, ID_TURBO, (unsigned)cur, MF_BYCOMMAND);
     AppendMenu(menu, MF_POPUP, (uintptr_t)speed, "&Speed");
     AppendMenu(menu, MF_SEPARATOR, 0, NULL);
     AppendMenu(menu, MF_STRING | (IsDlgButtonChecked(h, ID_SOUND) ? MF_CHECKED : 0), ID_SOUND, "Sound &effects");
-    AppendMenu(menu, MF_STRING, ID_RESET, "&Reset volume");
+    AppendMenu(menu, MF_STRING, ID_RESET, "&Reset volume\tCtrl+R");
     int id = TrackPopupMenu(menu, TPM_RETURNCMD, x, y, h);
     DestroyMenu(menu);
+    controls_menu_command(h, id);
+}
+
+/* A command from the context menu or an accelerator. */
+static void controls_menu_command(HWND h, int id)
+{
     switch (id) {
     case ID_SLOW: case ID_NORMAL: case ID_TURBO:
         SendMessage(GetDlgItem(h, id), BM_SETCHECK, BST_CHECKED, 0);
@@ -215,6 +234,10 @@ static LRESULT controls_proc(HWND h, unsigned msg, WPARAM wp, LPARAM lp)
     case WM_COMMAND: {
         HWND c = (HWND)lp;
         char text[32];
+        if (!c && LOWORD(wp) != IDOK && LOWORD(wp) != IDCANCEL) {   /* an accelerator */
+            controls_menu_command(h, LOWORD(wp));
+            return 0;
+        }
         switch (LOWORD(wp)) {
         case ID_SOUND: case ID_CLOCK:
             GetWindowText(c, text, sizeof text);
@@ -234,8 +257,12 @@ static LRESULT controls_proc(HWND h, unsigned msg, WPARAM wp, LPARAM lp)
             controls_ok(h);
             break;
         case IDCANCEL:
-            if (lp)                     /* the button, not the Esc key */
+            if (lp) {                   /* the button, not the Esc key */
                 DebugLog("button Cancel");
+                DebugLog("box Cancel -> %d",
+                         MessageBox(h, "Discard the changes to these settings?", "Controls",
+                                    MB_OKCANCEL | MB_ICONWARNING | MB_DEFBUTTON2));
+            }
             break;
         }
         return 0;
@@ -320,6 +347,20 @@ int main(void)
                                  246, 40, 380, 330, NULL, 0, NULL);
     SetFocus(GetDlgItem(controls, ID_NAME));
 
+    static const ACCEL programs_keys[] = {
+        { FVIRTKEY | FCONTROL, 'D', ID_DOS },
+        { FVIRTKEY | FCONTROL, 'Q', ID_EXIT },
+        { FVIRTKEY, VK_F1, ID_CONTENTS },
+    };
+    static const ACCEL controls_keys[] = {
+        { FVIRTKEY | FCONTROL, '1', ID_SLOW },
+        { FVIRTKEY | FCONTROL, '2', ID_NORMAL },
+        { FVIRTKEY | FCONTROL, '3', ID_TURBO },
+        { FVIRTKEY | FCONTROL, 'R', ID_RESET },
+    };
+    HACCEL programs_acc = CreateAcceleratorTable(programs_keys, 3);
+    HACCEL controls_acc = CreateAcceleratorTable(controls_keys, 4);
+
     MSG msg;
     PeekMessage(&msg, false);                               /* first paint */
     OutputDebugString("desktop ready");
@@ -331,7 +372,12 @@ int main(void)
             PostQuitMessage(0);
             continue;
         }
-        if (!IsDialogMessage(GetActiveWindow(), &msg)) {
+        HWND active = GetActiveWindow();
+        if (active == programs && TranslateAccelerator(programs, programs_acc, &msg))
+            continue;
+        if (active == controls && TranslateAccelerator(controls, controls_acc, &msg))
+            continue;
+        if (!IsDialogMessage(active, &msg)) {
             TranslateMessage(&msg);
             DispatchMessage(&msg);
         }

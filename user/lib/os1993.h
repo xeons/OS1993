@@ -44,6 +44,7 @@ bool     HasMouse(void);
 typedef struct wnd  *HWND;
 typedef struct dc   *HDC;
 typedef struct menu *HMENU;
+typedef struct accel_table *HACCEL;
 typedef uint32_t     WPARAM;
 typedef int32_t      LPARAM;
 typedef int32_t      LRESULT;
@@ -195,6 +196,11 @@ enum {
 /* Dialog command ids */
 #define IDOK        1
 #define IDCANCEL    2
+#define IDABORT     3
+#define IDRETRY     4
+#define IDIGNORE    5
+#define IDYES       6
+#define IDNO        7
 
 /* Control classes */
 #define WC_BUTTON     "BUTTON"
@@ -354,6 +360,40 @@ bool    CheckMenuRadioItem(HMENU menu, unsigned first, unsigned last, unsigned c
 HMENU   GetSystemMenu(HWND hwnd, bool revert);
 int     TrackPopupMenu(HMENU menu, unsigned flags, int x, int y, HWND owner);
 bool    DrawMenuBar(HWND hwnd);
+
+/* Keyboard accelerators: TranslateAccelerator, called in the message loop
+ * before TranslateMessage, turns a matching key into WM_COMMAND
+ * (HIWORD(wParam) = 1) for hwnd, and returns true if it did. */
+#define FVIRTKEY    0x01        /* key is a VK_ code (else a character) */
+#define FSHIFT      0x04
+#define FCONTROL    0x08
+#define FALT        0x10
+typedef struct { uint8_t fVirt; uint16_t key; uint16_t cmd; } ACCEL;
+HACCEL  CreateAcceleratorTable(const ACCEL *accels, int count);
+bool    DestroyAcceleratorTable(HACCEL table);
+int     TranslateAccelerator(HWND hwnd, HACCEL table, MSG *msg);
+
+/* Message boxes: modal to their owner (which is disabled meanwhile). */
+#define MB_OK               0x0000
+#define MB_OKCANCEL         0x0001
+#define MB_ABORTRETRYIGNORE 0x0002
+#define MB_YESNOCANCEL      0x0003
+#define MB_YESNO            0x0004
+#define MB_RETRYCANCEL      0x0005
+#define MB_TYPEMASK         0x000F
+#define MB_ICONHAND         0x0010
+#define MB_ICONERROR        MB_ICONHAND
+#define MB_ICONQUESTION     0x0020
+#define MB_ICONEXCLAMATION  0x0030
+#define MB_ICONWARNING      MB_ICONEXCLAMATION
+#define MB_ICONASTERISK     0x0040
+#define MB_ICONINFORMATION  MB_ICONASTERISK
+#define MB_ICONMASK         0x00F0
+#define MB_DEFBUTTON1       0x0000
+#define MB_DEFBUTTON2       0x0100
+#define MB_DEFBUTTON3       0x0200
+#define MB_DEFMASK          0x0F00
+int     MessageBox(HWND owner, const char *text, const char *caption, unsigned type);  /* -> IDOK... */
 
 /* Small runtime helpers (each module has its own copy: user/lib/lib.c) */
 size_t  strlen(const char *s);

@@ -45,6 +45,7 @@ struct wnd {
     struct wclass *cls;
     WNDPROC        proc;
     struct wnd    *parent, *first, *next;    /* children: first = bottom */
+    struct wnd    *owner;                    /* top level: owning window */
     unsigned       style;
     int            id;
     int            x, y, w, h;               /* parent client coords (top level: screen) */
@@ -81,6 +82,7 @@ struct wnd *wnd_child_at(struct wnd *w, int x, int y);      /* x,y in w's client
 void        wnd_raise(struct wnd *top);
 void        wnd_activate(struct wnd *top);
 struct wnd *wnd_active(void);
+struct wnd *wnd_owned_popup(struct wnd *owner);   /* an enabled window it owns */
 void        ui_post_mouse(struct wnd *w, unsigned msg, int sx, int sy, unsigned keys);
 void        ui_init_classes(void);
 
@@ -159,6 +161,7 @@ void  ui_keyboard_track(struct wnd *w, bool size);   /* SC_MOVE / SC_SIZE */
 
 /* menu.c */
 LRESULT menu_popup_proc(HWND, unsigned, WPARAM, LPARAM);
+LRESULT msgbox_proc(HWND, unsigned, WPARAM, LPARAM);
 void  menubar_paint(struct wnd *w);
 void  menu_track_bar(struct wnd *w, int x, int y);   /* click on the bar */
 void  menu_track_sys(struct wnd *w);                 /* click on the system box */

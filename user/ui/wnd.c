@@ -64,6 +64,15 @@ int wnd_toplevels(struct wnd **out)
 
 struct wnd *wnd_active(void) { return active; }
 
+struct wnd *wnd_owned_popup(struct wnd *owner)
+{
+    for (int i = ntops - 1; i >= 0; i--)
+        if (tops[i]->owner == owner && tops[i]->visible && tops[i]->enabled &&
+            !tops[i]->cls->noactivate)
+            return tops[i];
+    return NULL;
+}
+
 /* ---- classes ------------------------------------------------------------ */
 
 bool RegisterClass(const WNDCLASS *wc)
@@ -100,6 +109,7 @@ void ui_init_classes(void)
     builtin(WC_TRACKBAR, trackbar_proc, false);
     builtin(WC_PROGRESS, progress_proc, true);
     builtin("#MENU", menu_popup_proc, false)->noactivate = true;   /* menus never activate */
+    builtin("#MSGBOX", msgbox_proc, false);
 }
 
 /* ---- geometry ----------------------------------------------------------- */
@@ -214,6 +224,7 @@ HWND CreateWindow(const char *cls, const char *text, unsigned style,
     if (text)
         strncpy0(n->text, text, TEXT_MAX);
     n->parent = (style & WS_CHILD) ? p : NULL;
+    n->owner = (style & WS_CHILD) ? NULL : (p ? wnd_top(p) : NULL);
     if (n->parent) {                                /* top of the siblings */
         struct wnd **pp = &p->first;
         while (*pp)
@@ -250,6 +261,9 @@ bool DestroyWindow(HWND h)
     SendMessage(w, WM_DESTROY, 0, 0);
     while (w->first)
         DestroyWindow(w->first);
+    for (int i = ntops - 1; i >= 0; i--)          /* and the windows it owns */
+        if (i < ntops && tops[i]->owner == w)
+            DestroyWindow(tops[i]);
     kill_timers(w);
     drop_messages(w);
     menu_window_gone(w);
@@ -681,6 +695,8 @@ bool TranslateMessage(const MSG *m)
     char ch = kbd_char((int)m->wParam, (m->lParam & (1 << 25)) != 0);
     if (!ch)
         return false;
+    if ((m->lParam & (1 << 27)) && m->wParam >= 'A' && m->wParam <= 'Z')
+        ch = (char)(m->wParam - 'A' + 1);           /* Ctrl+letter: a control code */
     return PostMessage(m->hwnd, WM_CHAR, (WPARAM)(uint8_t)ch, m->lParam);
 }
 

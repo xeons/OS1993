@@ -37,6 +37,8 @@ def main():
         m.goto(100, 25); m.click()              # Programs again
         m.key("alt-h"); m.key("c")
         check(m.wait_log("GUI: menu Contents"), "Alt+H then a mnemonic chooses Help > Contents")
+        m.key("ret")                            # dismiss its message box
+        check(m.wait_log("GUI: box Contents -> 1"), "Contents message box closed with Enter")
         for k in ("f10", "right", "ret", "down", "ret"):
             m.key(k)
         check(m.wait_log("GUI: menu About OS1993", 2), "F10, arrows and Enter walk the menu bar")
@@ -62,9 +64,9 @@ def main():
         # --- context menu with a submenu (Controls, over "Colour scheme:") ---
         m.goto(280, 192); m.rclick()
         m.goto(300, 204)                        # hover "Speed": submenu opens
-        m.goto(460, 204); m.click()             # "Slow" in the submenu
+        m.goto(200, 204); m.click()             # "Slow": the submenu flipped left (no room)
         check(m.wait_log("GUI: speed Slow"), "right-click menu: hover opens a submenu, click chooses")
-        m.rclick()
+        m.goto(280, 192); m.rclick()
         for k in ("down", "right", "down", "down", "ret"):
             m.key(k)
         check(m.wait_log("GUI: speed Turbo"), "context menu by keyboard")
