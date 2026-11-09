@@ -26,11 +26,13 @@ are for later stages.
 | `make qemu-emm386` | FreeDOS with JEMM386: the loader must refuse to start       |
 | `make qemu-sessions` | types into two concurrent DOS sessions via QEMU's monitor |
 | `make qemu-absmouse` | absolute pointer through QEMU's VMware port: the cursor lands on the exact pixel, and clicks hit their control |
+| `make qemu-tasklist` | Ctrl+Alt+Del: Close Program ends a program, works from a DOS session, and the VMM's screen ends a program that froze the GUI |
 | `make qemu-notepad` | Notepad: typing, Save As with CR LF, the clipboard between two processes, Open, select/delete/undo, unsaved-changes questions, the file's bytes on disk |
 | `make qemu-files` | file access: Paint saves, opens and replaces a BMP through the file dialogs, a second process reads it, then the file is checked on the disk image |
 | `make qemu-shell` | the shell and its programs as processes: Start menu by mouse and Ctrl+Esc, desktop icons, Calculator, Paint, Clock, taskbar buttons, Run, Shut Down |
 | `make qemu-msgbox` | keyboard accelerators per window, message boxes: modality, default button, Tab, Yes/No letters, Esc, Alt+F4 |
 | `make qemu-menu` | menu bar, system menu and right-click menus by mouse and keyboard (mnemonics, F10, Alt+Space, keyboard Move) |
+| `make qemu-controls` | combo boxes (drop-down list with a scroll bar, editable, a list that opens upwards), the tab control and up-downs (buddy edit, auto-repeat, wrap) by mouse and keyboard |
 | `make qemu-wm`   | drives the window manager through QEMU's mouse and keyboard: every control, activate/move/resize/minimize/maximize/close, palette after a DOS session |
 | `make qemu-vga`  | the VDD: the GUI's desktop must come back pixel-identical after a text DOS session (except its animated progress bar) |
 
@@ -232,6 +234,15 @@ address space, like Win95's 32-bit side.
   `FindFirstFile`/`FindNextFile`/`FindClose`, `GetLastError`.
 - **Memory.** `SYS_SBRK` grows a per-process heap at `2000_0000`;
   KERNEL.DLL's `LocalAlloc`/`LocalReAlloc`/`LocalFree` manage it.
+- **Ctrl+Alt+Del** never reaches a DOS session (its BIOS would reboot).
+  With a GUI it comes to the front and the shell shows **Close Program**
+  (the running programs by window title; End Task, Shut Down, Cancel).
+  If the shell doesn't answer within two seconds -- a program holding the
+  window system's lock is stuck -- the VMM shows its own text-mode screen
+  over the desktop, as Windows 3.1 did: the programs, the one holding the
+  lock marked and chosen; Enter ends it and the desktop comes back, Esc
+  waits, Ctrl+Alt+Del again ends the whole session. `HANG.BIN` (start it
+  from Run) hangs on purpose to try it.
 - **Faults and kills.** An exception in ring 3 ends that process with a log
   line; the others carry on, and UI.DLL drops its windows. A killed process
   ends on its way back to ring 3.
@@ -419,6 +430,24 @@ Windows 95 set of window controls and widgets.
   messages (`EM_GETSEL`, `EM_REPLACESEL`, `EM_GETMODIFY`, `EM_LINEINDEX`...).
   Single-line edits copy, cut and paste too. Every control draws inside its own rectangle,
   focus and default rings included.
+- **Combo boxes, tabs, up-downs** (`user/ui/combo.c`, `tab.c`,
+  `updown.c`), with Win32's message numbers. `COMBOBOX` comes as
+  `CBS_DROPDOWNLIST` (a pop-up button showing the selection) and
+  `CBS_DROPDOWN` (a child `EDIT` and the arrow); its list is a pop-up
+  window that never activates, below the box or above it when the work
+  area has no room, with a scroll bar past 8 rows, and like a menu it is a
+  modal loop: hover, click or Enter chooses, Esc or a click outside
+  cancels; Alt+Down/F4 open it, the arrow keys change the selection while
+  it is closed. Strings live in the owning process's heap (`CB_ADDSTRING`,
+  `CB_GETLBTEXT`, `CB_FINDSTRINGEXACT`..., `CBN_SELCHANGE`, `CBN_DROPDOWN`,
+  `CBN_CLOSEUP`, `CBN_EDITCHANGE`). Unlike Windows, the window's height is
+  the closed box's. `TABCONTROL` draws Platinum tabs, the selected one
+  joined to its page (`TCM_INSERTITEM` with a `TCITEM`, `TCM_ADJUSTRECT`,
+  Left/Right); as there is no `WM_NOTIFY`, `TCN_SELCHANGING` and
+  `TCN_SELCHANGE` come as `WM_COMMAND`. `UPDOWN` steps a position with
+  auto-repeat and reports `WM_VSCROLL SB_THUMBPOSITION`; a buddy edit can
+  show it (`UDS_SETBUDDYINT`) and lend it its arrow keys
+  (`UDS_ARROWKEYS`).
 - **Background behaviour.** When a DOS session takes the screen, the GUI is
   told (`EV_FOCUS`) and stops drawing. Its VGA port accesses are trapped and
   emulated (writes dropped, reads FFh) instead of reaching the hardware
@@ -427,7 +456,9 @@ Windows 95 set of window controls and widgets.
 
 Demo windows (DEMO.BIN): **Programs** (MS-DOS Prompt, About, Exit, and a
 File / Help menu bar; F1, Ctrl+D and Ctrl+Q; Exit asks first), **Controls** (one of each control, and a right-click
-menu with a Speed submenu) and **About OS1993**. Esc closes the demo.
+menu with a Speed submenu) and **About OS1993**; File > More Controls
+opens a fourth, with a tab control over pages of controls, two combo boxes
+and up-downs. Esc closes the demo.
 
 ## Mouse
 

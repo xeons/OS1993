@@ -13,10 +13,12 @@
 #   make qemu-wm    drive the window manager and every control (mouse, keys)
 #   make qemu-absmouse  absolute pointer via QEMU's VMware port (exact position)
 #   make qemu-menu  menu bar, system menu and context menus (mouse, keys)
+#   make qemu-controls  combo boxes, the tab control and up-downs (mouse, keys)
 #   make qemu-msgbox  keyboard accelerators and message boxes
 #   make qemu-shell the shell and its programs, each a process
 #   make qemu-files file access: Paint's Open/Save, the file dialogs, the disk
 #   make qemu-notepad  Notepad and the multi-line edit control, the clipboard
+#   make qemu-tasklist Ctrl+Alt+Del: Close Program, and the VMM's screen for a hung GUI
 #   make clean
 
 CC      := i686-elf-gcc
@@ -58,14 +60,14 @@ SHELL_BASE  := $(shell $(MKDEF) user/shell/shell.def base)
 KRNL_OBJ  := $(U)/hdr/KERNEL.DLL.o $(U)/krnl/krnl.o $(U)/gen/krnl_exports.o $(U)/lib/lib.o
 GFX_OBJ   := $(U)/hdr/GFX.DLL.o $(U)/gfx/gfx.o $(U)/gen/gfx_exports.o $(U)/lib/lib.o
 UI_SRC    := wnd queue input frame paint menu accel msgbox dialog button static edit medit listbox \
-             scroll trackbar kbd theme
+             scroll trackbar combo tab updown kbd theme
 UI_OBJ    := $(U)/hdr/UI.DLL.o $(patsubst %,$(U)/ui/%.o,$(UI_SRC)) \
              $(U)/gen/ui_exports.o $(U)/gen/gfx_imports.o $(U)/gen/krnl_imports.o $(U)/lib/lib.o
 SHELL_OBJ := $(U)/hdr/SHELL.DLL.o $(U)/shell/shell.o $(U)/shell/icons.o $(U)/shell/filedlg.o $(U)/gen/shell_exports.o \
              $(U)/gen/ui_imports.o $(U)/gen/krnl_imports.o $(U)/lib/lib.o
 
 # Programs: user/apps/<name>.c, each a process of its own
-APPS      := SHELL DEMO CALC PAINT CLOCK NOTEPAD
+APPS      := SHELL DEMO CALC PAINT CLOCK NOTEPAD HANG
 APP_LIBS  := $(U)/lib/crt0.o $(U)/gen/krnl_imports.o $(U)/gen/ui_imports.o \
              $(U)/gen/shell_imports.o $(U)/lib/lib.o
 app_obj    = $(U)/hdr/$(1).BIN.o $(U)/apps/$(shell echo $(1) | tr A-Z a-z).o $(APP_LIBS)
@@ -81,7 +83,7 @@ KERNEL_ASM := $(wildcard kernel/*.asm)
 KERNEL_OBJ := $(patsubst kernel/%.asm,$(BUILD)/kernel/%.o,$(KERNEL_ASM)) \
               $(patsubst kernel/%.c,$(BUILD)/kernel/%.o,$(KERNEL_C))
 
-.PHONY: all run test check386 qemu qemu-test qemu-emm386 qemu-sessions qemu-vga qemu-wm qemu-absmouse qemu-menu qemu-msgbox qemu-shell qemu-files qemu-notepad clean
+.PHONY: all run test check386 qemu qemu-test qemu-emm386 qemu-sessions qemu-vga qemu-wm qemu-absmouse qemu-menu qemu-controls qemu-msgbox qemu-shell qemu-files qemu-notepad qemu-tasklist clean
 
 all: $(BUILD)/OS1993.COM $(BUILD)/VMM.BIN $(MODULES)
 
@@ -217,6 +219,9 @@ qemu-absmouse: all
 qemu-menu: all
 	@tools/qemu-menu-test.py
 
+qemu-controls: all
+	@tools/qemu-controls-test.py
+
 qemu-msgbox: all
 	@tools/qemu-msgbox-test.py
 
@@ -228,6 +233,9 @@ qemu-files: all
 
 qemu-notepad: all
 	@tools/qemu-notepad-test.py
+
+qemu-tasklist: all
+	@tools/qemu-tasklist-test.py
 
 check386: $(BUILD)/vmm.elf $(MODULE_ELFS)
 	@for f in $^; do tools/check386.sh $(OBJDUMP) $$f || exit 1; done

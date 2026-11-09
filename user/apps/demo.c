@@ -8,6 +8,7 @@
  *   Programs       MS-DOS Prompt (a DOS session VM), About, Exit
  *   Controls       every control type, live
  *   About OS1993   a small dialog
+ * and File > More Controls opens a fourth: tabs, combo boxes, up-downs.
  * With a self-test flag it instead checks that ring 3 is fenced in.
  */
 #include "os1993.h"
@@ -65,15 +66,17 @@ static void open_about(void)
 
 /* ---- Programs ---------------------------------------------------------- */
 
-enum { ID_DOS = 10, ID_ABOUT, ID_EXIT, ID_CONTENTS };
+enum { ID_DOS = 10, ID_ABOUT, ID_EXIT, ID_CONTENTS, ID_MORE };
 #define WM_TRAY (WM_USER + 50)
 static HWND controls_wnd;
+static void open_more(void);
 
 static HMENU programs_menu(void)
 {
     HMENU file = CreatePopupMenu(), help = CreatePopupMenu(), bar = CreateMenu();
     AppendMenu(file, MF_STRING, ID_DOS, "&MS-DOS Prompt\tCtrl+D");
     AppendMenu(file, MF_STRING, ID_ABOUT, "&About OS1993...");
+    AppendMenu(file, MF_STRING, ID_MORE, "Mo&re Controls...");
     AppendMenu(file, MF_SEPARATOR, 0, NULL);
     AppendMenu(file, MF_STRING, ID_EXIT, "E&xit\tCtrl+Q");
     AppendMenu(help, MF_STRING, ID_CONTENTS, "&Contents\tF1");
@@ -94,7 +97,8 @@ static LRESULT programs_proc(HWND h, unsigned msg, WPARAM wp, LPARAM lp)
         return 0;
     case WM_COMMAND:
         if (!lp) {                      /* menu, or accelerator (HIWORD 1) */
-            static const char *const names[] = { "MS-DOS Prompt", "About OS1993", "Exit", "Contents" };
+            static const char *const names[] = { "MS-DOS Prompt", "About OS1993", "Exit", "Contents",
+                                                 "More Controls" };
             DebugLog("%s %s", HIWORD(wp) == 1 ? "accel" : "menu", names[LOWORD(wp) - ID_DOS]);
         }
         switch (LOWORD(wp)) {
@@ -106,6 +110,9 @@ static LRESULT programs_proc(HWND h, unsigned msg, WPARAM wp, LPARAM lp)
             break;
         case ID_ABOUT:
             open_about();
+            break;
+        case ID_MORE:
+            open_more();
             break;
         case ID_CONTENTS:
             DebugLog("box Contents -> %d",
@@ -311,6 +318,180 @@ static LRESULT controls_proc(HWND h, unsigned msg, WPARAM wp, LPARAM lp)
     return DefWindowProc(h, msg, wp, lp);
 }
 
+/* ---- More Controls --------------------------------------------------------- */
+
+/* A tab control whose pages are sets of sibling controls shown and hidden
+ * on TCN_SELCHANGE; drop-down list and editable combo boxes; up-downs. */
+enum { ID_TABS = 40, ID_COLOUR, ID_PEOPLE, ID_COPIES, ID_COPIES_SPIN, ID_LEVEL, ID_LEVEL_TEXT };
+#define PAGES     3
+#define PAGE_MAX  6
+
+static HWND more;
+static HWND pages[PAGES][PAGE_MAX];
+static int  npage[PAGES];
+
+static const char *const people[] = {
+    "Ada", "Alan", "Bill", "Dennis", "Grace", "Ken", "Linus", "Niklaus", "Steve", "Tim",
+};
+static const char *const levels[] = { "Low", "Medium", "High", "Max" };
+
+static HWND page_child(int page, HWND h, const char *cls, const char *text, unsigned style,
+                       int x, int y, int w, int ht, int id)
+{
+    HWND c = CreateWindow(cls, text, WS_CHILD | (page ? 0 : WS_VISIBLE) | style, x, y, w, ht, h, id, NULL);
+    pages[page][npage[page]++] = c;
+    return c;
+}
+
+static void show_page(int page)
+{
+    for (int p = 0; p < PAGES; p++)
+        for (int i = 0; i < npage[p]; i++)
+            ShowWindow(pages[p][i], p == page ? SW_SHOW : SW_HIDE);
+}
+
+static void more_create(HWND h)
+{
+    static const char *const tabs[PAGES] = { "General", "Advanced", "Info" };
+    HWND tc = child(h, WC_TABCONTROL, "", WS_TABSTOP, 8, 8, 374, 186, ID_TABS);
+    for (int i = 0; i < PAGES; i++) {
+        TCITEM it = { .mask = TCIF_TEXT, .pszText = (char *)tabs[i] };
+        SendMessage(tc, TCM_INSERTITEM, (WPARAM)i, (LPARAM)&it);
+    }
+    npage[0] = npage[1] = npage[2] = 0;
+
+    /* General: a drop-down list of colours (more than fit: a scroll bar) */
+    page_child(0, h, WC_STATIC, "Colour scheme:", 0, 22, 46, 120, 16, 0);
+    HWND colour = page_child(0, h, WC_COMBOBOX, "", CBS_DROPDOWNLIST | WS_TABSTOP,
+                             146 - RING, 42 - RING, 160 + 2 * RING, EDIT_H + 2 * RING, ID_COLOUR);
+    page_child(0, h, WC_STATIC, "Click the box, or use", 0, 22, 82, 340, 16, 0);
+    page_child(0, h, WC_STATIC, "Alt+Down, F4 and the arrow keys.", 0, 22, 100, 340, 16, 0);
+    for (unsigned i = 0; i < sizeof colours / sizeof colours[0]; i++)
+        SendMessage(colour, CB_ADDSTRING, 0, (LPARAM)colours[i]);
+    SendMessage(colour, CB_SETCURSEL, 0, 0);
+
+    /* Advanced: an up-down with a buddy edit, and a horizontal one */
+    page_child(1, h, WC_STATIC, "Copies:", 0, 22, 46, 120, 16, 0);
+    HWND copies = page_child(1, h, WC_EDIT, "1", WS_TABSTOP,
+                             146 - RING, 42 - RING, 48 + 2 * RING, EDIT_H + 2 * RING, ID_COPIES);
+    HWND spin = page_child(1, h, WC_UPDOWN, "", UDS_SETBUDDYINT | UDS_ALIGNRIGHT | UDS_ARROWKEYS,
+                           0, 0, 16, 0, ID_COPIES_SPIN);
+    SendMessage(spin, UDM_SETRANGE, 0, MAKELPARAM(99, 1));
+    SendMessage(spin, UDM_SETBUDDY, (WPARAM)copies, 0);
+    SendMessage(spin, UDM_SETPOS, 0, 1);
+    page_child(1, h, WC_STATIC, "Level:", 0, 22, 84, 120, 16, 0);
+    HWND level = page_child(1, h, WC_UPDOWN, "", UDS_HORZ | UDS_WRAP, 146, 82, 32, 18, ID_LEVEL);
+    SendMessage(level, UDM_SETRANGE, 0, MAKELPARAM(3, 0));
+    page_child(1, h, WC_STATIC, levels[0], 0, 186, 84, 80, 16, ID_LEVEL_TEXT);
+
+    /* Info */
+    page_child(2, h, WC_STATIC, "COMBOBOX, TABCONTROL and UPDOWN", 0, 22, 46, 340, 16, 0);
+    page_child(2, h, WC_STATIC, "are UI.DLL's standard controls.", 0, 22, 64, 340, 16, 0);
+
+    /* Below the tabs: an editable combo box (its list opens upwards here) */
+    child(h, WC_STATIC, "Name:", 0, 12, 214, 48, 16, 0);
+    HWND name = child(h, WC_COMBOBOX, "", CBS_DROPDOWN | WS_TABSTOP,
+                      64 - RING, 210 - RING, 160 + 2 * RING, EDIT_H + 2 * RING, ID_PEOPLE);
+    for (unsigned i = 0; i < sizeof people / sizeof people[0]; i++)
+        SendMessage(name, CB_ADDSTRING, 0, (LPARAM)people[i]);
+    SendMessage(name, CB_SETCURSEL, 4, 0);
+    child(h, WC_BUTTON, "OK", BS_DEFPUSHBUTTON | WS_TABSTOP,
+          298 - DEF, 210 - DEF, 80 + 2 * DEF, BTN_H + 2 * DEF, IDOK);
+}
+
+static void more_ok(HWND h)
+{
+    char colour[32], name[64];
+    HWND c = GetDlgItem(h, ID_COLOUR);
+    colour[0] = '\0';
+    int sel = (int)SendMessage(c, CB_GETCURSEL, 0, 0);
+    if (sel >= 0 && SendMessage(c, CB_GETLBTEXTLEN, (WPARAM)sel, 0) < (int)sizeof colour)
+        SendMessage(c, CB_GETLBTEXT, (WPARAM)sel, (LPARAM)colour);
+    GetDlgItemText(h, ID_PEOPLE, name, sizeof name);
+    DebugLog("more OK: colour=%s name=%s known=%d copies=%d level=%d tab=%d", colour, name,
+             (int)SendMessage(GetDlgItem(h, ID_PEOPLE), CB_FINDSTRINGEXACT, (WPARAM)-1, (LPARAM)name),
+             (int16_t)LOWORD(SendMessage(GetDlgItem(h, ID_COPIES_SPIN), UDM_GETPOS, 0, 0)),
+             (int16_t)LOWORD(SendMessage(GetDlgItem(h, ID_LEVEL), UDM_GETPOS, 0, 0)),
+             (int)SendMessage(GetDlgItem(h, ID_TABS), TCM_GETCURSEL, 0, 0));
+}
+
+static LRESULT more_proc(HWND h, unsigned msg, WPARAM wp, LPARAM lp)
+{
+    switch (msg) {
+    case WM_CREATE:
+        more_create(h);
+        return 0;
+    case WM_COMMAND: {
+        HWND c = (HWND)lp;
+        char text[64];
+        switch (LOWORD(wp)) {
+        case ID_TABS:
+            if (HIWORD(wp) == TCN_SELCHANGE) {
+                int sel = (int)SendMessage(c, TCM_GETCURSEL, 0, 0);
+                TCITEM it = { .mask = TCIF_TEXT, .pszText = text, .cchTextMax = sizeof text };
+                SendMessage(c, TCM_GETITEM, (WPARAM)sel, (LPARAM)&it);
+                show_page(sel);
+                DebugLog("tab %s", text);
+            }
+            break;
+        case ID_COLOUR:
+        case ID_PEOPLE: {
+            const char *what = LOWORD(wp) == ID_COLOUR ? "combo" : "name";
+            int sel = (int)SendMessage(c, CB_GETCURSEL, 0, 0);
+            switch (HIWORD(wp)) {
+            case CBN_SELCHANGE:
+                if (sel >= 0 && SendMessage(c, CB_GETLBTEXTLEN, (WPARAM)sel, 0) < (int)sizeof text) {
+                    SendMessage(c, CB_GETLBTEXT, (WPARAM)sel, (LPARAM)text);
+                    DebugLog("%s %s", what, text);
+                }
+                break;
+            case CBN_EDITCHANGE:
+                GetWindowText(c, text, sizeof text);
+                DebugLog("%s typed %s", what, text);
+                break;
+            case CBN_DROPDOWN:
+                DebugLog("%s dropped", what);
+                break;
+            case CBN_CLOSEUP:
+                DebugLog("%s closed", what);
+                break;
+            }
+            break;
+        }
+        case IDOK:
+            more_ok(h);
+            DestroyWindow(h);
+            break;
+        }
+        return 0;
+    }
+    case WM_VSCROLL:                    /* the Copies up-down */
+        if (LOWORD(wp) == SB_THUMBPOSITION)
+            DebugLog("spin %d", (int16_t)HIWORD(wp));
+        return 0;
+    case WM_HSCROLL:                    /* the Level up-down */
+        if (LOWORD(wp) == SB_THUMBPOSITION) {
+            int v = (int16_t)HIWORD(wp);
+            SetDlgItemText(h, ID_LEVEL_TEXT, levels[v & 3]);
+            DebugLog("level %d", v);
+        }
+        return 0;
+    case WM_DESTROY:
+        more = NULL;
+        return 0;
+    }
+    return DefWindowProc(h, msg, wp, lp);
+}
+
+static void open_more(void)
+{
+    if (more)
+        SetActiveWindow(more);
+    else
+        more = CreateWindow("MoreControls", "More Controls", FRAMED | WS_VISIBLE,
+                            120, 100, 400, 280, NULL, 0, NULL);
+}
+
 /* ---- self-test ------------------------------------------------------------ */
 
 static int selftest(const struct user_info *info)
@@ -346,6 +527,7 @@ int main(void)
     register_class("Programs", programs_proc, C_FACE);
     register_class("Controls", controls_proc, C_FACE);
     register_class("About", about_proc, C_FACE);
+    register_class("MoreControls", more_proc, C_FACE);
 
     HWND programs = CreateWindow("Programs", "Programs", FRAMED, 16, 16, 210, 181, NULL, 0, NULL);
     SetMenu(programs, programs_menu());

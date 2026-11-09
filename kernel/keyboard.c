@@ -5,24 +5,29 @@
  * focus: the VMM console's buffer, or the focused VM's virtual keyboard
  * controller, which raises that VM's virtual IRQ 1. A VM reads ports 60h
  * and 64h (trapped) and sees only its own keys. Alt+Tab is the VMM's
- * hotkey and switches the focus.
+ * hotkey and switches the focus. Ctrl+Alt+Del never reaches a VM (its
+ * BIOS would reboot the machine): it goes to the GUI's task list, or
+ * brings the VMM console forward.
  */
 #include "kernel.h"
 #include "devices.h"
 #include "interrupts.h"
 #include "io.h"
 #include "vm.h"
+#include "user.h"
 
 #define KBD_DATA   0x60
 #define KBD_STATUS 0x64
 
 #define SC_ALT      0x38
+#define SC_CTRL     0x1D
+#define SC_DEL      0x53
 #define SC_TAB      0x0F
 #define SC_RELEASE  0x80
 
 static volatile uint8_t buf[32];            /* the console's scancodes */
 static volatile unsigned head, tail;
-static bool alt_down, eat_tab_release;
+static bool alt_down, ctrl_down, eat_tab_release, eat_del_release;
 
 static void console_put(uint8_t sc)
 {
@@ -44,6 +49,24 @@ static void keyboard_irq(struct regs *r)
 
     if (sc == SC_ALT)                     alt_down = true;
     if (sc == (SC_ALT | SC_RELEASE))      alt_down = false;
+    if (sc == SC_CTRL)                    ctrl_down = true;
+    if (sc == (SC_CTRL | SC_RELEASE))     ctrl_down = false;
+
+    if (alt_down && ctrl_down && sc == SC_DEL) {    /* Ctrl+Alt+Del */
+        eat_del_release = true;
+        struct vm *f = vm_focus();
+        if (f) {                                    /* it won't see them let go */
+            vkbd_put(f, SC_CTRL | SC_RELEASE);
+            vkbd_put(f, SC_ALT | SC_RELEASE);
+        }
+        if (!user_cad() && vm_focus())
+            vm_set_focus(NULL);                     /* no GUI: the VMM console */
+        return;
+    }
+    if (sc == (SC_DEL | SC_RELEASE) && eat_del_release) {
+        eat_del_release = false;
+        return;
+    }
 
     if (alt_down && sc == SC_TAB) {       /* Alt+Tab: next VM */
         struct vm *old = vm_focus();

@@ -29,6 +29,8 @@ int CreateProcess(const char *program, const char *args)
     return pid;
 }
 int  GetCurrentProcessId(void)              { return sys_getpid(); }
+int  EnumProcesses(PROCESSENTRY *list, int max) { return sys_proc_list(list, max); }
+void TaskListShown(void)                    { sys_tasklist_ack(); }
 bool IsProcessAlive(int pid)                { return sys_alive(pid) == 1; }
 bool TerminateProcess(int pid)              { return sys_kill(pid) == 0; }
 uint32_t GetProcessExitCount(void)          { return sys_exits(); }

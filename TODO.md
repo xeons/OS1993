@@ -9,8 +9,14 @@ README.md for what already works.
       items, bitmaps in menus, `WM_MENUSELECT` for status-bar help,
       `InsertMenu`/`DeleteMenu`/`ModifyMenu`, a menu bar that wraps to a
       second line when the window is narrow.
-- [ ] More controls: combo box (drop-down list), tab control, spin box,
-      multi-line edit with scrolling, tree view, tooltips.
+- [ ] More controls: tree view, list view, tooltips, status bar, toolbar.
+      Combo boxes, the tab control and up-downs exist; missing there:
+      `CBS_SIMPLE`, item data (`CB_SETITEMDATA`), `CBN_SELENDOK`/`CANCEL`,
+      autocomplete in the editable combo; a non-blocking
+      `CB_SHOWDROPDOWN` (it returns when the list closes); tab rows that
+      wrap or scroll when the tabs don't fit, icons in tabs, Ctrl+Tab;
+      `UDN_DELTAPOS`, acceleration while an up-down is held, thousands
+      separators. A real `WM_NOTIFY` would let tabs notify as in Win32.
 - [ ] Standard dialogs: file open/save, colour picker. Message boxes could
       use a system-modal flag and a beep (no sound driver yet).
 - [ ] Edit controls: text selection, clipboard (cut/copy/paste), horizontal
@@ -23,8 +29,9 @@ README.md for what already works.
 - [ ] Shell: wallpaper patterns, icon dragging, a Programs list read from a
       file (needs file I/O), large icons in the Start menu with the
       vertical banner, taskbar button right-click (the window's system
-      menu), tooltips for tray icons, a task list (Ctrl+Alt+Del) that can
-      end a hung program (SYS_KILL exists).
+      menu), tooltips for tray icons. Close Program could mark programs
+      "Not responding" (queue untouched for seconds) and try WM_CLOSE
+      before ending one.
 - [ ] Notepad: Find/Replace, Word Wrap, Print (no printer yet), files over
       32 KB. Calculator scientific view; Paint: cut/copy/paste, zoom, a
       canvas size setting.

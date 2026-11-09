@@ -60,6 +60,9 @@ bool IsDialogMessage(HWND dlg, const MSG *m)
         int i = 0;
         while (i < n && list[i] != f)
             i++;
+        if (i == n && f)                            /* inside one (a combo box's field) */
+            for (i = 0; i < n && !is_descendant(f, list[i]); i++)
+                ;
         int dir = GetKeyState(VK_SHIFT) < 0 ? -1 : 1;
         i = i == n ? 0 : (i + dir + n) % n;
         SetFocus(list[i]);

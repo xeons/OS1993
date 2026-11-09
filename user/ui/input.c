@@ -238,6 +238,14 @@ static void focus_event(int ours)
     ui_set_background(!ours);
 }
 
+/* Ctrl+Alt+Del: the shell shows its task list (and tells the VMM so). */
+static void task_list(void)
+{
+    ui_input_reset();                           /* the VMM ate the Del */
+    if (wnd_from(S->shell_hook))
+        PostMessage(S->shell_hook, WM_SHELLHOOK, HSHELL_TASKMAN, 0);
+}
+
 void ui_pump_input(void)
 {
     struct user_event e;
@@ -247,6 +255,7 @@ void ui_pump_input(void)
         case EV_FOCUS: focus_event(e.key); break;
         case EV_KEY:   key_event(e.key); break;
         case EV_MOUSE: handed_off = mouse_event(e.x, e.y, e.buttons); break;
+        case EV_CAD:   task_list(); break;
         }
         if (handed_off)
             return;
@@ -281,6 +290,10 @@ void ui_modal_event(struct modal_ev *m)
             switch (e.type) {
             case EV_FOCUS:
                 focus_event(e.key);
+                return;
+            case EV_CAD:                        /* cancels the loop, then the task list */
+                task_list();
+                m->type = EV_FOCUS;
                 return;
             case EV_KEY: {
                 int code;

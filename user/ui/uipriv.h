@@ -286,6 +286,10 @@ LRESULT listbox_proc(HWND, unsigned, WPARAM, LPARAM);
 LRESULT scrollbar_proc(HWND, unsigned, WPARAM, LPARAM);
 LRESULT trackbar_proc(HWND, unsigned, WPARAM, LPARAM);
 LRESULT progress_proc(HWND, unsigned, WPARAM, LPARAM);
+LRESULT combo_proc(HWND, unsigned, WPARAM, LPARAM);
+LRESULT combolist_proc(HWND, unsigned, WPARAM, LPARAM);  /* the dropped list */
+LRESULT tab_proc(HWND, unsigned, WPARAM, LPARAM);
+LRESULT updown_proc(HWND, unsigned, WPARAM, LPARAM);
 
 /* scroll bar geometry, shared with list boxes (scroll.c) */
 struct sbar { bool vert; int x, y, w, h; int value, min, max, page; };

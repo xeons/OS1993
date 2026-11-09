@@ -93,6 +93,7 @@ struct systime {
 #define EV_MOUSE    2                   /* x, y: pointer position; buttons */
 #define EV_FOCUS    3                   /* key = 1: the screen is ours again (repaint),
                                            key = 0: a DOS session took it (stop drawing) */
+#define EV_CAD      4                   /* Ctrl+Alt+Del: show the task list (SYS_TASKLIST_ACK) */
 #define MB_LEFT     0x01
 #define MB_RIGHT    0x02
 #define MB_MIDDLE   0x04
@@ -127,6 +128,16 @@ struct user_event {
 #define SYS_PROC_EXITS  18              /* -> how many processes have ended so far */
 #define SYS_FILE        19              /* EBX = FOP_*, ECX = struct file_args * -> result, or -error */
 #define SYS_SBRK        20              /* EBX = bytes to add -> the old end of the heap, or 0 */
+#define SYS_TASKLIST_ACK 21             /* the shell shows its task list for EV_CAD */
+#define SYS_PROC_LIST   22              /* EBX = struct proc_entry *, ECX = most -> count */
+
+struct proc_entry {                     /* a running process (SYS_PROC_LIST) */
+    uint32_t pid;
+    uint32_t flags;                     /* PROC_* */
+    char     name[16];
+};
+#define PROC_LEADER     0x01            /* the session's first process (the shell) */
+#define PROC_UI_LOCK    0x02            /* it holds lock 0 (the window manager's) */
 #define WAIT_INFINITE   0xFFFFFFFFu
 #define WAIT_INPUT      1               /* also end the wait when input is pending */
 #define LOCK_MAX        8
@@ -197,6 +208,7 @@ bool user_running(void);
 void user_service(void);                /* console thread: loads, reaping */
 void user_tick(void);                   /* timer: wake waiting processes */
 void user_screen(bool ours);            /* the GUI gained/lost the screen */
+bool user_cad(void);                    /* keyboard IRQ: Ctrl+Alt+Del; false if no GUI */
 /* After the session: the first process's exit code (>= 0) or
  * -(exception number + 1). */
 int  user_result(void);

@@ -140,7 +140,11 @@ void ui_init_classes(void)
     builtin(WC_SCROLLBAR, scrollbar_proc, false);
     builtin(WC_TRACKBAR, trackbar_proc, false);
     builtin(WC_PROGRESS, progress_proc, true);
+    builtin(WC_COMBOBOX, combo_proc, false);
+    builtin(WC_TABCONTROL, tab_proc, false);
+    builtin(WC_UPDOWN, updown_proc, false);
     builtin("#MENU", menu_popup_proc, false)->noactivate = true;   /* menus never activate */
+    builtin("#COMBOLBOX", combolist_proc, false)->noactivate = true;   /* nor combo lists */
     builtin("#MSGBOX", msgbox_proc, false);
 }
 

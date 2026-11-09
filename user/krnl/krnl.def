@@ -45,3 +45,5 @@ EXPORTS
     LocalReAlloc
     LocalFree
     LocalSize
+    EnumProcesses
+    TaskListShown

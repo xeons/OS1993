@@ -83,6 +83,11 @@ static struct {
     volatile int   focus_event;             /* -1 none, else EV_FOCUS key */
     bool           background;              /* VGA ports trapped */
     int            lock_owner[LOCK_MAX];    /* pid, 0 = free */
+    volatile bool  cad_event;               /* Ctrl+Alt+Del for the GUI ... */
+    volatile uint32_t cad_tick;             /* ... pressed then (0: no question) */
+    volatile bool  cad_acked;               /* the shell showed its task list */
+    volatile bool  cad_again;               /* pressed on the emergency screen */
+    bool           emergency;               /* the VMM's own screen is up */
 } u = { .focus_event = -1 };
 
 /* Work only the console thread can do (it owns the System VM's DOS):
@@ -568,9 +573,122 @@ static void lock_handoff(int n)
     }
 }
 
+/* ---- Ctrl+Alt+Del ------------------------------------------------------------ */
+
+/* Keyboard IRQ. The GUI gets EV_CAD and the shell answers by showing its
+ * task list; if it hasn't within two seconds, the window system is stuck
+ * (a program holding its lock in a loop) and the VMM steps in. */
+bool user_cad(void)
+{
+    if (!u.running || !(u.flags & UINFO_GRAPHICS))
+        return false;
+    if (u.emergency) {
+        u.cad_again = true;
+        return true;
+    }
+    if (vm_focus())
+        vm_set_focus(NULL);                         /* the GUI to the front */
+    u.cad_event = true;
+    u.cad_acked = false;
+    u.cad_tick = timer_ticks() | 1;
+    for (int i = 0; i < PROC_MAX; i++)
+        if (procs[i].state == P_RUNNING)
+            wake_proc(&procs[i]);
+    return true;
+}
+
+static void kill_proc(struct process *p)
+{
+    klog("VMM: ending %s (process %d)\n", p->name, p->pid);
+    p->killed = true;
+    p->lock_wait = -1;
+    thread_wake(p->thread);                         /* ends on its way to ring 3 */
+}
+
+#define EM_ATTR  0x1F                               /* white on blue */
+#define EM_HI    0x71                               /* blue on grey */
+
+static void em_text(int row, int col, uint8_t attr, const char *s)
+{
+    volatile uint8_t *v = KLOW(0xB8000);
+    for (; *s && col < 80; s++, col++) {
+        v[(row * 80 + col) * 2] = (uint8_t)*s;
+        v[(row * 80 + col) * 2 + 1] = attr;
+    }
+}
+
+/* The VMM's own screen, in text mode over the GUI, as Windows 3.1 had for
+ * a program that stopped responding. Console thread. */
+static void emergency(void)
+{
+    klog("VMM: Ctrl+Alt+Del: the window system is not responding\n");
+    u.emergency = true;
+    u.cad_again = false;
+    user_screen(false);                             /* GUI: hands off the VGA */
+    u.focus_event = -1;
+    vga_console_suspend();                          /* save the desktop; text mode */
+    while (keyboard_read() >= 0)
+        ;
+    int sel = 0, n = 0;
+    struct process *list[PROC_MAX];
+    for (int i = 0; i < PROC_MAX; i++)
+        if (procs[i].state == P_RUNNING && !procs[i].killed) {
+            if (u.lock_owner[0] == procs[i].pid)
+                sel = n;
+            list[n++] = &procs[i];
+        }
+    bool done = false;
+    while (!done && u.running) {
+        volatile uint8_t *v = KLOW(0xB8000);
+        for (int i = 0; i < 80 * 25; i++) { v[i * 2] = ' '; v[i * 2 + 1] = EM_ATTR; }
+        em_text(4, 36, EM_HI, " OS1993 ");
+        em_text(6, 6, EM_ATTR, "The window system is not responding. The program holding it is");
+        em_text(7, 6, EM_ATTR, "marked; it may be busy, or stuck. Programs running:");
+        for (int i = 0; i < n; i++) {
+            char line[48];
+            ksnprintf(line, sizeof line, " %c %-12s %s%s ", i == sel ? '>' : ' ', list[i]->name,
+                      list[i]->pid == u.leader ? "(shell) " : "",
+                      u.lock_owner[0] == list[i]->pid ? "(holds the window system)" : "");
+            em_text(9 + i, 10, i == sel ? EM_HI : EM_ATTR, line);
+        }
+        em_text(18, 6, EM_ATTR, "*  Up and Down choose a program; ENTER ends it.");
+        em_text(19, 6, EM_ATTR, "*  ESC returns to OS1993 to wait for it.");
+        em_text(20, 6, EM_ATTR, "*  CTRL+ALT+DEL again ends every program and the GUI.");
+        em_text(23, 24, EM_ATTR, "Press any of these keys to continue");
+
+        int sc;
+        while ((sc = keyboard_read()) < 0 && !u.cad_again && u.running)
+            sched_wait();
+        if (u.cad_again) {                          /* everything goes */
+            klog("VMM: ending the GUI session\n");
+            for (int i = 0; i < n; i++)
+                kill_proc(list[i]);
+            done = true;
+        } else if (sc == 0x48 && sel > 0) {         /* Up */
+            sel--;
+        } else if (sc == 0x50 && sel < n - 1) {     /* Down */
+            sel++;
+        } else if (sc == 0x1C && n) {               /* Enter */
+            kill_proc(list[sel]);
+            done = true;
+        } else if (sc == 0x01) {                    /* Esc */
+            done = true;
+        }
+    }
+    while (keyboard_read() >= 0)                    /* the key's release */
+        ;
+    vga_console_resume();
+    u.emergency = false;
+    u.cad_tick = 0;
+    user_screen(true);                              /* the GUI repaints */
+}
+
 /* Console thread, every loop: run exec requests, free ended processes. */
 void user_service(void)
 {
+    if (u.running && u.cad_tick && !u.cad_acked && timer_ticks() - u.cad_tick > 36)
+        emergency();
+
     uint32_t f = irq_save();
     for (int i = 0; i < PROC_MAX; i++) {
         struct process *p = &procs[i];
@@ -957,7 +1075,10 @@ void syscall_dispatch(struct regs *r)
             e.type = EV_FOCUS;
             e.key = (uint16_t)u.focus_event;
             u.focus_event = -1;
-        } else if ((sc = vm_focus() == NULL ? keyboard_read() : -1) >= 0) {
+        } else if (u.cad_event) {
+            e.type = EV_CAD;
+            u.cad_event = false;
+        } else if ((sc = vm_focus() == NULL && !u.emergency ? keyboard_read() : -1) >= 0) {
             e.type = EV_KEY;
             e.key = (uint16_t)sc;
         } else if (!mouse_get_event(&e)) {
@@ -971,6 +1092,31 @@ void syscall_dispatch(struct regs *r)
     case SYS_MOUSE:
         r->eax = mouse_present();
         break;
+    case SYS_TASKLIST_ACK:
+        u.cad_acked = true;
+        r->eax = 0;
+        break;
+    case SYS_PROC_LIST: {
+        uint32_t n = 0, max = r->ecx;
+        if (max > PROC_MAX) max = PROC_MAX;
+        if (!user_range_ok(r->ebx, max * sizeof(struct proc_entry))) {
+            r->eax = (uint32_t)-1;
+            break;
+        }
+        struct proc_entry *out = (struct proc_entry *)(uintptr_t)r->ebx;
+        for (int i = 0; i < PROC_MAX && n < max; i++) {
+            struct process *p = &procs[i];
+            if (p->state != P_RUNNING || p->killed)
+                continue;
+            out[n].pid = (uint32_t)p->pid;
+            out[n].flags = (p->pid == u.leader ? PROC_LEADER : 0) |
+                           (u.lock_owner[0] == p->pid ? PROC_UI_LOCK : 0);
+            memcpy(out[n].name, p->name, sizeof out[n].name);
+            n++;
+        }
+        r->eax = n;
+        break;
+    }
     case SYS_NEW_SESSION: {
         struct vm *vm = dos_new_session();
         r->eax = vm ? (uint32_t)vm->id : (uint32_t)-1;

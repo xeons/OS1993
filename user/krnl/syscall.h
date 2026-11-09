@@ -39,6 +39,8 @@ static inline int  sys_lock(int n)           { return (int)syscall3(SYS_LOCK, (u
 static inline int  sys_unlock(int n)         { return (int)syscall3(SYS_UNLOCK, (uint32_t)n, 0, 0); }
 static inline int  sys_time(struct systime *t) { return (int)syscall3(SYS_TIME, (uint32_t)t, 0, 0); }
 static inline uint32_t sys_exits(void)       { return syscall3(SYS_PROC_EXITS, 0, 0, 0); }
+static inline int  sys_tasklist_ack(void)    { return (int)syscall3(SYS_TASKLIST_ACK, 0, 0, 0); }
+static inline int  sys_proc_list(struct proc_entry *p, int n) { return (int)syscall3(SYS_PROC_LIST, (uint32_t)p, (uint32_t)n, 0); }
 static inline uint32_t sys_sbrk(uint32_t n)  { return syscall3(SYS_SBRK, n, 0, 0); }
 static inline int  sys_file(uint32_t op, struct file_args *a) { return (int)syscall3(SYS_FILE, op, (uint32_t)a, 0); }
 __attribute__((noreturn))

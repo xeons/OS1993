@@ -105,6 +105,121 @@ static void open_run(void)
     SetFocus(GetDlgItem(run_box, 100));
 }
 
+/* ---- Close Program (Ctrl+Alt+Del) ------------------------------------------------ */
+
+#define ID_TASKS    300
+#define ID_ENDTASK  301
+#define ID_SHUTDN   302
+
+static HWND task_box;
+static int task_pids[PROC_MAX];
+static char task_names[PROC_MAX][16];
+static int ntask_pids;
+
+static void shut_down(void);
+
+struct find_title { int pid; char *out; };
+
+static bool title_of(HWND h, LPARAM l)                  /* a process's main window */
+{
+    struct find_title *f = (struct find_title *)l;
+    unsigned style = (unsigned)GetWindowLong(h, GWL_STYLE);
+    if (GetWindowProcessId(h) != f->pid || !IsWindowVisible(h) || GetParent(h) ||
+        (style & WS_CAPTION) != WS_CAPTION)
+        return true;
+    GetWindowText(h, f->out, 40);
+    return false;
+}
+
+static void fill_tasks(void)
+{
+    HWND list = GetDlgItem(task_box, ID_TASKS);
+    SendMessage(list, LB_RESETCONTENT, 0, 0);
+    PROCESSENTRY p[PROC_MAX];
+    ntask_pids = EnumProcesses(p, PROC_MAX);
+    for (int i = 0; i < ntask_pids; i++) {
+        char text[48] = "";
+        task_pids[i] = (int)p[i].pid;
+        strncpy0(task_names[i], p[i].name, sizeof task_names[i]);
+        if (p[i].flags & PROC_LEADER) {
+            strncpy0(text, "Shell", sizeof text);
+        } else {
+            struct find_title f = { (int)p[i].pid, text };
+            EnumWindows(title_of, (LPARAM)&f);
+            if (!text[0])
+                strncpy0(text, p[i].name, sizeof text);
+        }
+        SendMessage(list, LB_ADDSTRING, 0, (LPARAM)text);
+        DebugLog("task %s: %s", p[i].name, text);
+    }
+    SendMessage(list, LB_SETCURSEL, 0, 0);
+}
+
+static LRESULT task_proc(HWND h, unsigned msg, WPARAM wp, LPARAM lp)
+{
+    switch (msg) {
+    case WM_CREATE:
+        CreateWindow(WC_LISTBOX, "", WS_CHILD | WS_VISIBLE | WS_TABSTOP | LBS_NOTIFY,
+                     9, 8, 302, 118, h, ID_TASKS, NULL);
+        CreateWindow(WC_STATIC, "Ending a program loses its unsaved work.", WS_CHILD | WS_VISIBLE,
+                     12, 132, 300, 16, h, 0, NULL);
+        CreateWindow(WC_BUTTON, "End Task", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
+                     8, 156, 92, 30, h, ID_ENDTASK, NULL);
+        CreateWindow(WC_BUTTON, "Shut Down", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+                     114, 160, 92, 22, h, ID_SHUTDN, NULL);
+        CreateWindow(WC_BUTTON, "Cancel", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+                     220, 160, 92, 22, h, IDCANCEL, NULL);
+        return 0;
+    case WM_COMMAND:
+        switch (LOWORD(wp)) {
+        case ID_ENDTASK: {
+            int i = (int)SendMessage(GetDlgItem(h, ID_TASKS), LB_GETCURSEL, 0, 0);
+            if (i < 0 || i >= ntask_pids)
+                break;
+            if (task_pids[i] == GetCurrentProcessId()) {   /* the shell itself */
+                DestroyWindow(h);
+                shut_down();
+                break;
+            }
+            DebugLog("end task %s", task_names[i]);
+            TerminateProcess(task_pids[i]);
+            SetTimer(h, 1, 300);                        /* the list, once it's gone */
+            break;
+        }
+        case ID_SHUTDN:
+            DestroyWindow(h);
+            shut_down();
+            break;
+        case IDCANCEL:
+            DestroyWindow(h);
+            break;
+        }
+        return 0;
+    case WM_TIMER:
+        KillTimer(h, 1);
+        fill_tasks();
+        return 0;
+    case WM_DESTROY:
+        task_box = NULL;
+        return 0;
+    }
+    return DefWindowProc(h, msg, wp, lp);
+}
+
+static void close_program(void)
+{
+    TaskListShown();                                    /* the VMM needn't step in */
+    if (!task_box) {
+        task_box = CreateWindowEx(WS_EX_TOPMOST, "ShellTasks", "Close Program", WS_DIALOG,
+                                  155, 110, 330, 222, NULL, 0, NULL);
+        fill_tasks();
+        ShowWindow(task_box, SW_SHOW);
+    }
+    SetForegroundWindow(task_box);
+    SetFocus(GetDlgItem(task_box, ID_TASKS));
+    DebugLog("close program");
+}
+
 /* ---- the Start menu ------------------------------------------------------------- */
 
 enum { ID_PROGRAM = 100, ID_RUN = 200, ID_ABOUT, ID_SHUTDOWN };
@@ -340,6 +455,10 @@ static LRESULT taskbar_proc(HWND h, unsigned msg, WPARAM wp, LPARAM lp)
         taskbar_paint(h);
         return 0;
     case WM_SHELLHOOK: {
+        if (wp == HSHELL_TASKMAN) {
+            close_program();
+            return 0;
+        }
         HWND w = (HWND)lp;
         if (wp == HSHELL_WINDOWCREATED) task_add(w);
         if (wp == HSHELL_WINDOWDESTROYED) task_remove(w);
@@ -526,6 +645,8 @@ int main(void)
     RegisterClass(&dc);
     RegisterClass(&tc);
     RegisterClass(&rc);
+    WNDCLASS kc = { .name = "ShellTasks", .proc = task_proc, .background = C_FACE, .icon = ICON_APP };
+    RegisterClass(&kc);
 
     desktop = CreateWindowEx(WS_EX_TOOLWINDOW, DESKTOP_CLASS, "Desktop", WS_POPUP,
                              0, 0, 640, 480, NULL, 0, NULL);
@@ -543,6 +664,8 @@ int main(void)
     DebugLog("shell ready");
     while (GetMessage(&msg)) {
         if (run_box && IsDialogMessage(run_box, &msg))
+            continue;
+        if (task_box && IsDialogMessage(task_box, &msg))
             continue;
         TranslateMessage(&msg);
         DispatchMessage(&msg);

@@ -41,6 +41,10 @@ int      CreateProcess(const char *program, const char *args);  /* -> pid, or -1
 int      GetCurrentProcessId(void);
 bool     IsProcessAlive(int pid);
 bool     TerminateProcess(int pid);
+typedef struct proc_entry PROCESSENTRY;          /* pid, flags (PROC_*), name */
+int      EnumProcesses(PROCESSENTRY *list, int max);    /* -> how many */
+void     TaskListShown(void);                   /* the shell answers Ctrl+Alt+Del (HSHELL_TASKMAN);
+                                                   without it the VMM steps in */
 uint32_t GetProcessExitCount(void);             /* processes ended so far */
 
 /* Waiting and locks (IPC primitives; UI.DLL builds messages on them) */
@@ -285,6 +289,9 @@ enum {
 #define WC_SCROLLBAR  "SCROLLBAR"
 #define WC_TRACKBAR   "TRACKBAR"
 #define WC_PROGRESS   "PROGRESS"
+#define WC_COMBOBOX   "COMBOBOX"
+#define WC_TABCONTROL "TABCONTROL"
+#define WC_UPDOWN     "UPDOWN"
 
 /* Button styles and messages */
 #define BS_PUSHBUTTON       0x0
@@ -349,6 +356,81 @@ enum {
 #define PBM_SETPOS          (WM_USER + 2)
 #define PBM_GETPOS          (WM_USER + 8)
 
+/* Combo box. The window's height is the closed box's (Windows counts the
+ * list too); the list drops below it, sized to at most 8 rows. Item
+ * strings are copied into the owning process's heap. CB_SHOWDROPDOWN 1
+ * returns once the list has closed again (the list runs a modal loop). */
+#define CBS_DROPDOWN        0x0002      /* an editable field and the arrow */
+#define CBS_DROPDOWNLIST    0x0003      /* a box showing the selection and the arrow */
+#define CB_ADDSTRING        0x0143      /* lp = text -> index */
+#define CB_DELETESTRING     0x0144      /* wp = index -> items left */
+#define CB_GETCOUNT         0x0146
+#define CB_GETCURSEL        0x0147
+#define CB_GETLBTEXT        0x0148      /* wp = index, lp = buffer (big enough) -> length */
+#define CB_GETLBTEXTLEN     0x0149
+#define CB_INSERTSTRING     0x014A      /* wp = index (-1: the end), lp = text */
+#define CB_RESETCONTENT     0x014B
+#define CB_FINDSTRING       0x014C      /* wp = start after (-1: all), lp = prefix -> index */
+#define CB_SETCURSEL        0x014E      /* wp = index (-1: none) */
+#define CB_SHOWDROPDOWN     0x014F      /* wp = 1 opens the list, 0 closes it */
+#define CB_GETDROPPEDSTATE  0x0157
+#define CB_FINDSTRINGEXACT  0x0158      /* as CB_FINDSTRING, the whole text (any case) */
+#define CBN_SELCHANGE       1
+#define CBN_EDITCHANGE      5           /* CBS_DROPDOWN: the text was typed */
+#define CBN_DROPDOWN        7
+#define CBN_CLOSEUP         8
+#define CB_ERR              (-1)
+
+/* Tab control. Tabs along the top; the program shows the page itself
+ * (on TCN_SELCHANGE: hide one set of controls, show another). Windows
+ * notifies with WM_NOTIFY, which OS1993 doesn't have: here it is
+ * WM_COMMAND with HIWORD(wParam) = TCN_* and lParam = the tab control;
+ * returning nonzero to TCN_SELCHANGING keeps the current tab. TCIF_TEXT
+ * and TCIF_PARAM are the item fields there are; texts keep 31 characters. */
+#define TCM_FIRST           0x1300
+#define TCM_GETITEMCOUNT    (TCM_FIRST + 4)
+#define TCM_GETITEM         (TCM_FIRST + 5)     /* wp = index, lp = TCITEM * */
+#define TCM_SETITEM         (TCM_FIRST + 6)
+#define TCM_INSERTITEM      (TCM_FIRST + 7)     /* wp = index, lp = TCITEM * -> index */
+#define TCM_DELETEITEM      (TCM_FIRST + 8)
+#define TCM_DELETEALLITEMS  (TCM_FIRST + 9)
+#define TCM_GETITEMRECT     (TCM_FIRST + 10)    /* wp = index, lp = RECT * (its client coords) */
+#define TCM_GETCURSEL       (TCM_FIRST + 11)
+#define TCM_SETCURSEL       (TCM_FIRST + 12)    /* no notification -> the previous one */
+#define TCM_ADJUSTRECT      (TCM_FIRST + 40)    /* lp = RECT *; wp 0: window -> page, 1: back */
+#define TCM_GETCURFOCUS     (TCM_FIRST + 47)
+#define TCM_SETCURFOCUS     (TCM_FIRST + 48)    /* as a click: notifies */
+#define TCIF_TEXT           0x0001
+#define TCIF_PARAM          0x0008
+#define TCN_SELCHANGE       0xFDD9      /* Windows' -551, as a 16-bit WM_COMMAND code */
+#define TCN_SELCHANGING     0xFDD8      /* -552 */
+typedef struct {
+    unsigned    mask;                   /* TCIF_* */
+    unsigned    dwState, dwStateMask;   /* (unused) */
+    char       *pszText;
+    int         cchTextMax;             /* TCM_GETITEM: the buffer's size */
+    int         iImage;                 /* (unused) */
+    LPARAM      lParam;
+} TCITEM;
+
+/* Up-down (spin) control: two arrow buttons that step a position through
+ * a range, repeating while held. The parent hears WM_VSCROLL (WM_HSCROLL
+ * with UDS_HORZ) SB_THUMBPOSITION with the new position in HIWORD(wParam),
+ * and SB_ENDSCROLL when the mouse lets go. The range starts as 0..100
+ * (Windows' is 100..0); max below min makes the up arrow count down. */
+#define UDS_WRAP            0x0001      /* past one end to the other */
+#define UDS_SETBUDDYINT     0x0002      /* the position is the buddy's text */
+#define UDS_ALIGNRIGHT      0x0004      /* sit at the buddy's right, as tall as it */
+#define UDS_AUTOBUDDY       0x0010      /* the buddy is the sibling created before it */
+#define UDS_ARROWKEYS       0x0020      /* Up/Down in the buddy step it */
+#define UDS_HORZ            0x0040      /* arrows side by side */
+#define UDM_SETRANGE        (WM_USER + 101)     /* lp = MAKELPARAM(max, min) */
+#define UDM_GETRANGE        (WM_USER + 102)     /* -> MAKELONG(max, min) */
+#define UDM_SETPOS          (WM_USER + 103)     /* lp = position -> the old one */
+#define UDM_GETPOS          (WM_USER + 104)     /* -> MAKELONG(position, error) */
+#define UDM_SETBUDDY        (WM_USER + 105)     /* wp = HWND -> the old buddy */
+#define UDM_GETBUDDY        (WM_USER + 106)
+
 /* ShowWindow */
 #define SW_HIDE             0
 #define SW_SHOWNORMAL       1
@@ -368,6 +450,7 @@ enum {
 #define HSHELL_WINDOWDESTROYED 2
 #define HSHELL_WINDOWACTIVATED 4
 #define HSHELL_REDRAW          6        /* title or state changed */
+#define HSHELL_TASKMAN         7        /* Ctrl+Alt+Del: show the task list */
 
 /* SystemParametersInfo */
 #define SPI_SETWORKAREA     0x002F      /* pv = RECT *: where windows maximize */
