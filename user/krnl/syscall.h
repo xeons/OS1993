@@ -41,6 +41,9 @@ static inline int  sys_time(struct systime *t) { return (int)syscall3(SYS_TIME, 
 static inline uint32_t sys_exits(void)       { return syscall3(SYS_PROC_EXITS, 0, 0, 0); }
 static inline int  sys_tasklist_ack(void)    { return (int)syscall3(SYS_TASKLIST_ACK, 0, 0, 0); }
 static inline int  sys_proc_list(struct proc_entry *p, int n) { return (int)syscall3(SYS_PROC_LIST, (uint32_t)p, (uint32_t)n, 0); }
+static inline int  sys_display_info(struct display_info *d) { return (int)syscall3(SYS_DISPLAY_INFO, (uint32_t)d, 0, 0); }
+static inline int  sys_display_modes(struct display_mode *m, int n) { return (int)syscall3(SYS_DISPLAY_MODES, (uint32_t)m, (uint32_t)n, 0); }
+static inline int  sys_display_set(int w, int h, int bpp) { return (int)syscall3(SYS_DISPLAY_SET, (uint32_t)w, (uint32_t)h, (uint32_t)bpp); }
 static inline uint32_t sys_sbrk(uint32_t n)  { return syscall3(SYS_SBRK, n, 0, 0); }
 static inline int  sys_file(uint32_t op, struct file_args *a) { return (int)syscall3(SYS_FILE, op, (uint32_t)a, 0); }
 __attribute__((noreturn))

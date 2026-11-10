@@ -13,6 +13,21 @@ import time
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BUILD = os.path.join(ROOT, "build")
 QDIR = os.path.join(BUILD, "qemu")
+
+
+def vga_rom_dir():
+    """QEMU's ISA VGA (with the Bochs VBE registers) loads vgabios.bin, which
+    distributions ship as vgabios-isavga.bin: a directory that has it."""
+    d = os.path.join(BUILD, "qemu-rom")
+    os.makedirs(d, exist_ok=True)
+    link = os.path.join(d, "vgabios.bin")
+    if not os.path.exists(link):
+        for base in ("/usr/share/qemu", "/usr/share/qemu-firmware", "/usr/share/seabios"):
+            src = os.path.join(base, "vgabios-isavga.bin")
+            if os.path.exists(src):
+                os.symlink(src, link)
+                break
+    return d
 IMG = os.path.join(BUILD, "freedos.img")
 
 KEYS = {" ": "spc", "\n": "ret", ".": "dot", ",": "comma", "-": "minus", "/": "slash",
@@ -89,11 +104,12 @@ class Machine:
         for f in ("monitor.sock", "qmp.sock", "SERIAL.LOG"):
             if os.path.exists(f):
                 os.unlink(f)
+        rom = vga_rom_dir()
         self.qemu = subprocess.Popen([
             # vmport is on by default for isapc; off keeps the plain relative
             # PS/2 path that mouse_move can drive.
             "qemu-system-i386", "-M", "isapc,vmport=on" if self.vmport else "isapc,vmport=off",
-            "-cpu", "486", "-m", "16",
+            "-cpu", "486", "-m", "16", "-vga", "std", "-L", rom, "-L", "/usr/share/qemu",
             "-drive", f"file={IMG},format=raw,if=ide", "-serial", "file:SERIAL.LOG",
             "-device", "isa-debug-exit,iobase=0xf4,iosize=4",
             "-display", "none", "-monitor", "unix:monitor.sock,server,nowait",

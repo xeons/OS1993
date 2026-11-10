@@ -36,8 +36,8 @@ def main():
         m.goto(30, 466); m.click()
         b = m.screenshot("shell-start")
         check(near(pixel(b, 2, 400), rgb(BLACK)), "the Start menu rises from the Start button")
-        m.goto(60, 371)                             # hover "Programs": the submenu opens
-        m.goto(220, 371); m.click()                 # "Calculator"
+        m.goto(60, 353)                             # hover "Programs": the submenu opens
+        m.goto(220, 353); m.click()                 # "Calculator"
         check(m.wait_log("GUI: launch Calculator") and m.wait_log("USER: started CALC.BIN"),
               "Start > Programs > Calculator starts a process")
         check(m.wait_log("GUI: calculator ready"), "the Calculator runs")

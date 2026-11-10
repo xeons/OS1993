@@ -17,18 +17,11 @@
 
 #define REGION_MAX 48
 
-struct gfx ui_gfx;                          /* this process's view of S->back */
+struct gfx ui_gfx;                          /* this process's view of the back buffer */
 static struct dc paint_dc;
 static struct wnd *painting;
 
 struct region { int n; RECT r[REGION_MAX]; };
-
-void ui_screen_init(void)
-{
-    const struct user_info *info = GetStartupInfo();
-    gfx_init(&ui_screen, (volatile uint8_t *)info->vga, (const uint8_t *)info->font);
-    gfx_init_mem(&ui_gfx, S->back, (const uint8_t *)info->font);
-}
 
 /* ---- regions ------------------------------------------------------------- */
 
@@ -87,7 +80,7 @@ static void subtract_above(struct region *g, struct wnd *t)
 
 void ui_invalidate_screen(int x, int y, int w, int h)
 {
-    RECT r = { x, y, x + w, y + h }, scr = { 0, 0, 640, 480 }, in;
+    RECT r = { x, y, x + w, y + h }, scr = { 0, 0, S->scr_w, S->scr_h }, in;
     if (!rect_intersect(r, scr, &r))
         return;
     for (int i = 0; i < S->ntops; i++) {
@@ -151,7 +144,7 @@ void ui_set_background(bool background)
 {
     S->background = background;
     if (!background)                            /* the VDD restored an old image */
-        ui_invalidate_screen(0, 0, 640, 480);
+        ui_invalidate_screen(0, 0, S->scr_w, S->scr_h);
 }
 
 /* ---- presenting ------------------------------------------------------------- */
@@ -165,7 +158,7 @@ void ui_present(int x0, int y0, int x1, int y1)
     bool outl = S->in.outline_on;
     if (outl) ui_outline(false);
     if (cur) ui_cursor(false);
-    gfx_present(&ui_gfx, ui_screen.fb, x0, y0, x1 - x0, y1 - y0);
+    gfx_present(&ui_gfx, &ui_screen, x0, y0, x1 - x0, y1 - y0);
     ui_cursor(true);                            /* also after a repaint from scratch */
     if (outl) ui_outline(true);
 }
@@ -448,6 +441,13 @@ void DrawRoundRect(HDC dc, const RECT *r, uint8_t c)
     SetPixel(dc, x + w - 2, y + 1, c);
     SetPixel(dc, x + 1, y + h - 2, c);
     SetPixel(dc, x + w - 2, y + h - 2, c);
+}
+
+void FillRectRGB(HDC dc, const RECT *r, uint8_t red, uint8_t green, uint8_t blue)
+{
+    dc_apply(dc);
+    gfx_fill_rgb(&ui_gfx, dc->ox + r->left, dc->oy + r->top, r->right - r->left, r->bottom - r->top,
+                 red, green, blue);
 }
 
 int TextWidth(const char *s) { return (int)strlen(s) * 8; }

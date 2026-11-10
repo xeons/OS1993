@@ -251,11 +251,11 @@ int MessageBox(HWND owner, const char *text, const char *caption, unsigned type)
     struct wnd *ow = owner ? wnd_from(owner) : NULL;
     if (ow)
         ow = wnd_top(ow);
-    RECT area = { 0, 0, 640, 480 };
+    RECT area = S->work;
     if (ow && ow->visible && ow->state != WS_STATE_MIN)
         frame_outer(ow, &area);
-    int x = clampi(area.left + (area.right - area.left - w) / 2, 0, 640 - w);
-    int y = clampi(area.top + (area.bottom - area.top - h) / 3, 0, 480 - h);
+    int x = clampi(area.left + (area.right - area.left - w) / 2, 0, S->scr_w - w);
+    int y = clampi(area.top + (area.bottom - area.top - h) / 3, 0, S->scr_h - h);
 
     bool reenable = ow && ow->enabled;
     if (ow)

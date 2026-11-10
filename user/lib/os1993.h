@@ -90,6 +90,12 @@ void    *LocalReAlloc(void *p, uint32_t size, unsigned flags);
 void    *LocalFree(void *p);                            /* -> NULL */
 uint32_t LocalSize(void *p);
 
+/* The display, for UI.DLL (programs use EnumDisplaySettings and
+ * ChangeDisplaySettings): the current mode, the modes there are, a switch. */
+bool     GetDisplayInfo(struct display_info *d);
+int      GetDisplayModes(struct display_mode *list, int max);  /* -> how many */
+bool     SetDisplayMode(int width, int height, int bpp);
+
 /* Raw input, for UI.DLL */
 bool     GetInputEvent(struct user_event *e);
 void     WaitForInput(void);                    /* sleep until input or a tick */
@@ -185,7 +191,8 @@ enum {
 #define WM_SYSKEYDOWN       0x0104
 #define WM_SYSKEYUP         0x0105
 #define WM_CONTEXTMENU      0x007B
-#define WM_STYLECHANGED     0x007D  /* after SetWindowLong(GWL_STYLE): wParam = GWL_STYLE */  /* wParam = window clicked, lParam = screen x,y */
+#define WM_STYLECHANGED     0x007D  /* after SetWindowLong(GWL_STYLE): wParam = GWL_STYLE */
+#define WM_DISPLAYCHANGE    0x007E  /* the display mode changed: wParam = bits, lParam = w, h */  /* wParam = window clicked, lParam = screen x,y */
 #define WM_COMMAND          0x0111
 #define WM_SYSCOMMAND       0x0112
 #define WM_TIMER            0x0113
@@ -554,6 +561,19 @@ bool    RegisterShellHookWindow(HWND hwnd);         /* gets WM_SHELLHOOK */
 bool    SetShellWindow(HWND hwnd);                  /* the desktop: kept at the bottom */
 HWND    GetShellWindow(void);
 bool    SystemParametersInfo(unsigned action, unsigned param, void *pv, unsigned flags);
+
+/* The screen and its modes, as in Win32 */
+#define SM_CXSCREEN         0
+#define SM_CYSCREEN         1
+#define ENUM_CURRENT_SETTINGS (-1)
+#define DISP_CHANGE_SUCCESSFUL 0
+#define DISP_CHANGE_FAILED  (-1)
+#define DISP_CHANGE_BADMODE (-2)
+typedef struct { uint32_t dmPelsWidth, dmPelsHeight, dmBitsPerPel; } DEVMODE;
+int     GetSystemMetrics(int index);
+bool    EnumDisplaySettings(int index, DEVMODE *dm);        /* index 0..: the modes */
+int     ChangeDisplaySettings(const DEVMODE *dm, unsigned flags);
+void    FillRectRGB(HDC dc, const RECT *r, uint8_t red, uint8_t green, uint8_t blue);
 
 /* The clipboard: text, shared by every process */
 bool    SetClipboardText(const char *text, int len);        /* len -1: up to the NUL */

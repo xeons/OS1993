@@ -18,6 +18,8 @@
 #define TRAY_MAX    8
 #define CELL_W      88
 #define CELL_H      62
+#define SCR_W()     GetSystemMetrics(SM_CXSCREEN)
+#define SCR_H()     GetSystemMetrics(SM_CYSCREEN)
 
 static HWND desktop, taskbar;
 
@@ -220,9 +222,289 @@ static void close_program(void)
     DebugLog("close program");
 }
 
+/* ---- Display Properties ------------------------------------------------------------ */
+
+#define ID_RES      400
+#define ID_DEPTH    401
+#define ID_KEEPTXT  410
+
+static HWND display_box;
+static DEVMODE res_list[16];                /* the sizes offered ... */
+static int nres;
+static int depth_list[8];                   /* ... and the depths */
+static int ndepth;
+
+static const char *depth_name(int bpp)
+{
+    switch (bpp) {
+    case 4:  return "16 colors";
+    case 8:  return "256 colors";
+    case 16: return "High Color (16 bit)";
+    case 32: return "True Color (32 bit)";
+    }
+    return "?";
+}
+
+static bool mode_exists(int w, int h, int bpp)
+{
+    DEVMODE dm;
+    for (int i = 0; EnumDisplaySettings(i, &dm); i++)
+        if ((int)dm.dmPelsWidth == w && (int)dm.dmPelsHeight == h && (int)dm.dmBitsPerPel == bpp)
+            return true;
+    return false;
+}
+
+static void put_int(char *out, int v)
+{
+    char d[12];
+    int n = 0, k = 0;
+    do { d[n++] = (char)('0' + v % 10); v /= 10; } while (v);
+    while (n) out[k++] = d[--n];
+    out[k] = '\0';
+}
+
+/* OS1993.INI keeps the mode for the next session. */
+static void save_mode(const DEVMODE *dm)
+{
+    char text[96] = "[display]\r\nwidth=", num[12];
+    put_int(num, (int)dm->dmPelsWidth);  strncpy0(text + strlen(text), num, sizeof text - strlen(text));
+    strncpy0(text + strlen(text), "\r\nheight=", sizeof text - strlen(text));
+    put_int(num, (int)dm->dmPelsHeight); strncpy0(text + strlen(text), num, sizeof text - strlen(text));
+    strncpy0(text + strlen(text), "\r\nbits=", sizeof text - strlen(text));
+    put_int(num, (int)dm->dmBitsPerPel); strncpy0(text + strlen(text), num, sizeof text - strlen(text));
+    strncpy0(text + strlen(text), "\r\n", sizeof text - strlen(text));
+    HANDLE f = CreateFile("OS1993.INI", GENERIC_WRITE, CREATE_ALWAYS);
+    if (f != INVALID_HANDLE_VALUE) {
+        uint32_t done;
+        WriteFile(f, text, (uint32_t)strlen(text), &done);
+        CloseHandle(f);
+    }
+}
+
+static bool load_mode(DEVMODE *dm)
+{
+    char text[256];
+    uint32_t got = 0;
+    HANDLE f = CreateFile("OS1993.INI", GENERIC_READ, OPEN_EXISTING);
+    if (f == INVALID_HANDLE_VALUE)
+        return false;
+    ReadFile(f, text, sizeof text - 1, &got);
+    CloseHandle(f);
+    text[got] = '\0';
+    *dm = (DEVMODE){ 0, 0, 0 };
+    for (char *p = text; *p; ) {
+        char *key = p;
+        while (*p && *p != '=' && *p != '\n') p++;
+        if (*p != '=') { while (*p && *p != '\n') p++; if (*p) p++; continue; }
+        *p++ = '\0';
+        uint32_t v = 0;
+        while (*p >= '0' && *p <= '9') v = v * 10 + (uint32_t)(*p++ - '0');
+        if (!strcmp(key, "width"))  dm->dmPelsWidth = v;
+        if (!strcmp(key, "height")) dm->dmPelsHeight = v;
+        if (!strcmp(key, "bits"))   dm->dmBitsPerPel = v;
+        while (*p && *p != '\n') p++;
+        if (*p) p++;
+    }
+    return dm->dmPelsWidth && dm->dmPelsHeight && dm->dmBitsPerPel;
+}
+
+/* "Keep this setting?": answered, or 15 seconds and it goes back. */
+static int keep_left;
+static bool keep_done;
+static int keep_answer;
+
+static void keep_text(HWND h)
+{
+    char text[64] = "Reverting in ", num[12];
+    put_int(num, keep_left);
+    strncpy0(text + strlen(text), num, sizeof text - strlen(text));
+    strncpy0(text + strlen(text), " seconds.", sizeof text - strlen(text));
+    SetDlgItemText(h, ID_KEEPTXT, text);
+}
+
+static LRESULT keep_proc(HWND h, unsigned msg, WPARAM wp, LPARAM lp)
+{
+    switch (msg) {
+    case WM_CREATE:
+        CreateWindow(WC_STATIC, "Do you want to keep this setting?", WS_CHILD | WS_VISIBLE,
+                     12, 12, 290, 16, h, 0, NULL);
+        CreateWindow(WC_STATIC, "", WS_CHILD | WS_VISIBLE, 12, 32, 290, 16, h, ID_KEEPTXT, NULL);
+        CreateWindow(WC_BUTTON, "Yes", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
+                     118, 58, 84, 30, h, IDYES, NULL);
+        CreateWindow(WC_BUTTON, "No", WS_CHILD | WS_VISIBLE | WS_TABSTOP, 212, 62, 76, 22, h, IDNO, NULL);
+        SetTimer(h, 1, 1000);
+        return 0;
+    case WM_TIMER:
+        if (--keep_left <= 0) {
+            keep_answer = IDNO;
+            keep_done = true;
+        } else {
+            keep_text(h);
+        }
+        return 0;
+    case WM_COMMAND:
+        if (LOWORD(wp) == IDYES || LOWORD(wp) == IDNO || LOWORD(wp) == IDCANCEL) {
+            keep_answer = LOWORD(wp) == IDYES ? IDYES : IDNO;
+            keep_done = true;
+        }
+        return 0;
+    case WM_CLOSE:
+        keep_answer = IDNO;
+        keep_done = true;
+        return 0;
+    }
+    return DefWindowProc(h, msg, wp, lp);
+}
+
+static bool keep_setting(void)
+{
+    keep_left = 15;
+    keep_done = false;
+    keep_answer = IDNO;
+    int w = 320, hh = 130;
+    HWND h = CreateWindowEx(WS_EX_TOPMOST, "ShellKeep", "Display Properties", WS_CAPTION | WS_VISIBLE,
+                            (SCR_W() - w) / 2, (SCR_H() - hh) / 3, w, hh, NULL, 0, NULL);
+    keep_text(h);
+    SetFocus(GetDlgItem(h, IDYES));
+    MSG m;
+    while (!keep_done && GetMessage(&m)) {
+        if (!IsDialogMessage(h, &m)) {
+            TranslateMessage(&m);
+            DispatchMessage(&m);
+        }
+    }
+    DestroyWindow(h);
+    return keep_answer == IDYES;
+}
+
+static void apply_display(int w, int h, int bpp)
+{
+    DEVMODE old, dm = { (uint32_t)w, (uint32_t)h, (uint32_t)bpp };
+    EnumDisplaySettings(ENUM_CURRENT_SETTINGS, &old);
+    if (old.dmPelsWidth == dm.dmPelsWidth && old.dmPelsHeight == dm.dmPelsHeight &&
+        old.dmBitsPerPel == dm.dmBitsPerPel)
+        return;
+    DebugLog("display settings %dx%dx%d", w, h, bpp);
+    if (ChangeDisplaySettings(&dm, 0) != DISP_CHANGE_SUCCESSFUL) {
+        MessageBox(desktop, "The display could not be switched to that mode.", "Display Properties",
+                   MB_OK | MB_ICONERROR);
+        return;
+    }
+    if (keep_setting()) {
+        save_mode(&dm);
+        DebugLog("display kept");
+    } else {
+        ChangeDisplaySettings(&old, 0);
+        DebugLog("display reverted");
+    }
+}
+
+static LRESULT display_proc(HWND h, unsigned msg, WPARAM wp, LPARAM lp)
+{
+    switch (msg) {
+    case WM_CREATE: {
+        CreateWindow(WC_STATIC, "Screen area:", WS_CHILD | WS_VISIBLE, 12, 12, 200, 16, h, 0, NULL);
+        HWND res = CreateWindow(WC_COMBOBOX, "", WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST,
+                                12, 30, 236, 24, h, ID_RES, NULL);
+        CreateWindow(WC_STATIC, "Colors:", WS_CHILD | WS_VISIBLE, 12, 66, 200, 16, h, 0, NULL);
+        HWND dep = CreateWindow(WC_COMBOBOX, "", WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST,
+                                12, 84, 236, 24, h, ID_DEPTH, NULL);
+        CreateWindow(WC_BUTTON, "OK", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
+                     70, 124, 84, 30, h, IDOK, NULL);
+        CreateWindow(WC_BUTTON, "Cancel", WS_CHILD | WS_VISIBLE | WS_TABSTOP, 164, 128, 84, 22, h, IDCANCEL, NULL);
+        DEVMODE cur, dm;
+        EnumDisplaySettings(ENUM_CURRENT_SETTINGS, &cur);
+        nres = ndepth = 0;
+        for (int i = 0; EnumDisplaySettings(i, &dm); i++) {
+            bool have = false;
+            for (int k = 0; k < nres; k++)
+                if (res_list[k].dmPelsWidth == dm.dmPelsWidth && res_list[k].dmPelsHeight == dm.dmPelsHeight)
+                    have = true;
+            if (!have && nres < 16)
+                res_list[nres++] = dm;
+            have = false;
+            for (int k = 0; k < ndepth; k++)
+                if (depth_list[k] == (int)dm.dmBitsPerPel) have = true;
+            if (!have && ndepth < 8) {                  /* in order */
+                int at = ndepth++;
+                while (at > 0 && depth_list[at - 1] > (int)dm.dmBitsPerPel) {
+                    depth_list[at] = depth_list[at - 1];
+                    at--;
+                }
+                depth_list[at] = (int)dm.dmBitsPerPel;
+            }
+        }
+        for (int i = 0; i < nres; i++) {
+            char text[32], num[12];
+            put_int(text, (int)res_list[i].dmPelsWidth);
+            strncpy0(text + strlen(text), " by ", sizeof text - strlen(text));
+            put_int(num, (int)res_list[i].dmPelsHeight);
+            strncpy0(text + strlen(text), num, sizeof text - strlen(text));
+            strncpy0(text + strlen(text), " pixels", sizeof text - strlen(text));
+            SendMessage(res, CB_ADDSTRING, 0, (LPARAM)text);
+            if (res_list[i].dmPelsWidth == cur.dmPelsWidth && res_list[i].dmPelsHeight == cur.dmPelsHeight)
+                SendMessage(res, CB_SETCURSEL, (WPARAM)i, 0);
+        }
+        for (int i = 0; i < ndepth; i++) {
+            SendMessage(dep, CB_ADDSTRING, 0, (LPARAM)depth_name(depth_list[i]));
+            if (depth_list[i] == (int)cur.dmBitsPerPel)
+                SendMessage(dep, CB_SETCURSEL, (WPARAM)i, 0);
+        }
+        return 0;
+    }
+    case WM_COMMAND:
+        if (LOWORD(wp) == IDOK) {
+            int r = (int)SendMessage(GetDlgItem(h, ID_RES), CB_GETCURSEL, 0, 0);
+            int d = (int)SendMessage(GetDlgItem(h, ID_DEPTH), CB_GETCURSEL, 0, 0);
+            if (r < 0 || d < 0)
+                break;
+            int w = (int)res_list[r].dmPelsWidth, hh = (int)res_list[r].dmPelsHeight, bpp = depth_list[d];
+            if (!mode_exists(w, hh, bpp)) {
+                MessageBox(h, "This display can't show that many colors at that size.\n"
+                           "Choose another combination.", "Display Properties", MB_OK | MB_ICONINFORMATION);
+                break;
+            }
+            DestroyWindow(h);
+            apply_display(w, hh, bpp);
+        } else if (LOWORD(wp) == IDCANCEL) {
+            DestroyWindow(h);
+        }
+        return 0;
+    case WM_DESTROY:
+        display_box = NULL;
+        return 0;
+    }
+    return DefWindowProc(h, msg, wp, lp);
+}
+
+static void open_display(void)
+{
+    if (display_box) {
+        SetForegroundWindow(display_box);
+        return;
+    }
+    int w = 270, hh = 194;
+    display_box = CreateWindow("ShellDisplay", "Display Properties", WS_DIALOG | WS_VISIBLE,
+                               (SCR_W() - w) / 2, (SCR_H() - hh) / 3, w, hh, NULL, 0, NULL);
+    SetFocus(GetDlgItem(display_box, ID_RES));
+    DebugLog("display properties");
+}
+
+/* The desktop and taskbar fit the screen; the rest of it is the work area. */
+static void layout(void)
+{
+    int w = SCR_W(), h = SCR_H();
+    MoveWindow(desktop, 0, 0, w, h, true);
+    MoveWindow(taskbar, 0, h - BAR_H, w, BAR_H, true);
+    RECT work = { 0, 0, w, h - BAR_H };
+    SystemParametersInfo(SPI_SETWORKAREA, 0, &work, 0);
+    InvalidateRect(desktop, NULL);
+    InvalidateRect(taskbar, NULL);
+}
+
 /* ---- the Start menu ------------------------------------------------------------- */
 
-enum { ID_PROGRAM = 100, ID_RUN = 200, ID_ABOUT, ID_SHUTDOWN };
+enum { ID_PROGRAM = 100, ID_RUN = 200, ID_ABOUT, ID_SHUTDOWN, ID_DISPLAY };
 
 static bool start_open;
 
@@ -243,13 +525,14 @@ static void start_menu(void)
         AppendMenu(progs, MF_STRING, ID_PROGRAM + i, programs[i].name);
     AppendMenu(menu, MF_POPUP, (uintptr_t)progs, "&Programs");
     AppendMenu(menu, MF_STRING, ID_RUN, "&Run...");
+    AppendMenu(menu, MF_STRING, ID_DISPLAY, "&Display Settings...");
     AppendMenu(menu, MF_SEPARATOR, 0, NULL);
     AppendMenu(menu, MF_STRING, ID_ABOUT, "&About OS1993...");
     AppendMenu(menu, MF_SEPARATOR, 0, NULL);
     AppendMenu(menu, MF_STRING, ID_SHUTDOWN, "Sh&ut Down...");
     start_open = true;
     InvalidateRect(taskbar, NULL);
-    int id = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_BOTTOMALIGN, 2, 480 - BAR_H + 1, taskbar);
+    int id = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_BOTTOMALIGN, 2, SCR_H() - BAR_H + 1, taskbar);
     DestroyMenu(menu);
     start_open = false;
     InvalidateRect(taskbar, NULL);
@@ -257,6 +540,8 @@ static void start_menu(void)
         launch(programs[id - ID_PROGRAM].file, programs[id - ID_PROGRAM].name);
     else if (id == ID_RUN)
         open_run();
+    else if (id == ID_DISPLAY)
+        open_display();
     else if (id == ID_ABOUT)
         ShellAbout(desktop, "OS1993", "Programs run as separate processes,\neach in its own address space.");
     else if (id == ID_SHUTDOWN)
@@ -316,7 +601,7 @@ static void tasks_refresh(void)
 }
 
 static int tray_width(void) { return 8 + ntray * 20 + 64 + 8; }
-static int tray_left(void)  { return 640 - 4 - tray_width(); }
+static int tray_left(void)  { return SCR_W() - 4 - tray_width(); }
 
 static RECT task_rect(int i)
 {
@@ -356,10 +641,10 @@ static void taskbar_paint(HWND h)
 {
     PAINTSTRUCT ps;
     HDC dc = BeginPaint(h, &ps);
-    RECT all = { 0, 0, 640, BAR_H };
+    RECT all = { 0, 0, SCR_W(), BAR_H };
     FillRect(dc, &all, C_FACE);
-    DrawLine(dc, 0, 0, 640, false, C_GRAY4);
-    DrawLine(dc, 0, 1, 640, false, C_WHITE);
+    DrawLine(dc, 0, 0, SCR_W(), false, C_GRAY4);
+    DrawLine(dc, 0, 1, SCR_W(), false, C_WHITE);
 
     RECT sb = { 2, 3, START_W, BAR_H - 3 };             /* Start */
     bevel_box(dc, sb, start_open);
@@ -380,7 +665,7 @@ static void taskbar_paint(HWND h)
         TextOut(dc, r.left + 23 + down, r.top + 3 + down, title, C_BLACK, -1);
     }
 
-    RECT tr = { tray_left(), 3, 636, BAR_H - 3 };       /* the notification area */
+    RECT tr = { tray_left(), 3, SCR_W() - 4, BAR_H - 3 };   /* the notification area */
     DrawBevel(dc, &tr, false);
     for (int i = 0; i < ntray; i++)
         DrawSmallIcon(dc, tr.left + 6 + i * 20, tr.top + 3, tray[i].icon);
@@ -441,7 +726,7 @@ static void taskbar_click(int x, int y, unsigned mouse_msg)
             return;
         }
     }
-    if (x >= 640 - 4 - 8 - 64 - 4 && mouse_msg == WM_LBUTTONDBLCLK)
+    if (x >= SCR_W() - 4 - 8 - 64 - 4 && mouse_msg == WM_LBUTTONDBLCLK)
         launch("CLOCK.BIN", "Clock");
 }
 
@@ -478,7 +763,7 @@ static LRESULT taskbar_proc(HWND h, unsigned msg, WPARAM wp, LPARAM lp)
         SYSTEMTIME t;
         GetLocalTime(&t);
         if (t.minute != clock_minute) {
-            RECT r = { tray_left(), 0, 640, BAR_H };
+            RECT r = { tray_left(), 0, SCR_W(), BAR_H };
             InvalidateRect(h, &r);
         }
         return 0;
@@ -487,6 +772,9 @@ static LRESULT taskbar_proc(HWND h, unsigned msg, WPARAM wp, LPARAM lp)
     case WM_LBUTTONDBLCLK:
     case WM_RBUTTONUP:
         taskbar_click(GET_X_LPARAM(lp), GET_Y_LPARAM(lp), msg);
+        return 0;
+    case WM_DISPLAYCHANGE:
+        layout();
         return 0;
     case WM_SYSCOMMAND:
         if ((wp & 0xFFF0) == SC_TASKLIST) {
@@ -550,6 +838,17 @@ static void desktop_paint(HWND h)
     PAINTSTRUCT ps;
     HDC dc = BeginPaint(h, &ps);
     bool focused = GetForegroundWindow() == h;
+    DEVMODE mode;
+    EnumDisplaySettings(ENUM_CURRENT_SETTINGS, &mode);
+    if (mode.dmBitsPerPel >= 16) {                      /* real colours: a gradient */
+        int hgt = SCR_H();
+        for (int y = ps.rcPaint.top & ~3; y < ps.rcPaint.bottom; y += 4) {
+            RECT band = { ps.rcPaint.left, y, ps.rcPaint.right, y + 4 };
+            int k = y * 255 / (hgt ? hgt : 1);
+            FillRectRGB(dc, &band, (uint8_t)(40 + k * 20 / 255), (uint8_t)(110 - k * 50 / 255),
+                        (uint8_t)(170 - k * 90 / 255));
+        }
+    }
     for (int i = 0; i < NICONS; i++) {
         RECT c = cell(i);
         DrawIcon(dc, c.left + (CELL_W - 32) / 2, c.top + 2, icons[i].icon);
@@ -619,10 +918,13 @@ static LRESULT desktop_proc(HWND h, unsigned msg, WPARAM wp, LPARAM lp)
         HMENU m = CreatePopupMenu();
         AppendMenu(m, MF_STRING, ID_RUN, "&Run...");
         AppendMenu(m, MF_STRING, ID_ABOUT, "&About OS1993...");
+        AppendMenu(m, MF_SEPARATOR, 0, NULL);
+        AppendMenu(m, MF_STRING, ID_DISPLAY, "Propert&ies");
         int id = TrackPopupMenu(m, TPM_RETURNCMD, GET_X_LPARAM(lp), GET_Y_LPARAM(lp), h);
         DestroyMenu(m);
         if (id == ID_RUN) open_run();
         if (id == ID_ABOUT) ShellAbout(h, "OS1993", NULL);
+        if (id == ID_DISPLAY) open_display();
         return 0;
     }
     case WM_CLOSE:                                      /* Alt+F4 on the desktop */
@@ -647,15 +949,23 @@ int main(void)
     RegisterClass(&rc);
     WNDCLASS kc = { .name = "ShellTasks", .proc = task_proc, .background = C_FACE, .icon = ICON_APP };
     RegisterClass(&kc);
+    WNDCLASS pc = { .name = "ShellDisplay", .proc = display_proc, .background = C_FACE, .icon = ICON_COMPUTER };
+    RegisterClass(&pc);
+    WNDCLASS qc = { .name = "ShellKeep", .proc = keep_proc, .background = C_FACE, .icon = ICON_COMPUTER };
+    RegisterClass(&qc);
+    DEVMODE saved;                                      /* the mode the last session kept */
+    if (load_mode(&saved) && ChangeDisplaySettings(&saved, 0) == DISP_CHANGE_SUCCESSFUL)
+        DebugLog("display %dx%dx%d from OS1993.INI", (int)saved.dmPelsWidth, (int)saved.dmPelsHeight,
+                 (int)saved.dmBitsPerPel);
 
     desktop = CreateWindowEx(WS_EX_TOOLWINDOW, DESKTOP_CLASS, "Desktop", WS_POPUP,
-                             0, 0, 640, 480, NULL, 0, NULL);
+                             0, 0, SCR_W(), SCR_H(), NULL, 0, NULL);
     SetShellWindow(desktop);
     ShowWindow(desktop, SW_SHOW);
     taskbar = CreateWindowEx(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, TRAY_CLASS, "",
-                             WS_POPUP | WS_VISIBLE, 0, 480 - BAR_H, 640, BAR_H, NULL, 0, NULL);
+                             WS_POPUP | WS_VISIBLE, 0, SCR_H() - BAR_H, SCR_W(), BAR_H, NULL, 0, NULL);
     RegisterShellHookWindow(taskbar);
-    RECT work = { 0, 0, 640, 480 - BAR_H };
+    RECT work = { 0, 0, SCR_W(), SCR_H() - BAR_H };
     SystemParametersInfo(SPI_SETWORKAREA, 0, &work, 0);
     EnumWindows(collect, 0);
 
@@ -666,6 +976,8 @@ int main(void)
         if (run_box && IsDialogMessage(run_box, &msg))
             continue;
         if (task_box && IsDialogMessage(task_box, &msg))
+            continue;
+        if (display_box && IsDialogMessage(display_box, &msg))
             continue;
         TranslateMessage(&msg);
         DispatchMessage(&msg);

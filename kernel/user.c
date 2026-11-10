@@ -23,6 +23,7 @@
 #include "kernel.h"
 #include "devices.h"
 #include "files.h"
+#include "display.h"
 #include "gdt.h"
 #include "interrupts.h"
 #include "io.h"
@@ -35,7 +36,9 @@
 
 #define MAX_IMAGE   (2u * 1024 * 1024)
 #define USER_PDES   512                     /* PDEs 0-511 cover user space */
-#define SHARED_PDE  (USER_SHARED >> 22)
+#define SHARED_FIRST (int)(USER_SHARED >> 22)     /* the shared region's PDEs */
+#define SHARED_LAST  (int)((USER_SHARED_END - 1) >> 22)
+#define SHARED_N     (SHARED_LAST - SHARED_FIRST + 1)
 
 /* A module's image, kept while the session lasts so later processes can
  * share it: the frames of its read-only pages, mapped into each of them
@@ -98,7 +101,8 @@ static struct {
     int            leader;                  /* its first process */
     int            result;
     uint32_t       flags;
-    uint32_t       shared_pde;              /* the shared region's page table */
+    bool           shared_on;               /* the shared region exists */
+    uint32_t       shared_pdes[SHARED_N];   /* ... its page tables */
     uint32_t       prints;                  /* SYS_PRINT calls (self-test) */
     uint32_t       exits;
     volatile int   focus_event;             /* -1 none, else EV_FOCUS key */
@@ -205,7 +209,7 @@ static void release_address_space(struct process *p)
     p->heap_end = USER_HEAP;
     volatile uint32_t *pd = (volatile uint32_t *)PD_WINDOW;
     for (int i = 1; i < USER_PDES; i++) {
-        if (i == SHARED_PDE)                    /* shared_destroy's business */
+        if (i >= SHARED_FIRST && i <= SHARED_LAST)  /* shared_destroy's business */
             continue;
         if (pd[i] & PTE_P)
             pmm_free(pd[i] & PAGE_MASK);
@@ -214,30 +218,47 @@ static void release_address_space(struct process *p)
     tlb_flush();
 }
 
-/* The shared region: video memory and the arena, for the whole session. */
+/* The shared region, for the whole session: VGA memory, the arena, and
+ * the display's back buffer and framebuffer. All its page tables exist
+ * from the start, so every process has them and later mappings (a display
+ * mode change) show up in all of them at once. */
 static bool shared_create(void)
 {
+    volatile uint32_t *pd = (volatile uint32_t *)PD_WINDOW;
+    for (int i = SHARED_FIRST; i <= SHARED_LAST; i++) {
+        if (pd[i] & PTE_P)
+            continue;
+        uint32_t pt = pmm_alloc();
+        if (!pt)
+            return false;
+        memset(phys_to_virt(pt), 0, PAGE_SIZE);
+        pd[i] = pt | PTE_P | PTE_W | PTE_U;
+    }
+    u.shared_on = true;
+    for (int i = SHARED_FIRST; i <= SHARED_LAST; i++)
+        u.shared_pdes[i - SHARED_FIRST] = pd[i];
     for (uint32_t i = 0; i < 16; i++)
         if (vmm_map(USER_VGA + i * PAGE_SIZE, 0xA0000 + i * PAGE_SIZE, PTE_W | PTE_U) != 0)
             return false;
-    if (!map_zeroed(USER_ARENA, USER_ARENA_SIZE))
-        return false;
-    u.shared_pde = ((volatile uint32_t *)PD_WINDOW)[SHARED_PDE];
-    return true;
+    return map_zeroed(USER_ARENA, USER_ARENA_SIZE) && display_session_start();
 }
 
 static void shared_destroy(void)                /* the last process is installed */
 {
-    if (!u.shared_pde)
+    if (!u.shared_on)
         return;
+    display_session_end();
     for (uint32_t i = 0; i < 16; i++)
         vmm_unmap(USER_VGA + i * PAGE_SIZE);    /* device memory: don't free */
     unmap_free(USER_ARENA, USER_ARENA_SIZE);
     volatile uint32_t *pd = (volatile uint32_t *)PD_WINDOW;
-    pmm_free(u.shared_pde & PAGE_MASK);
-    pd[SHARED_PDE] = 0;
+    for (int i = SHARED_FIRST; i <= SHARED_LAST; i++) {
+        if (pd[i] & PTE_P)
+            pmm_free(pd[i] & PAGE_MASK);
+        pd[i] = 0;
+    }
     tlb_flush();
-    u.shared_pde = 0;
+    u.shared_on = false;
 }
 
 /* Is [p, p+len) ordinary mapped user memory? */
@@ -630,13 +651,14 @@ static int spawn(const char *name, const char *args)
     p->pid = next_pid++;
     p->lock_wait = -1;
     p->heap_end = USER_HEAP;
-    p->pde[SHARED_PDE] = u.shared_pde;              /* 0 for the first one */
+    for (int i = SHARED_FIRST; i <= SHARED_LAST; i++)   /* none for the first one */
+        p->pde[i] = u.shared_on ? u.shared_pdes[i - SHARED_FIRST] : 0;
 
     struct thread *self = current;                  /* load into p's space */
     struct process *was = self->proc;
     self->proc = p;
     proc_switch(p);
-    bool first = !u.shared_pde;
+    bool first = !u.shared_on;
     struct module *prog = load_module(p, name, MOD_PROGRAM);
     bool ok = prog && resolve(p, prog, 0) &&
               map_zeroed(USER_STACK_TOP - USER_STACK_SIZE, USER_STACK_SIZE) &&
@@ -650,7 +672,7 @@ static int spawn(const char *name, const char *args)
         info->font = USER_INFO + PAGE_SIZE;
         info->pid = (uint32_t)p->pid;
         memcpy((void *)(uintptr_t)info->font, vga_font8x16(), 256 * 16);
-        if (u.shared_pde) {
+        if (u.shared_on) {
             info->vga = USER_VGA;
             info->arena = USER_ARENA;
             info->arena_size = USER_ARENA_SIZE;
@@ -1259,6 +1281,30 @@ void syscall_dispatch(struct regs *r)
     }
     case SYS_MOUSE:
         r->eax = mouse_present();
+        break;
+    case SYS_DISPLAY_INFO:
+        if (!user_writable(r->ebx, sizeof(struct display_info))) {
+            r->eax = (uint32_t)-1;
+            break;
+        }
+        memcpy((void *)(uintptr_t)r->ebx, display_current(), sizeof(struct display_info));
+        r->eax = 0;
+        break;
+    case SYS_DISPLAY_MODES: {
+        struct display_mode list[16];
+        int n = display_modes(list, 16), max = (int)r->ecx;
+        if (max > n) max = n;
+        if (max < 0 || !user_writable(r->ebx, (uint32_t)max * sizeof list[0])) {
+            r->eax = (uint32_t)-1;
+            break;
+        }
+        memcpy((void *)(uintptr_t)r->ebx, list, (uint32_t)max * sizeof list[0]);
+        r->eax = (uint32_t)n;
+        break;
+    }
+    case SYS_DISPLAY_SET:
+        r->eax = u.shared_on && !u.background && !u.emergency
+                 ? (uint32_t)display_set((int)r->ebx, (int)r->ecx, (int)r->edx) : (uint32_t)-1;
         break;
     case SYS_TASKLIST_ACK:
         u.cad_acked = true;

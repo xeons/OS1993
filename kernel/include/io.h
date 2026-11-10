@@ -18,6 +18,18 @@ static inline uint8_t inb(uint16_t port)
 /* ~1us delay for slow ISA devices (POST code port). */
 static inline void io_wait(void) { outb(0x80, 0); }
 
+static inline void outw(uint16_t port, uint16_t v)
+{
+    __asm__ volatile("outw %0, %1" : : "a"(v), "Nd"(port));
+}
+
+static inline uint16_t inw(uint16_t port)
+{
+    uint16_t v;
+    __asm__ volatile("inw %1, %0" : "=a"(v) : "Nd"(port));
+    return v;
+}
+
 static inline void cpu_cli(void) { __asm__ volatile("cli" ::: "memory"); }
 static inline void cpu_sti(void) { __asm__ volatile("sti" ::: "memory"); }
 

@@ -95,13 +95,14 @@ static HWND open(FINDREPLACE *fr, bool replace)
     }
     if (!fr || !fr->find || !fr->max || !IsWindow(fr->owner))
         return NULL;
-    RECT o;
+    RECT o, work;
     GetWindowRect(fr->owner, &o);
+    SystemParametersInfo(SPI_GETWORKAREA, 0, &work, 0);
     int w = 350 + 10, h = (replace ? 124 : 94) + 30;
     int x = o.left + (o.right - o.left - w) / 2, y = o.top + 40;
     if (x < 0) x = 0;
-    if (x + w > 640) x = 640 - w;
-    if (y + h > 452) y = 452 - h;
+    if (x + w > work.right) x = work.right - w;
+    if (y + h > work.bottom) y = work.bottom - h;
     /* the id says which dialog to build (WM_CREATE reads it) */
     HWND d = CreateWindow("#FINDDLG", replace ? "Replace" : "Find", WS_CAPTION | WS_SYSMENU,
                           x, y, w, h, fr->owner, replace ? 1 : 0, fr);

@@ -98,3 +98,7 @@ EXPORTS
     SetClipboardText
     GetClipboardText
     GetClipboardTextLength
+    GetSystemMetrics
+    EnumDisplaySettings
+    ChangeDisplaySettings
+    FillRectRGB

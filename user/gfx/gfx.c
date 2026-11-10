@@ -1,5 +1,8 @@
 /*
- * gfx.c -- 640x480x16 planar VGA drawing.
+ * gfx.c -- drawing: 640x480x16 planar VGA, and linear 8/16/32-bit modes.
+ *
+ * Linear modes (the VBE adapter's) are plain memory: a row of pixels of
+ * 1, 2 or 4 bytes each. Every drawing function handles that case first.
  *
  * Mode 12h keeps each of the 4 colour bits in its own plane, 8 pixels per
  * byte. We draw with the graphics controller's Set/Reset registers: the
@@ -41,6 +44,11 @@ static inline void put_masked(volatile uint8_t *p, uint8_t mask)
 
 void gfx_init(struct gfx *g, volatile uint8_t *fb, const uint8_t *font8x16)
 {
+    g->bpp = 4;
+    g->base = 0;
+    g->pitch = 80;
+    for (int i = 0; i < 16; i++)
+        g->pal[i] = (uint32_t)i;
     g->fb = fb;
     g->planes = 0;
     g->width = 640;
@@ -56,6 +64,117 @@ void gfx_init_mem(struct gfx *g, uint8_t *planes, const uint8_t *font8x16)
     g->planes = planes;
 }
 
+void gfx_init_linear(struct gfx *g, uint8_t *base, int w, int h, int bpp, uint32_t pitch,
+                     const uint8_t *font8x16)
+{
+    gfx_init(g, 0, font8x16);
+    g->bpp = bpp;
+    g->base = base;
+    g->pitch = pitch;
+    g->width = w;
+    g->height = h;
+    gfx_noclip(g);
+}
+
+/* ---- linear modes ----------------------------------------------------------- */
+
+static int clip_rect(const struct gfx *g, int *x, int *y, int *w, int *h);
+
+static uint32_t xor_value(const struct gfx *g)
+{
+    return g->bpp == 32 ? 0x00FFFFFFu : g->bpp == 16 ? 0xFFFFu : 0x0Fu;
+}
+
+static void lin_fill(struct gfx *g, int x, int y, int w, int h, uint32_t v, bool xor)
+{
+    if (!clip_rect(g, &x, &y, &w, &h))
+        return;
+    for (int row = y; row < y + h; row++) {
+        uint8_t *p = g->base + (uint32_t)row * g->pitch;
+        if (g->bpp == 8) {
+            uint8_t *q = p + x;
+            for (int i = 0; i < w; i++)
+                q[i] = xor ? (uint8_t)(q[i] ^ v) : (uint8_t)v;
+        } else if (g->bpp == 16) {
+            uint16_t *q = (uint16_t *)p + x;
+            for (int i = 0; i < w; i++)
+                q[i] = xor ? (uint16_t)(q[i] ^ v) : (uint16_t)v;
+        } else {
+            uint32_t *q = (uint32_t *)p + x;
+            if (xor)
+                for (int i = 0; i < w; i++) q[i] ^= v;
+            else
+                for (int i = 0; i < w; i++) q[i] = v;
+        }
+    }
+}
+
+static void lin_put(struct gfx *g, int x, int y, uint32_t v, bool xor)
+{
+    if (x < g->cx0 || y < g->cy0 || x >= g->cx1 || y >= g->cy1)
+        return;
+    uint8_t *p = g->base + (uint32_t)y * g->pitch;
+    if (g->bpp == 8)       { uint8_t *q = p + x;              *q = xor ? (uint8_t)(*q ^ v) : (uint8_t)v; }
+    else if (g->bpp == 16) { uint16_t *q = (uint16_t *)p + x; *q = xor ? (uint16_t)(*q ^ v) : (uint16_t)v; }
+    else                   { uint32_t *q = (uint32_t *)p + x; *q = xor ? *q ^ v : v; }
+}
+
+static void lin_rows(struct gfx *g, int x, int y, const uint16_t *rows, int h, uint32_t v, bool xor)
+{
+    for (int r = 0; r < h; r++)
+        for (int b = 0; rows[r] && b < 16; b++)
+            if (rows[r] & (0x8000 >> b))
+                lin_put(g, x + b, y + r, v, xor);
+}
+
+static uint8_t nearest(const struct gfx *g, uint8_t r, uint8_t gr, uint8_t b)
+{
+    int best = 0;
+    int32_t best_d = 0x7FFFFFFF;
+    for (int i = 0; i < 16; i++) {
+        int32_t dr = r - g->theme[i][0] * 255 / 63, dg = gr - g->theme[i][1] * 255 / 63,
+                db = b - g->theme[i][2] * 255 / 63;
+        int32_t d = dr * dr + dg * dg + db * db;
+        if (d < best_d) { best_d = d; best = i; }
+    }
+    return (uint8_t)best;
+}
+
+static uint32_t rgb_value(const struct gfx *g, uint8_t r, uint8_t gr, uint8_t b)
+{
+    if (g->bpp <= 8)
+        return g->pal[nearest(g, r, gr, b)];
+    return ((uint32_t)(r >> (8 - g->rsize)) << g->rpos) | ((uint32_t)(gr >> (8 - g->gsize)) << g->gpos) |
+           ((uint32_t)(b >> (8 - g->bsize)) << g->bpos);
+}
+
+void gfx_set_colors(struct gfx *g, const uint8_t rgb[16][3], int rpos, int rsize,
+                    int gpos, int gsize, int bpos, int bsize)
+{
+    g->rpos = (uint8_t)rpos; g->rsize = (uint8_t)rsize;
+    g->gpos = (uint8_t)gpos; g->gsize = (uint8_t)gsize;
+    g->bpos = (uint8_t)bpos; g->bsize = (uint8_t)bsize;
+    for (int i = 0; i < 16; i++) {
+        for (int c = 0; c < 3; c++)
+            g->theme[i][c] = rgb[i][c];
+        g->pal[i] = (uint32_t)i;
+    }
+    if (g->bpp > 8)
+        for (int i = 0; i < 16; i++)
+            g->pal[i] = rgb_value(g, (uint8_t)(rgb[i][0] * 255 / 63), (uint8_t)(rgb[i][1] * 255 / 63),
+                                  (uint8_t)(rgb[i][2] * 255 / 63));
+}
+
+void gfx_fill_rgb(struct gfx *g, int x, int y, int w, int h, uint8_t r, uint8_t gr, uint8_t b)
+{
+    if (g->bpp == 4)
+        gfx_fill(g, x, y, w, h, nearest(g, r, gr, b));
+    else
+        lin_fill(g, x, y, w, h, rgb_value(g, r, gr, b), false);
+}
+
+/* ---- planar mode 12h ---------------------------------------------------------- */
+
 /* Memory target: apply what one Set/Reset write would do to all 4 planes. */
 static inline void mem_put(struct gfx *g, int row, int col, uint8_t mask,
                            uint8_t color, uint8_t fn)
@@ -70,14 +189,29 @@ static inline void mem_put(struct gfx *g, int row, int col, uint8_t mask,
     }
 }
 
-void gfx_present(const struct gfx *m, volatile uint8_t *fb, int x, int y, int w, int h)
+void gfx_present(const struct gfx *m, struct gfx *screen, int x, int y, int w, int h)
 {
     if (x < 0) { w += x; x = 0; }
     if (y < 0) { h += y; y = 0; }
-    if (x + w > 640) w = 640 - x;
-    if (y + h > 480) h = 480 - y;
+    if (x + w > m->width) w = m->width - x;
+    if (y + h > m->height) h = m->height - y;
     if (w <= 0 || h <= 0)
         return;
+    if (m->bpp != 4) {                  /* rows of whole pixels */
+        uint32_t bytes = (uint32_t)w * (uint32_t)(m->bpp / 8), off = (uint32_t)x * (uint32_t)(m->bpp / 8);
+        for (int row = y; row < y + h; row++) {
+            const uint8_t *src = m->base + (uint32_t)row * m->pitch + off;
+            uint8_t *dst = screen->base + (uint32_t)row * screen->pitch + off;
+            uint32_t n = bytes;
+            while (n >= 4 && !((uintptr_t)dst & 3)) {
+                *(uint32_t *)dst = *(const uint32_t *)src;
+                dst += 4; src += 4; n -= 4;
+            }
+            while (n--) *dst++ = *src++;
+        }
+        return;
+    }
+    volatile uint8_t *fb = screen->fb;
     int b1 = x >> 3, b2 = (x + w - 1) >> 3, n = b2 - b1 + 1;
     gc(5, 0x00);                        /* write mode 0, plain copies */
     gc(3, 0x00);
@@ -150,6 +284,10 @@ static int clip_rect(const struct gfx *g, int *x, int *y, int *w, int *h)
 
 static void fill_fn(struct gfx *g, int x, int y, int w, int h, uint8_t color, uint8_t fn)
 {
+    if (g->bpp != 4) {
+        lin_fill(g, x, y, w, h, fn ? xor_value(g) : g->pal[color & 15], fn != 0);
+        return;
+    }
     if (!clip_rect(g, &x, &y, &w, &h))
         return;
     int b1 = x >> 3, b2 = (x + w - 1) >> 3;
@@ -201,6 +339,10 @@ void gfx_xor_frame(struct gfx *g, int x, int y, int w, int h, int t)
 
 void gfx_pixel(struct gfx *g, int x, int y, uint8_t color)
 {
+    if (g->bpp != 4) {
+        lin_put(g, x, y, g->pal[color & 15], false);
+        return;
+    }
     if (x < g->cx0 || y < g->cy0 || x >= g->cx1 || y >= g->cy1)
         return;
     if (g->planes) {
@@ -229,6 +371,10 @@ static void blit_rows(struct gfx *g, int x, int y, const uint16_t *rows, int h,
 {
     if (x >= g->cx1 || y >= g->cy1 || x + 16 <= g->cx0 || y + h <= g->cy0)
         return;
+    if (g->bpp != 4) {
+        lin_rows(g, x, y, rows, h, fn ? xor_value(g) : g->pal[color & 15], fn != 0);
+        return;
+    }
     int shift = x & 7, col = x >> 3;
     uint8_t cm[3];
     for (int b = 0; b < 3; b++)
@@ -292,6 +438,12 @@ void gfx_blit8(struct gfx *g, int x, int y, int w, int h, const uint8_t *pixels,
         return;
     for (int row = y0; row < y1; row++) {
         const uint8_t *src = pixels + (row - y) * stride - x;
+        if (g->bpp != 4) {
+            for (int px = x0; px < x1; px++)
+                if (src[px] != 0xFF)
+                    lin_put(g, px, row, g->pal[src[px] & 15], false);
+            continue;
+        }
         if (!g->planes) {
             for (int px = x0; px < x1; px++)
                 if (src[px] != 0xFF)

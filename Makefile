@@ -19,6 +19,7 @@
 #   make qemu-files file access: Paint's Open/Save, the file dialogs, the disk
 #   make qemu-notepad  Notepad and the multi-line edit control, the clipboard
 #   make qemu-tasklist Ctrl+Alt+Del: Close Program, and the VMM's screen for a hung GUI
+#   make qemu-vesa     the VBE display driver: higher resolutions and colour depths
 #   make clean
 
 CC      := i686-elf-gcc
@@ -59,7 +60,7 @@ SHELL_BASE  := $(shell $(MKDEF) user/shell/shell.def base)
 # DLLs: header, code, export table, import libraries of what they call
 KRNL_OBJ  := $(U)/hdr/KERNEL.DLL.o $(U)/krnl/krnl.o $(U)/gen/krnl_exports.o $(U)/lib/lib.o
 GFX_OBJ   := $(U)/hdr/GFX.DLL.o $(U)/gfx/gfx.o $(U)/gen/gfx_exports.o $(U)/lib/lib.o
-UI_SRC    := wnd queue input frame paint menu accel msgbox dialog button static edit medit listbox \
+UI_SRC    := wnd queue input frame paint display menu accel msgbox dialog button static edit medit listbox \
              scroll trackbar combo tab updown kbd theme
 UI_OBJ    := $(U)/hdr/UI.DLL.o $(patsubst %,$(U)/ui/%.o,$(UI_SRC)) \
              $(U)/gen/ui_exports.o $(U)/gen/gfx_imports.o $(U)/gen/krnl_imports.o $(U)/lib/lib.o
@@ -83,7 +84,7 @@ KERNEL_ASM := $(wildcard kernel/*.asm)
 KERNEL_OBJ := $(patsubst kernel/%.asm,$(BUILD)/kernel/%.o,$(KERNEL_ASM)) \
               $(patsubst kernel/%.c,$(BUILD)/kernel/%.o,$(KERNEL_C))
 
-.PHONY: all run test check486 qemu qemu-test qemu-emm386 qemu-sessions qemu-vga qemu-wm qemu-absmouse qemu-menu qemu-controls qemu-msgbox qemu-shell qemu-files qemu-notepad qemu-tasklist clean
+.PHONY: all run test check486 qemu qemu-test qemu-emm386 qemu-sessions qemu-vga qemu-wm qemu-absmouse qemu-menu qemu-controls qemu-msgbox qemu-shell qemu-files qemu-notepad qemu-tasklist qemu-vesa clean
 
 all: $(BUILD)/OS1993.COM $(BUILD)/VMM.BIN $(MODULES)
 
@@ -184,16 +185,24 @@ test: all
 	else echo "  FAIL  on a 386 the loader refuses to start"; exit 1; fi
 
 # QEMU has no 386 model; a 486 with 16 MB is the closest 1993 machine.
-QEMU_ARGS := -M isapc,vmport=on -cpu 486 -m 16 -drive file=$(BUILD)/freedos.img,format=raw,if=ide \
+# -vga std: the ISA VGA with the Bochs VBE registers (display.c); its BIOS is
+# vgabios.bin, shipped as vgabios-isavga.bin (build/qemu-rom has the link).
+QEMU_ROM  := $(BUILD)/qemu-rom/vgabios.bin
+QEMU_ARGS := -M isapc,vmport=on -cpu 486 -m 16 -vga std -L $(BUILD)/qemu-rom -L /usr/share/qemu -drive file=$(BUILD)/freedos.img,format=raw,if=ide \
              -serial file:$(BUILD)/qemu/SERIAL.LOG -device isa-debug-exit,iobase=0xf4,iosize=4
 QEMU_IMG  := $(BUILD)/freedos.img@@32256
 
-qemu: all
+$(QEMU_ROM):
+	@mkdir -p $(dir $@)
+	@for d in /usr/share/qemu /usr/share/qemu-firmware /usr/share/seabios; do \
+	    if [ -e $$d/vgabios-isavga.bin ]; then ln -sf $$d/vgabios-isavga.bin $@; break; fi; done
+
+qemu: all $(QEMU_ROM)
 	@mkdir -p $(BUILD)/qemu
 	tools/mkfreedos.sh normal
 	$(QEMU) $(QEMU_ARGS)
 
-qemu-test: all
+qemu-test: all $(QEMU_ROM)
 	@mkdir -p $(BUILD)/qemu && rm -f $(BUILD)/qemu/*.LOG
 	@tools/mkfreedos.sh normal autotest
 	timeout -s KILL 120 $(QEMU) $(QEMU_ARGS) -display none || true
@@ -242,6 +251,9 @@ qemu-notepad: all
 
 qemu-tasklist: all
 	@tools/qemu-tasklist-test.py
+
+qemu-vesa: all $(QEMU_ROM)
+	@tools/qemu-vesa-test.py
 
 check486: $(BUILD)/vmm.elf $(MODULE_ELFS)
 	@for f in $^; do tools/check486.sh $(OBJDUMP) $$f || exit 1; done

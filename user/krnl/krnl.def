@@ -47,3 +47,6 @@ EXPORTS
     LocalSize
     EnumProcesses
     TaskListShown
+    GetDisplayInfo
+    GetDisplayModes
+    SetDisplayMode

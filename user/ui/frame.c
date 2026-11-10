@@ -27,7 +27,7 @@ void frame_outer(struct wnd *w, RECT *r)
         return;
     }
     if (!w->parent && w->state == WS_STATE_MIN) {
-        int x = 4 + w->min_slot * (TILE_W + 4), y = 480 - TILE_H - 4;
+        int x = 4 + w->min_slot * (TILE_W + 4), y = S->scr_h - TILE_H - 4;
         *r = (RECT){ x, y, x + TILE_W, y + TILE_H };
         return;
     }

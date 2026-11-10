@@ -469,9 +469,9 @@ static void open_popup_at(struct menu *m, int x, int y, bool keyboard, int pos, 
     SendMessage(T.owner, WM_INITMENUPOPUP, (WPARAM)m, MAKELPARAM(pos, m->system));
     int w, h;
     popup_size(m, &w, &h);
-    if (x + w > 640 && flip_x >= 0) x = flip_x - w;
-    if (x + w > 640) x = 640 - w;
-    if (y + h > 480) y = 480 - h;
+    if (x + w > S->scr_w && flip_x >= 0) x = flip_x - w;
+    if (x + w > S->scr_w) x = S->scr_w - w;
+    if (y + h > S->scr_h) y = S->scr_h - h;
     if (x < 0) x = 0;
     if (y < 0) y = 0;
     struct menu_level *lv = &T.lv[T.n];

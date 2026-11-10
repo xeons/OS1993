@@ -21,11 +21,12 @@ are for later stages.
 | `make run`       | boots it in DOSBox-X: 486, 16 MB, XMS, no EMS                 |
 | `make test`      | headless round trip DOS → VMM → DOS, checked automatically    |
 | `make check486`  | fails if any binary contains a post-486 or FPU instruction    |
-| `make qemu`      | boots real FreeDOS 1.3 in QEMU (486, 16 MB, ISA PC); `OS1993` is in `C:\OS1993` |
+| `make qemu`      | boots real FreeDOS 1.3 in QEMU (486, 16 MB, ISA PC with the ISA VGA and its VBE registers); `OS1993` is in `C:\OS1993` |
 | `make qemu-test` | headless FreeDOS run of the same checks as `make test`        |
 | `make qemu-emm386` | FreeDOS with JEMM386: the loader must refuse to start       |
 | `make qemu-sessions` | types into two concurrent DOS sessions via QEMU's monitor |
 | `make qemu-absmouse` | absolute pointer through QEMU's VMware port: the cursor lands on the exact pixel, and clicks hit their control |
+| `make qemu-vesa` | the VBE display driver: Display Properties switches to 1024×768 high colour, 800×600 in 256 colours and true colour, No and the 15-second timeout go back, a DOS session and back keeps the mode, OS1993.INI restores it next session, and 640×480×16 is VGA again |
 | `make qemu-tasklist` | Ctrl+Alt+Del: Close Program ends a program, works from a DOS session, and the VMM's screen ends a program that froze the GUI |
 | `make qemu-notepad` | Notepad: typing, Save As with CR LF, the clipboard between two processes, Open, select/delete/undo, unsaved-changes questions, Find/Find Next/whole words, Replace All and its undo, Word Wrap, the file's bytes on disk |
 | `make qemu-files` | file access: Paint saves, opens and replaces a BMP through the file dialogs, a second process reads it, then the file is checked on the disk image |
@@ -484,7 +485,7 @@ and up-downs. Esc closes the demo.
   acknowledgement. No acknowledgement means no mouse, and the VMM carries on.
 - **Packets.** 3-byte packets resync on bit 3 of the first byte, use 9-bit
   signed deltas, and drop overflows. The kernel keeps an absolute pointer
-  position clamped to 640×480, plus the buttons. The keyboard handler
+  position clamped to the screen (640×480 or the display mode's size), plus the buttons. The keyboard handler
   checks the controller's "aux data" status bit, so a mouse byte arriving
   on IRQ 1 isn't taken for a key.
 - **Delivery.** Events go to the ring-3 GUI while it has the screen.
@@ -523,6 +524,48 @@ ring 3.
   INT 10h AX=1130h. It needs only VGA port access and a pointer to
   A000:0000, and is linked into the ring-3 GUI as its `VGA.DRV`.
 
+## Display modes (VBE)
+
+`kernel/display.c` adds higher resolutions and colour depths to VGA's
+640×480×16. It is a display driver for one card, as Windows' were: the VBE
+adapter that Bochs and QEMU emulate (`-vga std`; on QEMU's ISA machine its
+BIOS is `vgabios-isavga.bin`, linked as `build/qemu-rom/vgabios.bin`).
+
+- **Hardware.** The adapter is programmed through its index/data ports
+  (1CEh/1CFh) rather than INT 10h 4F02h: that gives a linear framebuffer at
+  E0000000h (the ISA BIOS offers banked modes only) and mode switches made
+  of port writes, which also work from the keyboard interrupt (switching to
+  a DOS session) and the emergency screen. `kernel/vbe.c` still asks the
+  VBE BIOS for its version, memory and modes at boot, for the log.
+- **Modes.** 640×480, 800×600, 1024×768 and 1280×1024 in 8 bits (palette),
+  16 (5:6:5) and 32 (8:8:8), the ones that fit the adapter's memory, plus
+  640×480×16 planar (mode 12h), always there.
+- **Memory.** The framebuffer (`USER_FB`, mapped uncached) and the back
+  buffer in the screen's format (`USER_BACK`, up to 8 MB) are in the shared
+  region, whose page tables every process shares, so a switch remaps them
+  once for everyone. `SYS_DISPLAY_INFO/MODES/SET` describe and change the
+  mode; a switch is allowed to the GUI while it has the screen.
+- **Drawing.** GFX.DLL draws linear 8/16/32-bit pixels as well as planar
+  ones. Programs still draw in the theme's 16 colours: 8-bit modes put the
+  theme in the DAC, 16- and 32-bit ones map each to a pixel value;
+  `FillRectRGB` draws any colour (the nearest theme colour where there are
+  only 16 or 256).
+- **Programs.** `EnumDisplaySettings`, `ChangeDisplaySettings` and
+  `GetSystemMetrics(SM_CXSCREEN/SM_CYSCREEN)`, as in Win32. A switch
+  re-creates every process's view of the screen the next time it takes
+  the window system's lock (the mode's generation number has moved), fits
+  maximized windows to the new work area, and posts `WM_DISPLAYCHANGE` to
+  every top-level window; the shell lays out its desktop and taskbar again.
+- **Display Properties** (Start menu, or the desktop's right-click menu)
+  offers the sizes and depths, asks "Keep this setting?" for 15 seconds,
+  and saves a kept mode in `OS1993.INI`, which the shell applies when it
+  starts.
+- **DOS sessions.** Switching to one turns the adapter off (in 256 colours
+  the DAC is saved first); switching back turns it on and the GUI repaints.
+
+Other cards would need the VBE BIOS's own linear modes (mode set with
+INT 10h on the console thread): see TODO.md.
+
 Limitations: DOS sessions must stay in text mode. A DOS program switching
 its VM to graphics isn't virtualized yet. Mono adapters get text only.
 
@@ -540,11 +583,12 @@ kernel/vm.c sched.c switch.asm           VMs, address spaces, focus; threads
 kernel/vmtest.c                          multi-VM self-test
 kernel/dosmgr.c                          one DOS shared by all VMs
 kernel/vga.c gfx.c                       VGA state (VDD), planar drawing
+kernel/display.c vbe.c                   display modes: the VBE adapter, the VBE BIOS probe
 kernel/user.c                            ring-3 loader, INT 30h system calls
 kernel/mouse.c                           PS/2 mouse (IRQ 12)
 user/lib/os1993.h                        the public API; crt0, header, C runtime
 user/krnl/                               KERNEL.DLL (system call wrappers)
-user/gfx/                                GFX.DLL (planar VGA drawing)
+user/gfx/                                GFX.DLL (drawing: planar VGA, linear 8/16/32 bits)
 user/ui/                                 UI.DLL (windows, messages, controls)
 user/shell/                              SHELL.DLL (shell API, stock icons)
 user/apps/                               SHELL.BIN, CALC.BIN, PAINT.BIN, CLOCK.BIN, DEMO.BIN
@@ -592,8 +636,9 @@ tools/                   check486.sh, check-test.sh
    Calculator, Paint and Clock, file access for programs with the Open and
    Save As dialogs, a process heap, the clipboard, a multi-line edit control
    and Notepad (word wrap, Find/Replace), a Ctrl+Alt+Del task list, combo
-   boxes, tabs and up-downs, and code shared between processes. Next:
-   VESA truecolor, finer-grained window system locking.
+   boxes, tabs and up-downs, and code shared between processes, and higher resolutions and colour depths
+   (the VBE display driver, Display Properties). Next: finer-grained window
+   system locking.
 7. **Win16-style API layer.** 16-bit protected-mode apps in ring 3 with LDTs,
    built with Open Watcom.
 8. **Coexisting with EMM386** through VCPI/GEMMIS, and acting as a DPMI host.

@@ -11,6 +11,7 @@
 #include "mm.h"
 #include "v86.h"
 #include "vga.h"
+#include "display.h"
 
 #define MISC_W   0x3C2
 #define MISC_R   0x3CC
@@ -167,6 +168,7 @@ void vga_gfx_leave(void)
 {
     if (!console_gfx)
         return;
+    display_force_off();
     struct v86_regs r = { .eax = 0x0003 };          /* BIOS text mode */
     v86_int(0x10, &r);
     console_gfx = gfx_on_screen = false;
@@ -177,6 +179,12 @@ void vga_console_suspend(void)
 {
     if (!console_gfx || !gfx_on_screen)
         return;
+    if (display_linear()) {         /* the adapter's mode: the GUI repaints later */
+        display_suspend();
+        restore_text_hw();
+        gfx_on_screen = false;
+        return;
+    }
     vga_save_regs(&gfx_regs);       /* as the GUI left them: its palette too */
     plane_access();
     for (int p = 0; p < 4; p++)
@@ -189,6 +197,11 @@ void vga_console_resume(void)
 {
     if (!console_gfx || gfx_on_screen)
         return;
+    if (display_linear()) {
+        display_resume();
+        gfx_on_screen = true;
+        return;
+    }
     plane_access();
     for (int p = 0; p < 4; p++)
         plane_write(p, gfx_planes + p * VGA_PLANE_BYTES, VGA_PLANE_BYTES);
@@ -196,8 +209,15 @@ void vga_console_resume(void)
     gfx_on_screen = true;
 }
 
+/* Back to mode 12h from the adapter's modes (the GUI repaints). */
+void vga_planar_restore(void)
+{
+    vga_load_regs(&gfx_regs);
+}
+
 void vga_force_text(void)
 {
+    display_force_off();
     if (!gfx_on_screen)
         return;
     restore_text_hw();

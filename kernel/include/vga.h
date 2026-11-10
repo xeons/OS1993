@@ -39,6 +39,7 @@ void vga_console_suspend(void);     /* save graphics, switch hardware to text */
 void vga_console_resume(void);      /* restore graphics exactly */
 
 void vga_force_text(void);          /* panic / exit: text mode, no BIOS */
+void vga_planar_restore(void);      /* mode 12h again (leaving the VBE adapter's modes) */
 
 /* Low-level state access (also used by the tests). */
 void vga_save_regs(struct vga_regs *s);

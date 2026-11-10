@@ -29,6 +29,7 @@ void ui_enter(void)
     if (!held) {
         AcquireLock(0);
         held = true;
+        ui_sync_display();                      /* another process may have switched modes */
     }
 }
 
@@ -60,18 +61,24 @@ void InitUI(void)
 {
     ui_pid = GetCurrentProcessId();
     SetWaitHooks(before_wait, after_wait);
-    ui_screen_init();
     if (S->magic != UI_MAGIC) {                 /* the first process sets it up */
+        struct display_info d;
+        GetDisplayInfo(&d);
         memset(S, 0, sizeof *S);
         S->magic = UI_MAGIC;
-        S->work = (RECT){ 0, 0, 640, 480 };
+        S->scr_w = d.width;
+        S->scr_h = d.height;
+        S->bpp = d.bpp;
+        S->mode_gen = d.gen;
+        S->work = (RECT){ 0, 0, S->scr_w, S->scr_h };
         S->in.cur_x = 320;
         S->in.cur_y = 240;
         S->exits_seen = GetProcessExitCount();
         gfx_set_palette(theme_palette);
         ui_init_classes();
-        ui_invalidate_screen(0, 0, 640, 480);
+        ui_invalidate_screen(0, 0, S->scr_w, S->scr_h);
     }
+    ui_screen_init();
     myq = queue_of(ui_pid);
     if (!myq && (myq = queue_of(0)) != NULL) {
         memset(myq, 0, sizeof *myq);

@@ -195,7 +195,8 @@ struct ui_shared {
     RECT           work;                     /* SPI_SETWORKAREA */
     int            clip_len;                 /* the clipboard */
     char           clip[CLIP_MAX];
-    uint8_t        back[4 * GFX_PLANE_BYTES];/* the off-screen copy of the screen */
+    int            scr_w, scr_h, bpp;        /* the display mode */
+    uint32_t       mode_gen;                 /* ... changes counted (GetDisplayInfo gen) */
 };
 
 #define S ((struct ui_shared *)USER_ARENA)
@@ -257,7 +258,8 @@ bool  ui_paint_pending(void);
 void  ui_paint(void);                        /* this process's windows, the desktop */
 void  ui_paint_now(struct wnd *w);           /* w at once (before XOR drawing) */
 void  ui_set_background(bool background);
-void  ui_screen_init(void);
+void  ui_screen_init(void);                  /* display.c: this process's view of the screen */
+void  ui_sync_display(void);                 /* ... caught up with a mode change */
 void  ui_present(int x0, int y0, int x1, int y1);  /* back buffer -> screen */
 
 /* input.c */

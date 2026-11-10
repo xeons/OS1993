@@ -19,3 +19,6 @@ EXPORTS
     gfx_init_mem
     gfx_present
     gfx_blit8
+    gfx_init_linear
+    gfx_set_colors
+    gfx_fill_rgb

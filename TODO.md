@@ -76,9 +76,16 @@ README.md for what already works.
 
 ## Graphics
 
-- [ ] **VESA truecolor backend** (VBE mode set via INT 10h 4F02h, linear
-      or banked framebuffer). The UI uses theme colours only, so it can map
-      them to RGB without changes.
+- [x] Display modes up to 1280x1024 in 8/16/32 bits on the Bochs/QEMU VBE
+      adapter (kernel/display.c), Display Properties, OS1993.INI.
+- [ ] A generic VBE BIOS backend for other cards: mode set with INT 10h
+      4F02h on the console thread (V86), using the BIOS's linear modes
+      (vbe.c already lists them); banked-only cards would need a bank
+      switch per 64 KB in gfx_present.
+- [ ] 15- and 24-bit modes (VBE's 5:5:5 and packed 3-byte pixels).
+- [ ] Hardware cursor / blits where the adapter has them.
+- [ ] Programs that draw only in the theme's 16 colours: a true-colour
+      bitmap API (DIBs) for Paint and images.
 - [ ] VDD for DOS sessions that switch to graphics modes (currently text
       mode only).
 - [ ] Trap CRTC ports for background DOS sessions (a background session's

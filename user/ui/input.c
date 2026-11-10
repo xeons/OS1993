@@ -382,7 +382,7 @@ static RECT moved_to(RECT o, int dx, int dy)
     int w = o.right - o.left, h = o.bottom - o.top;
     RECT r;
     r.left = o.left + dx;
-    r.top = clampi(o.top + dy, 0, 480 - TILE_H);
+    r.top = clampi(o.top + dy, 0, S->scr_h - TILE_H);
     r.right = r.left + w;
     r.bottom = r.top + h;
     return r;

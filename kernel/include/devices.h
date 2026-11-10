@@ -24,5 +24,6 @@ bool mouse_present(void);
 void mouse_set_delivery(bool on);    /* queue events for the GUI */
 bool mouse_get_event(struct user_event *e);
 bool mouse_pending(void);
+void mouse_set_screen(int w, int h);  /* the pointer's range: the display mode */
 
 #endif

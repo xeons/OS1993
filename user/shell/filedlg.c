@@ -233,15 +233,17 @@ static bool run(OPENFILENAME *ofn, bool save)
     HWND owner = ofn->owner;
     while (owner && GetParent(owner))
         owner = GetParent(owner);
-    RECT o = { 0, 0, 640, 452 };
+    RECT o, work;
+    SystemParametersInfo(SPI_GETWORKAREA, 0, &work, 0);
+    o = work;
     if (owner)
         GetWindowRect(owner, &o);
     int w = 304 + 10, hh = 262 + 25 + 5;
     int x = o.left + (o.right - o.left - w) / 2, y = o.top + (o.bottom - o.top - hh) / 3;
     if (x < 0) x = 0;
     if (y < 0) y = 0;
-    if (x + w > 640) x = 640 - w;
-    if (y + hh > 452) y = 452 - hh;
+    if (x + w > work.right) x = work.right - w;
+    if (y + hh > work.bottom) y = work.bottom - hh;
 
     bool reenable = owner && IsWindowEnabled(owner);
     if (owner)

@@ -2,7 +2,7 @@
  * mouse.c -- PS/2 mouse on the 8042's auxiliary port (IRQ 12).
  *
  * The kernel owns the mouse. It keeps an absolute pointer position on the
- * 640x480 screen and queues events for the ring-3 GUI while the GUI has
+ * screen (640x480, or the display mode's size) and queues events for the ring-3 GUI while the GUI has
  * the screen. DOS sessions don't get a mouse yet (that needs a virtual
  * auxiliary device for a DOS mouse driver to talk to).
  *
@@ -50,6 +50,13 @@ static struct user_event queue[QUEUE];
 static unsigned qhead, qtail;
 static bool     deliver;            /* queue events (the GUI has the screen) */
 static bool     absolute;           /* VMware absolute pointer in use */
+static int      screen_w = 640, screen_h = 480;
+
+void mouse_set_screen(int w, int h)
+{
+    screen_w = w;
+    screen_h = h;
+}
 
 static void vmw_call(uint32_t cmd, uint32_t arg, uint32_t r[4])
 {
@@ -129,8 +136,8 @@ static void vmmouse_poll(void)
         if (r[0] == 0xFFFF0000u || (r[0] & 0xFFFF) < 4)
             return;
         vmw_call(VMW_ABS_DATA, 4, r);       /* flags, x, y, wheel */
-        mx = (int)(r[1] * 640 / 65536);
-        my = (int)(r[2] * 480 / 65536);
+        mx = (int)(r[1] * (uint32_t)screen_w / 65536);
+        my = (int)(r[2] * (uint32_t)screen_h / 65536);
         buttons = (uint8_t)(((r[0] & 0x20) ? 1 : 0) | ((r[0] & 0x10) ? 2 : 0) |
                             ((r[0] & 0x08) ? 4 : 0));
         struct user_event e = { .type = EV_MOUSE, .buttons = buttons,
@@ -160,8 +167,8 @@ void mouse_byte(uint8_t b)
     my -= dy;                       /* PS/2 y grows upwards */
     if (mx < 0) mx = 0;
     if (my < 0) my = 0;
-    if (mx > 639) mx = 639;
-    if (my > 479) my = 479;
+    if (mx > screen_w - 1) mx = screen_w - 1;
+    if (my > screen_h - 1) my = screen_h - 1;
     buttons = packet[0] & 0x07;
 
     struct user_event e = { .type = EV_MOUSE, .buttons = buttons,

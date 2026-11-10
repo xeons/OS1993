@@ -21,10 +21,15 @@
 #define USER_INFO       0x7FFF0000u     /* struct user_info + the font */
 #define USER_HEAP       0x20000000u     /* the heap (SYS_SBRK) grows up from here ... */
 #define USER_HEAP_LIMIT 0x60000000u     /* ... to here */
-#define USER_SHARED     0x60000000u     /* shared region (one page table): */
+#define USER_SHARED     0x60000000u     /* shared region (page tables of their own): */
 #define USER_VGA        0x60000000u     /*   A000:0000-AFFF, 64 KB */
 #define USER_ARENA      0x60010000u     /*   the shared arena */
 #define USER_ARENA_SIZE 0x00080000u     /*   512 KB */
+#define USER_BACK       0x60400000u     /*   the off-screen copy of the screen (up to 8 MB) */
+#define USER_BACK_MAX   0x00800000u
+#define USER_FB         0x60C00000u     /*   a linear framebuffer (up to 16 MB) */
+#define USER_FB_MAX     0x01000000u
+#define USER_SHARED_END 0x61C00000u
 #define PROC_MAX        8               /* processes at once */
 #define ARGS_MAX        128
 
@@ -133,6 +138,23 @@ struct user_event {
 #define SYS_SBRK        20              /* EBX = bytes to add -> the old end of the heap, or 0 */
 #define SYS_TASKLIST_ACK 21             /* the shell shows its task list for EV_CAD */
 #define SYS_PROC_LIST   22              /* EBX = struct proc_entry *, ECX = most -> count */
+#define SYS_DISPLAY_INFO 23             /* EBX = struct display_info * */
+#define SYS_DISPLAY_MODES 24            /* EBX = struct display_mode *, ECX = most -> count */
+#define SYS_DISPLAY_SET 25              /* EBX = width, ECX = height, EDX = bits -> 0, or -1 */
+
+/* The display (SYS_DISPLAY_*): VGA's 640x480 in 16 colours (4 bits,
+ * planar), or a linear mode in 8 (palette), 16 (5:6:5) or 32 (8:8:8) bits. */
+struct display_mode { uint16_t width, height; uint8_t bpp, pad[3]; };
+struct display_info {
+    uint16_t width, height;
+    uint8_t  bpp;                       /* 4: planar VGA */
+    uint8_t  red_pos, red_size, green_pos, green_size, blue_pos, blue_size, pad;
+    uint32_t pitch;                     /* bytes per row on screen (planar: 80) */
+    uint32_t fb;                        /* the screen, in user space */
+    uint32_t back;                      /* the off-screen copy (same format, rows of back_pitch) */
+    uint32_t back_pitch;
+    uint32_t gen;                       /* counts mode changes */
+};
 
 struct proc_entry {                     /* a running process (SYS_PROC_LIST) */
     uint32_t pid;
