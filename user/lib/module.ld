@@ -23,6 +23,7 @@ SECTIONS
     __image_size = __image_end - __image_start;
     __mem_size   = __mem_end - __image_start;
     PROVIDE(__exports = 0);
+    __guard = DEFINED(__stack_chk_guard) ? __stack_chk_guard : 0;   /* the loader seeds it */
 
     /DISCARD/ : { *(.comment) *(.eh_frame) *(.note*) }
 }

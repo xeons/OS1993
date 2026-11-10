@@ -20,11 +20,13 @@
 #   make qemu-notepad  Notepad and the multi-line edit control, the clipboard
 #   make qemu-tasklist Ctrl+Alt+Del: Close Program, and the VMM's screen for a hung GUI
 #   make qemu-vesa     the VBE display driver: higher resolutions and colour depths
+#   make qemu-crt      the C runtime (CRT.DLL, libcrt.a) and its protections
 #   make clean
 
 CC      := i686-elf-gcc
 OBJCOPY := i686-elf-objcopy
 OBJDUMP := i686-elf-objdump
+AR      := i686-elf-ar
 NASM    := nasm
 DOSBOX  := dosbox-x
 QEMU    := qemu-system-i386
@@ -49,34 +51,50 @@ MAKEFLAGS   += --no-builtin-rules
 .SUFFIXES:
 U           := $(BUILD)/user
 MKDEF       := python3 tools/mkdef.py
-USER_CFLAGS := $(filter-out -Ikernel/include,$(CFLAGS)) -Iuser/lib -Iuser/gfx -Iuser/ui -Iuser/shell -Ikernel/include -MMD -MP
+# Every ring-3 module is hardened: stack canaries (seeded per process by the
+# loader) and _FORTIFY_SOURCE's checked copies; see user/crt/include/crtdefs.h.
+USER_CFLAGS := $(filter-out -Ikernel/include,$(CFLAGS)) -Iuser/crt/include -Iuser/lib -Iuser/gfx -Iuser/ui -Iuser/shell \
+               -Ikernel/include -fstack-protector-strong -D_FORTIFY_SOURCE=2 -MMD -MP
 MOD_LDFLAGS := -T user/lib/module.ld -nostdlib -ffreestanding \
                -Wl,--build-id=none -Wl,--no-warn-rwx-segments
 KRNL_BASE   := $(shell $(MKDEF) user/krnl/krnl.def base)
 GFX_BASE    := $(shell $(MKDEF) user/gfx/gfx.def base)
 UI_BASE     := $(shell $(MKDEF) user/ui/ui.def base)
 SHELL_BASE  := $(shell $(MKDEF) user/shell/shell.def base)
+CRT_BASE    := $(shell $(MKDEF) user/crt/crt.def base)
+
+# The C runtime, from one set of sources: CRT.DLL for programs to share,
+# libcrt.a to link into a module of its own (the system DLLs, CRTSTAT.BIN).
+# ssp.o (the module's own stack canary) goes into every module.
+CRT_SRC   := string safe strerror fortify printf malloc stdlib ctype errno exit time stdio
+CRT_CODE  := $(patsubst %,$(U)/crt/%.o,$(CRT_SRC)) $(U)/crt/setjmp.o
+LIBCRT    := $(U)/libcrt.a
+SSP       := $(U)/crt/ssp.o
+CRT_OBJ   := $(U)/hdr/CRT.DLL.o $(CRT_CODE) $(SSP) $(U)/gen/crt_exports.o $(U)/gen/krnl_imports.o
 
 # DLLs: header, code, export table, import libraries of what they call
-KRNL_OBJ  := $(U)/hdr/KERNEL.DLL.o $(U)/krnl/krnl.o $(U)/gen/krnl_exports.o $(U)/lib/lib.o
-GFX_OBJ   := $(U)/hdr/GFX.DLL.o $(U)/gfx/gfx.o $(U)/gen/gfx_exports.o $(U)/lib/lib.o
+KRNL_OBJ  := $(U)/hdr/KERNEL.DLL.o $(U)/krnl/krnl.o $(U)/gen/krnl_exports.o $(SSP) $(LIBCRT)
+GFX_OBJ   := $(U)/hdr/GFX.DLL.o $(U)/gfx/gfx.o $(U)/gen/gfx_exports.o $(SSP) $(LIBCRT)
 UI_SRC    := wnd queue input frame paint display menu accel msgbox dialog button static edit medit listbox \
              scroll trackbar combo tab updown kbd theme
 UI_OBJ    := $(U)/hdr/UI.DLL.o $(patsubst %,$(U)/ui/%.o,$(UI_SRC)) \
-             $(U)/gen/ui_exports.o $(U)/gen/gfx_imports.o $(U)/gen/krnl_imports.o $(U)/lib/lib.o
+             $(U)/gen/ui_exports.o $(U)/gen/gfx_imports.o $(U)/gen/krnl_imports.o $(SSP) $(LIBCRT)
 SHELL_OBJ := $(U)/hdr/SHELL.DLL.o $(U)/shell/shell.o $(U)/shell/icons.o $(U)/shell/filedlg.o $(U)/shell/findrepl.o $(U)/gen/shell_exports.o \
-             $(U)/gen/ui_imports.o $(U)/gen/krnl_imports.o $(U)/lib/lib.o
+             $(U)/gen/ui_imports.o $(U)/gen/krnl_imports.o $(SSP) $(LIBCRT)
 
-# Programs: user/apps/<name>.c, each a process of its own
-APPS      := SHELL DEMO CALC PAINT CLOCK NOTEPAD HANG
+# Programs: user/apps/<name>.c, each a process of its own, sharing CRT.DLL.
+# CRTSTAT.BIN is CRTTEST.BIN with the C runtime linked in (libcrt.a).
+APPS      := SHELL DEMO CALC PAINT CLOCK NOTEPAD HANG CRTTEST
 APP_LIBS  := $(U)/lib/crt0.o $(U)/gen/krnl_imports.o $(U)/gen/ui_imports.o \
-             $(U)/gen/shell_imports.o $(U)/lib/lib.o
+             $(U)/gen/shell_imports.o $(U)/gen/crt_imports.o $(SSP)
 app_obj    = $(U)/hdr/$(1).BIN.o $(U)/apps/$(shell echo $(1) | tr A-Z a-z).o $(APP_LIBS)
+CRTSTAT_OBJ := $(U)/hdr/CRTSTAT.BIN.o $(U)/apps/crttest.o $(U)/lib/crt0.o $(U)/gen/krnl_imports.o \
+               $(U)/gen/ui_imports.o $(U)/gen/shell_imports.o $(SSP) $(LIBCRT)
 
-USER_OBJ  := $(sort $(KRNL_OBJ) $(GFX_OBJ) $(UI_OBJ) $(SHELL_OBJ) \
-                    $(foreach a,$(APPS),$(call app_obj,$(a))))
-MODULES   := $(BUILD)/KERNEL.DLL $(BUILD)/GFX.DLL $(BUILD)/UI.DLL $(BUILD)/SHELL.DLL \
-             $(patsubst %,$(BUILD)/%.BIN,$(APPS))
+USER_OBJ  := $(sort $(filter %.o,$(KRNL_OBJ) $(GFX_OBJ) $(UI_OBJ) $(SHELL_OBJ) $(CRT_OBJ) $(CRTSTAT_OBJ) \
+                    $(foreach a,$(APPS),$(call app_obj,$(a)))))
+MODULES   := $(BUILD)/KERNEL.DLL $(BUILD)/GFX.DLL $(BUILD)/UI.DLL $(BUILD)/SHELL.DLL $(BUILD)/CRT.DLL \
+             $(patsubst %,$(BUILD)/%.BIN,$(APPS)) $(BUILD)/CRTSTAT.BIN
 MODULE_ELFS := $(patsubst $(BUILD)/%,$(U)/%.elf,$(MODULES))
 
 KERNEL_C   := $(wildcard kernel/*.c)
@@ -84,7 +102,7 @@ KERNEL_ASM := $(wildcard kernel/*.asm)
 KERNEL_OBJ := $(patsubst kernel/%.asm,$(BUILD)/kernel/%.o,$(KERNEL_ASM)) \
               $(patsubst kernel/%.c,$(BUILD)/kernel/%.o,$(KERNEL_C))
 
-.PHONY: all run test check486 qemu qemu-test qemu-emm386 qemu-sessions qemu-vga qemu-wm qemu-absmouse qemu-menu qemu-controls qemu-msgbox qemu-shell qemu-files qemu-notepad qemu-tasklist qemu-vesa clean
+.PHONY: all run test check486 qemu qemu-test qemu-emm386 qemu-sessions qemu-vga qemu-wm qemu-absmouse qemu-menu qemu-controls qemu-msgbox qemu-shell qemu-files qemu-notepad qemu-tasklist qemu-vesa qemu-crt clean
 
 all: $(BUILD)/OS1993.COM $(BUILD)/VMM.BIN $(MODULES)
 
@@ -120,6 +138,25 @@ $(U)/UI.DLL.elf: $(UI_OBJ) user/lib/module.ld
 
 $(U)/SHELL.DLL.elf: $(SHELL_OBJ) user/lib/module.ld
 	$(CC) $(MOD_LDFLAGS) -Wl,--defsym=MODBASE=$(SHELL_BASE) -o $@ $(SHELL_OBJ)
+
+$(U)/CRT.DLL.elf: $(CRT_OBJ) user/lib/module.ld
+	$(CC) $(MOD_LDFLAGS) -Wl,--defsym=MODBASE=$(CRT_BASE) -o $@ $(CRT_OBJ)
+
+$(U)/CRTSTAT.BIN.elf: $(CRTSTAT_OBJ) user/lib/module.ld
+	$(CC) $(MOD_LDFLAGS) -Wl,--defsym=MODBASE=0x00400000 -o $@ $(CRTSTAT_OBJ)
+
+$(LIBCRT): $(CRT_CODE)
+	@rm -f $@
+	$(AR) rcs $@ $^
+
+# The canary's own code can't be protected by it.
+$(SSP): user/crt/ssp.c
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -fno-stack-protector -c -o $@ $<
+
+$(U)/crt/setjmp.o: user/crt/setjmp.asm
+	@mkdir -p $(dir $@)
+	$(NASM) -f elf32 -g -o $@ $<
 
 define APP_RULE
 $(U)/$(1).BIN.elf: $(call app_obj,$(1)) user/lib/module.ld
@@ -159,6 +196,11 @@ $(U)/gen/shell_exports.asm $(U)/gen/shell_imports.asm: user/shell/shell.def tool
 	@mkdir -p $(dir $@)
 	$(MKDEF) $< exports $(U)/gen/shell_exports.asm
 	$(MKDEF) $< imports $(U)/gen/shell_imports.asm
+
+$(U)/gen/crt_exports.asm $(U)/gen/crt_imports.asm: user/crt/crt.def tools/mkdef.py
+	@mkdir -p $(dir $@)
+	$(MKDEF) $< exports $(U)/gen/crt_exports.asm
+	$(MKDEF) $< imports $(U)/gen/crt_imports.asm
 
 $(U)/gen/%.o: $(U)/gen/%.asm
 	$(NASM) -f elf32 -o $@ $<
@@ -255,6 +297,9 @@ qemu-tasklist: all
 qemu-vesa: all $(QEMU_ROM)
 	@tools/qemu-vesa-test.py
 
+qemu-crt: all $(QEMU_ROM)
+	@tools/qemu-crt-test.py
+
 check486: $(BUILD)/vmm.elf $(MODULE_ELFS)
 	@for f in $^; do tools/check486.sh $(OBJDUMP) $$f || exit 1; done
 
@@ -263,4 +308,4 @@ clean:
 
 -include $(KERNEL_OBJ:.o=.d)
 
--include $(patsubst %.o,%.d,$(filter-out $(U)/hdr/% $(U)/gen/% %/crt0.o,$(USER_OBJ)))
+-include $(patsubst %.o,%.d,$(filter-out $(U)/hdr/% $(U)/gen/% %/crt0.o %/setjmp.o,$(USER_OBJ)))

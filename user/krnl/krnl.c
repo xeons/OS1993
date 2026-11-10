@@ -34,6 +34,7 @@ void TaskListShown(void)                    { sys_tasklist_ack(); }
 bool GetDisplayInfo(struct display_info *d) { return sys_display_info(d) == 0; }
 int  GetDisplayModes(struct display_mode *m, int max) { return sys_display_modes(m, max); }
 bool SetDisplayMode(int w, int h, int bpp)  { return sys_display_set(w, h, bpp) == 0; }
+bool GetRandomBytes(void *buf, uint32_t n)  { return sys_random(buf, n) == 0; }
 bool IsProcessAlive(int pid)                { return sys_alive(pid) == 1; }
 bool TerminateProcess(int pid)              { return sys_kill(pid) == 0; }
 uint32_t GetProcessExitCount(void)          { return sys_exits(); }

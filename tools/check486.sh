@@ -8,11 +8,11 @@ elf=$2
 
 bad='^(cmov|cmpxchg8b|cpuid|rdtsc|rdmsr|wrmsr|rdpmc|sysenter|sysexit|syscall|ud2|endbr|movbe|popcnt|lzcnt|tzcnt|f[a-z]|(v?p?(add|sub|mul|mov|xor|and|or)[a-z]*(ps|pd|ss|sd)$)|emms|movq|movd)'
 
-# Ring-3 modules start .text with the 52-byte MOD3 header: data, not code.
+# Ring-3 modules start .text with the 56-byte MOD3 header: data, not code.
 start=
 text=$("$objdump" -h "$elf" | awk '$2 == ".text" { print $4; exit }')
 if [ -n "$text" ] && "$objdump" -s -j .text --stop-address=$((0x$text + 4)) "$elf" | grep -q 'MOD3'; then
-    start="--start-address=$((0x$text + 52))"
+    start="--start-address=$((0x$text + 56))"
 fi
 
 hits=$("$objdump" -d --no-show-raw-insn $start "$elf" |

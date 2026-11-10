@@ -46,17 +46,19 @@ static void plain_name(const char *s, char *out, int max)    /* without '&' */
     out[n] = '\0';
 }
 
-static void launch(const char *file, const char *name)
+static void launch_args(const char *file, const char *name, const char *args)
 {
     char plain[32];
     plain_name(name, plain, sizeof plain);
     DebugLog("launch %s", plain);
-    if (ShellExecute(desktop, "open", file, NULL, NULL, SW_SHOW) <= 32) {
+    if (ShellExecute(desktop, "open", file, args, NULL, SW_SHOW) <= 32) {
         char text[96] = "Cannot start ";
         strncpy0(text + strlen(text), plain, sizeof text - strlen(text));
         MessageBox(desktop, text, "Shell", MB_OK | MB_ICONERROR);
     }
 }
+
+static void launch(const char *file, const char *name) { launch_args(file, name, NULL); }
 
 /* ---- the Run dialog ------------------------------------------------------------- */
 
@@ -83,7 +85,10 @@ static LRESULT run_proc(HWND h, unsigned msg, WPARAM wp, LPARAM lp)
             GetDlgItemText(h, 100, file, sizeof file);
             if (file[0]) {
                 DestroyWindow(h);
-                launch(file, file);
+                char *args = strchr(file, ' ');     /* "PROGRAM.BIN arguments" */
+                if (args)
+                    *args++ = '\0';
+                launch_args(file, file, args);
             }
         } else if (LOWORD(wp) == IDCANCEL) {
             DestroyWindow(h);
@@ -105,6 +110,7 @@ static void open_run(void)
     run_box = CreateWindow("ShellRun", "Run", WS_DIALOG | WS_VISIBLE, 140, 160, 352, 158,
                            NULL, 0, NULL);
     SetFocus(GetDlgItem(run_box, 100));
+    DebugLog("run dialog");
 }
 
 /* ---- Close Program (Ctrl+Alt+Del) ------------------------------------------------ */

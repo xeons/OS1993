@@ -56,6 +56,8 @@ struct mod_header {                     /* first bytes of every module */
     char     name[16];                  /* "UI.DLL" */
     uint32_t data;                      /* writable from here (page aligned): each process
                                            gets its own copy; the pages before are shared */
+    uint32_t guard;                     /* -> the module's stack canary (__stack_chk_guard),
+                                           or 0: the loader sets a random one per process */
 };
 
 struct mod_export { uint32_t name; uint32_t addr; };    /* name -> ASCIIZ */
@@ -141,6 +143,18 @@ struct user_event {
 #define SYS_DISPLAY_INFO 23             /* EBX = struct display_info * */
 #define SYS_DISPLAY_MODES 24            /* EBX = struct display_mode *, ECX = most -> count */
 #define SYS_DISPLAY_SET 25              /* EBX = width, ECX = height, EDX = bits -> 0, or -1 */
+#define SYS_RANDOM      26              /* EBX = buffer, ECX = bytes (at most 256) -> 0, or -1 */
+#define SYS_FAIL        27              /* EBX = FAIL_*, ECX = message or 0: the process
+                                           detected its own corruption and ends at once */
+
+/* SYS_FAIL reasons (as Win32's __fastfail codes); the exit code is FAIL_EXIT */
+#define FAIL_STACK_OVERRUN  1           /* a stack canary was overwritten */
+#define FAIL_HEAP_CORRUPT   2           /* the heap's checks failed (overrun, double free) */
+#define FAIL_BUFFER_OVERRUN 3           /* a _FORTIFY_SOURCE check failed */
+#define FAIL_CONSTRAINT     4           /* a bounds-checked (_s) function's constraint */
+#define FAIL_ABORT          5           /* abort() */
+#define FAIL_ASSERT         6           /* assert() */
+#define FAIL_EXIT           (-0x409)    /* cf. STATUS_STACK_BUFFER_OVERRUN */
 
 /* The display (SYS_DISPLAY_*): VGA's 640x480 in 16 colours (4 bits,
  * planar), or a linear mode in 8 (palette), 16 (5:6:5) or 32 (8:8:8) bits. */

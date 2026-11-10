@@ -70,6 +70,13 @@ README.md for what already works.
       to 40 with INT 21h 67h); FILES= in CONFIG.SYS bounds them.
 - [ ] The heap only grows (SYS_SBRK); freed memory is reused but never
       returned to the system until the process ends.
+- [ ] C runtime: no floating point (no FPU on a 486SX; a soft-float
+      library would be needed), no locales or wide characters, no
+      environment variables; text files aren't translated (CR LF); its
+      locks are empty until processes have several threads.
+- [ ] Heap checks catch overruns and double frees when a block is freed,
+      not when the bytes are written; a freed block reused by a new
+      allocation can't be told from it.
 - [ ] IPC: done -- per-process queues, cross-process SendMessage and
       WM_COPYDATA, wait/wake and kernel locks. Still to do: named shared
       memory sections, named events, pipes.

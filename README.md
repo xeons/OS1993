@@ -26,6 +26,7 @@ are for later stages.
 | `make qemu-emm386` | FreeDOS with JEMM386: the loader must refuse to start       |
 | `make qemu-sessions` | types into two concurrent DOS sessions via QEMU's monitor |
 | `make qemu-absmouse` | absolute pointer through QEMU's VMware port: the cursor lands on the exact pixel, and clicks hit their control |
+| `make qemu-crt` | the C runtime: CRTTEST.BIN (CRT.DLL) and CRTSTAT.BIN (libcrt.a) pass its checks; a stack overrun, a heap overrun, a double free, a fortified memcpy, a broken Annex K constraint, `%n` and a failed assert each end the program with the reason logged; every process has its own canary |
 | `make qemu-vesa` | the VBE display driver: Display Properties switches to 1024×768 high colour, 800×600 in 256 colours and true colour, No and the 15-second timeout go back, a DOS session and back keeps the mode, OS1993.INI restores it next session, and 640×480×16 is VGA again |
 | `make qemu-tasklist` | Ctrl+Alt+Del: Close Program ends a program, works from a DOS session, and the VMM's screen ends a program that froze the GUI |
 | `make qemu-notepad` | Notepad: typing, Save As with CR LF, the clipboard between two processes, Open, select/delete/undo, unsaved-changes questions, Find/Find Next/whole words, Replace All and its undo, Word Wrap, the file's bytes on disk |
@@ -287,13 +288,69 @@ system DLLs.
 | `KERNEL.DLL` | `1000_0000` | the userland kernel library: wraps the INT 30h system calls (`user/krnl/`) |
 | `GFX.DLL` | `1010_0000` | the VGA display driver (`user/gfx/`)             |
 | `UI.DLL`  | `1020_0000` | windows, messages, painting, controls (`user/ui/`); imports KERNEL, GFX |
+| `CRT.DLL` | `1040_0000` | the C runtime (`user/crt/`); imports KERNEL. Also built as `libcrt.a` |
 | `SHELL.DLL` | `1030_0000` | the shell API: `ShellExecute`, `ShellAbout`, `Shell_NotifyIcon`, `GetOpenFileName`/`GetSaveFileName`, `FindText`/`ReplaceText`, stock icons (`user/shell/`) |
-| `*.BIN`   | `0040_0000` | programs (`user/apps/`): SHELL, CALC, PAINT, CLOCK, DEMO |
+| `*.BIN`   | `0040_0000` | programs (`user/apps/`): SHELL, CALC, PAINT, CLOCK, NOTEPAD, DEMO, CRTTEST (and CRTSTAT) |
 
 Programs include one header, `user/lib/os1993.h` (the `windows.h` of
 OS1993), and call KERNEL.DLL (`CreateProcess`, `GetTickCount`, `Sleep`,
 `GetLocalTime`, `WaitForWake`/`WakeProcess`, `AcquireLock`, `DebugLog`,
 ...) instead of issuing system calls themselves.
+
+## The C runtime
+
+`user/crt/` is a C library for ring 3, built from one set of sources two
+ways: **CRT.DLL**, which programs import and share (its code is mapped
+once, like any DLL's), and **libcrt.a**, linked into a module of its own.
+The system DLLs link the parts they use statically (KERNEL.DLL can't import
+a DLL that imports it); programs use CRT.DLL; `CRTSTAT.BIN` is the test
+program linked statically. Headers are in `user/crt/include` (`string.h`,
+`stdlib.h`, `stdio.h`, `ctype.h`, `errno.h`, `assert.h`, `setjmp.h`,
+`time.h`; the compiler supplies `stdint.h`, `stddef.h`, `stdarg.h`,
+`limits.h`). `crt0` calls `main(argc, argv)` with the command line split
+at spaces (quotes keep one together) and `exit`s with its result.
+
+- **stdio.** Buffered `FILE`s over KERNEL.DLL's files; `stdout` and
+  `stderr` are the debug log, a line at a time; `stdin` is empty. Files
+  are binary (no CR LF translation). `printf` has every integer conversion,
+  flag and length, but no floating point: a 486SX has no FPU.
+- **stdlib.** `malloc` over the process heap, `strtol` and friends
+  (64-bit without libgcc: overflow is checked in 32-bit halves), `qsort`,
+  `bsearch`, `atexit`, `rand`, and `rand_s`/`getrandom_bytes` from the
+  kernel's generator. `time.h` reads the RTC (local time is UTC).
+
+It is hardened, by default and in every ring-3 module:
+
+- **Stack canaries.** Everything is compiled with
+  `-fstack-protector-strong`. Each module has its own `__stack_chk_guard`
+  (data can't be imported), and the module header points at it: the loader
+  stores a fresh random value there for each process, its low byte zero so
+  a string copy can't reproduce it.
+- **Random numbers.** `kernel/random.c`: a ChaCha20 generator whose key
+  every request first mixes with an entropy pool (interrupt timing, the
+  RTC and the PIT at boot) and then replaces ("fast key erasure").
+  `SYS_RANDOM` / `GetRandomBytes`.
+- **Fail fast.** A process that finds itself corrupted ends at once with
+  `SYS_FAIL` (as Win32's `__fastfail`, a trap of its own rather than a call
+  into a possibly corrupted DLL). The kernel logs the reason and the
+  process ends with code -1033 (`STATUS_STACK_BUFFER_OVERRUN`'s 409h).
+- **The heap.** Each block has a header with a cookie (its size and
+  address mixed with a random secret) and a guard word after it. `free`
+  and `realloc` check both: an overrun, a double free or a pointer malloc
+  never returned is caught. Freed bytes are overwritten. `calloc` and
+  `reallocarray` check their multiplication.
+- **Bounds-checked functions** (C11 Annex K): `memcpy_s`, `strcpy_s`,
+  `strcat_s`, `sprintf_s`, `strtok_s`, `fopen_s`, `qsort_s` and the rest.
+  A broken constraint empties the destination and calls the handler;
+  `abort_handler_s` is the default (`set_constraint_handler_s` changes
+  it). Also `strlcpy`/`strlcat`, `explicit_bzero` and `timingsafe_memcmp`.
+- **`_FORTIFY_SOURCE=2`.** Copies into objects of known size (`memcpy`,
+  `strcpy`, `sprintf` ...) are checked at compile time where possible and
+  otherwise by `__memcpy_chk` and friends.
+- **No `%n`** in `printf`: it writes through a pointer, the classic
+  format-string hole. `setjmp` stores its stack and code pointers XORed
+  with the canary. `qsort` is a heapsort: no recursion, n log n whatever
+  the input.
 
 ## The window system across processes
 
@@ -582,11 +639,13 @@ kernel/v86test.c dosshell.c              DOS calls from the kernel, DOS sessions
 kernel/vm.c sched.c switch.asm           VMs, address spaces, focus; threads
 kernel/vmtest.c                          multi-VM self-test
 kernel/dosmgr.c                          one DOS shared by all VMs
+kernel/random.c                          random numbers (ChaCha20 from interrupt timing)
 kernel/vga.c gfx.c                       VGA state (VDD), planar drawing
 kernel/display.c vbe.c                   display modes: the VBE adapter, the VBE BIOS probe
 kernel/user.c                            ring-3 loader, INT 30h system calls
 kernel/mouse.c                           PS/2 mouse (IRQ 12)
-user/lib/os1993.h                        the public API; crt0, header, C runtime
+user/lib/os1993.h                        the public API; crt0, the module header and linker script
+user/crt/                                the C runtime: CRT.DLL and libcrt.a; include/ has its headers
 user/krnl/                               KERNEL.DLL (system call wrappers)
 user/gfx/                                GFX.DLL (drawing: planar VGA, linear 8/16/32 bits)
 user/ui/                                 UI.DLL (windows, messages, controls)
@@ -637,8 +696,9 @@ tools/                   check486.sh, check-test.sh
    Save As dialogs, a process heap, the clipboard, a multi-line edit control
    and Notepad (word wrap, Find/Replace), a Ctrl+Alt+Del task list, combo
    boxes, tabs and up-downs, and code shared between processes, and higher resolutions and colour depths
-   (the VBE display driver, Display Properties). Next: finer-grained window
-   system locking.
+   (the VBE display driver, Display Properties), and a hardened C runtime
+   (CRT.DLL and libcrt.a). Next: threads and the process, memory and file
+   APIs; then a network driver, TCP/IP, sockets and PING.
 7. **Win16-style API layer.** 16-bit protected-mode apps in ring 3 with LDTs,
    built with Open Watcom.
 8. **Coexisting with EMM386** through VCPI/GEMMIS, and acting as a DPMI host.

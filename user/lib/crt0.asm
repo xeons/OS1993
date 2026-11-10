@@ -4,17 +4,17 @@
         cpu     386
         bits    32
 
-        extern  main
+        extern  main, __crt_start
 
         section .text
 
 ; Entered in ring 3 with EBX -> struct user_info, every import already
 ; linked. The loader zero-fills every page, so .bss is already clear.
+; The C runtime splits the arguments, calls main(argc, argv) and exit()s
+; with its result.
         global  _start
 _start:
         push    ebx
-        call    main
-        mov     ebx, eax                ; SYS_EXIT with main's result
-        xor     eax, eax
-        int     0x30
+        push    main
+        call    __crt_start
 .hang:  jmp     .hang

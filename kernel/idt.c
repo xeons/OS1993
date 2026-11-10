@@ -1,4 +1,6 @@
 #include "kernel.h"
+#include "devices.h"
+#include "random.h"
 #include "gdt.h"
 #include "interrupts.h"
 #include "sched.h"
@@ -92,6 +94,7 @@ void interrupt_dispatch(struct regs *r)
     if (irq < 16) {
         if (pic_is_spurious(irq))
             return;
+        random_mix(r->eip ^ r->esp_pushad ^ r->eax ^ irq << 24 ^ timer_ticks() << 8);
         if (irq_handlers[irq])
             irq_handlers[irq](r);
         else

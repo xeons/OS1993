@@ -3,6 +3,7 @@
 -ffreestanding
 -Ikernel/include
 -Iuser/lib
+-Iuser/crt/include
 -Iuser/gfx
 -Iuser/ui
 -Iuser/krnl

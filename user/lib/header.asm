@@ -6,7 +6,7 @@
         cpu     386
         bits    32
 
-        extern  __image_start, __image_size, __mem_size, __exports, __imports, __data_start
+        extern  __image_start, __image_size, __mem_size, __exports, __imports, __data_start, __guard
 %if KIND == 1
         extern  _start
 %endif
@@ -27,3 +27,4 @@
 name:   db      MODNAME
         times   16 - ($ - name) db 0
         dd      __data_start            ; writable (per process) from here
+        dd      __guard                 ; -> __stack_chk_guard, or 0

@@ -15,6 +15,7 @@
 #include "vga.h"
 #include "vbe.h"
 #include "display.h"
+#include "random.h"
 #include "vm.h"
 
 const struct bootinfo *g_bootinfo;
@@ -156,6 +157,7 @@ void kmain(const struct bootinfo *bi)
     dosmgr_started();
     ok("DOS shared between VMs (DOSMGR)");
     vga_init();
+    random_init();
     vbe_init();
     display_init();
     ok("VGA driver (text and 640x480x16 graphics)");

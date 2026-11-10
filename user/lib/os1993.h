@@ -96,6 +96,10 @@ bool     GetDisplayInfo(struct display_info *d);
 int      GetDisplayModes(struct display_mode *list, int max);  /* -> how many */
 bool     SetDisplayMode(int width, int height, int bpp);
 
+/* Random bytes from the kernel's generator (ChaCha20 keyed from interrupt
+ * timing), at most 256 per call: for keys, cookies, sequence numbers. */
+bool     GetRandomBytes(void *buf, uint32_t n);
+
 /* Raw input, for UI.DLL */
 bool     GetInputEvent(struct user_event *e);
 void     WaitForInput(void);                    /* sleep until input or a tick */
@@ -704,11 +708,6 @@ int     TranslateAccelerator(HWND hwnd, HACCEL table, MSG *msg);
 int     MessageBox(HWND owner, const char *text, const char *caption, unsigned type);  /* -> IDOK... */
 
 /* Small runtime helpers (each module has its own copy: user/lib/lib.c) */
-size_t  strlen(const char *s);
-int     strcmp(const char *a, const char *b);
-char   *strncpy0(char *d, const char *s, size_t size);   /* always terminates */
-void   *memset(void *d, int c, size_t n);
-void   *memcpy(void *d, const void *s, size_t n);
-void   *memmove(void *d, const void *s, size_t n);
+#include <string.h>          /* the C runtime's (user/crt/include) */
 
 #endif

@@ -30,6 +30,7 @@
 #include "mm.h"
 #include "sched.h"
 #include "user.h"
+#include "random.h"
 #include "v86.h"
 #include "vga.h"
 #include "vm.h"
@@ -50,7 +51,7 @@
 
 struct image {
     char      name[16];
-    uint32_t  kind, base, data, end, entry, exports, imports;
+    uint32_t  kind, base, data, end, entry, exports, imports, guard;
     uint32_t *code;                         /* frames of [base, data) */
     uint32_t *pristine;                     /* frames: the first contents of [data, end) */
     int       refs;                         /* processes using it */
@@ -63,6 +64,7 @@ struct module {
     uint32_t base, end;                     /* mapped [base, end) */
     uint32_t data;                          /* private from here; before, shared */
     uint32_t exports, imports;
+    uint32_t guard;                         /* its stack canary, or 0 */
     bool     resolved;
     struct image *img;                      /* shared from this image, or NULL */
 };
@@ -411,6 +413,7 @@ static struct module *map_image(struct process *p, struct image *img)
     strncpy0(m->name, img->name, sizeof m->name);
     m->exports = img->exports;
     m->imports = img->imports;
+    m->guard = img->guard;
     if (img->kind == MOD_PROGRAM)
         p->entry = img->entry;
     return m;
@@ -464,6 +467,7 @@ static void keep_images(struct process *p)
         img->entry = i == 0 ? p->entry : 0;
         img->exports = m->exports;
         img->imports = m->imports;
+        img->guard = m->guard;
         img->pristine = pristine;
         img->code = code;
         img->refs = 1;
@@ -560,6 +564,7 @@ static struct module *load_module(struct process *p, const char *name, uint32_t 
     memcpy(m->name, name, strlen(name) < sizeof m->name ? strlen(name) + 1 : sizeof m->name - 1);
     m->exports = hdr.exports;
     m->imports = hdr.imports;
+    m->guard = hdr.guard >= m->data && hdr.guard <= m->end - 4 && !(hdr.guard & 3) ? hdr.guard : 0;
     if (kind == MOD_PROGRAM)
         p->entry = hdr.entry;
     return m;
@@ -693,6 +698,9 @@ static int spawn(const char *name, const char *args)
         ok = p->thread != NULL;
         if (ok)
             keep_images(p);                         /* before any of its code runs */
+        for (int i = 0; ok && i < p->nmods; i++)    /* then: canaries of its own */
+            if (p->mods[i].guard)
+                *(uint32_t *)(uintptr_t)p->mods[i].guard = random_u32() & ~0xFFu;
     }
     if (!ok) {
         klog("USER: could not start %s\n", name);
@@ -1071,6 +1079,29 @@ void syscall_dispatch(struct regs *r)
     case SYS_TICKS:
         r->eax = timer_ticks();
         break;
+    case SYS_RANDOM:
+        if (r->ecx > 256 || !user_writable(r->ebx, r->ecx)) {
+            r->eax = (uint32_t)-1;
+            break;
+        }
+        random_bytes((void *)(uintptr_t)r->ebx, r->ecx);
+        r->eax = 0;
+        break;
+    case SYS_FAIL: {
+        static const char *const why[] = { "failure", "stack buffer overrun", "heap corruption",
+                                           "buffer overrun", "runtime-constraint violation",
+                                           "abort", "assertion failed" };
+        char text[128] = "";
+        for (uint32_t i = 0; r->ecx && i < sizeof text - 1 && user_range_ok(r->ecx + i, 1); i++) {
+            text[i] = *(const char *)(uintptr_t)(r->ecx + i);
+            if (!text[i])
+                break;
+        }
+        klog("USER: %s: %s%s%s (fail fast)\n", self->name, why[r->ebx < 7 ? r->ebx : 0],
+             text[0] ? ": " : "", text);
+        finish(FAIL_EXIT);
+        break;
+    }
     case SYS_YIELD:
         schedule();
         r->eax = 0;
