@@ -11,7 +11,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-#define MAX_THREADS   16
+#define MAX_THREADS   64
 #define THREAD_STACK  8192
 #define SLICE_TICKS   2         /* ~110 ms at 18.2 Hz */
 
@@ -30,6 +30,13 @@ struct thread {
     void       *arg;
     bool        user;           /* runs ring-3 code: TSS.ESP0 = kstack top */
     struct process *proc;       /* its process (ring-3 threads, and the loader) */
+    uint32_t    tib;            /* ring 3: its TIB (user address), for FS */
+    int         uth;            /* ... its slot in the process's thread table */
+    uint32_t    futex;          /* blocked in SYS_FUTEX_WAIT on this key, or 0 */
+    uint32_t    deadline;       /* ... until this tick (0: no limit) */
+    bool        woken;          /* ... and a SYS_FUTEX_WAKE came */
+    bool        killed;         /* TerminateThread: ends on its way to ring 3 */
+    int         kill_code;
 };
 
 extern struct thread *current;

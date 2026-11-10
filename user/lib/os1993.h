@@ -82,6 +82,19 @@ bool     FindClose(HANDLE h);
 uint32_t GetLastError(void);
 void     SetLastError(uint32_t error);
 
+bool     SetEndOfFile(HANDLE h);                        /* the file ends at its pointer */
+bool     FlushFileBuffers(HANDLE h);
+bool     SetFileAttributes(const char *path, uint32_t attributes);
+uint32_t GetFullPathName(const char *path, uint32_t size, char *buf, char **file_part);
+bool     GetDiskFreeSpace(const char *root, uint32_t *sectors_per_cluster, uint32_t *bytes_per_sector,
+                          uint32_t *free_clusters, uint32_t *total_clusters);
+bool     CopyFile(const char *from, const char *to, bool fail_if_exists);
+typedef struct { uint32_t dwLowDateTime, dwHighDateTime; } FILETIME;   /* 100 ns since 1601 */
+bool     GetFileTime(HANDLE h, FILETIME *created, FILETIME *accessed, FILETIME *written);
+bool     SetFileTime(HANDLE h, const FILETIME *created, const FILETIME *accessed, const FILETIME *written);
+bool     FileTimeToSystemTime(const FILETIME *ft, SYSTEMTIME *st);
+bool     SystemTimeToFileTime(const SYSTEMTIME *st, FILETIME *ft);
+
 /* Memory: the process heap (it grows as needed, up to 1 GB) */
 #define LMEM_FIXED      0x0000
 #define LMEM_ZEROINIT   0x0040
@@ -89,6 +102,110 @@ void    *LocalAlloc(unsigned flags, uint32_t size);     /* NULL if out of memory
 void    *LocalReAlloc(void *p, uint32_t size, unsigned flags);
 void    *LocalFree(void *p);                            /* -> NULL */
 uint32_t LocalSize(void *p);
+
+/* Heaps, as in Win32: the process heap (LocalAlloc's), or private ones in
+ * regions of their own. A damaged block header ends the process. */
+#define HEAP_NO_SERIALIZE           0x0001
+#define HEAP_ZERO_MEMORY            0x0008
+#define HEAP_REALLOC_IN_PLACE_ONLY  0x0010
+HANDLE   GetProcessHeap(void);
+HANDLE   HeapCreate(uint32_t flags, uint32_t initial, uint32_t max);   /* max 0: up to 16 MB */
+bool     HeapDestroy(HANDLE heap);
+void    *HeapAlloc(HANDLE heap, uint32_t flags, uint32_t size);
+void    *HeapReAlloc(HANDLE heap, uint32_t flags, void *p, uint32_t size);
+bool     HeapFree(HANDLE heap, uint32_t flags, void *p);
+uint32_t HeapSize(HANDLE heap, uint32_t flags, const void *p);
+bool     HeapValidate(HANDLE heap, uint32_t flags, const void *p);
+
+/* Virtual memory: regions of the address space (0x62000000-0x7F000000),
+ * reserved in 64 KB steps and committed page by page. No paging to disk:
+ * a committed page has its memory at once. */
+#define MEM_COMMIT      0x1000
+#define MEM_RESERVE     0x2000
+#define MEM_DECOMMIT    0x4000
+#define MEM_RELEASE     0x8000
+#define MEM_FREE        0x10000
+#define MEM_PRIVATE     0x20000
+#define PAGE_NOACCESS           0x01            /* only by not committing */
+#define PAGE_READONLY           0x02
+#define PAGE_READWRITE          0x04
+#define PAGE_WRITECOPY          0x08
+#define PAGE_EXECUTE            0x10            /* a 486 can't refuse to run data: */
+#define PAGE_EXECUTE_READ       0x20            /* these are READONLY ... */
+#define PAGE_EXECUTE_READWRITE  0x40            /* ... and READWRITE */
+#define PAGE_EXECUTE_WRITECOPY  0x80
+typedef struct {
+    void    *BaseAddress, *AllocationBase;
+    uint32_t AllocationProtect, RegionSize, State, Protect, Type;
+} MEMORY_BASIC_INFORMATION;
+typedef struct {
+    uint32_t dwLength, dwMemoryLoad;
+    uint32_t dwTotalPhys, dwAvailPhys, dwTotalPageFile, dwAvailPageFile, dwTotalVirtual, dwAvailVirtual;
+} MEMORYSTATUS;
+void    *VirtualAlloc(void *addr, uint32_t size, uint32_t type, uint32_t protect);
+bool     VirtualFree(void *addr, uint32_t size, uint32_t type);   /* MEM_RELEASE: size 0 */
+bool     VirtualProtect(void *addr, uint32_t size, uint32_t protect, uint32_t *old);
+uint32_t VirtualQuery(const void *addr, MEMORY_BASIC_INFORMATION *mbi, uint32_t len);
+void     GlobalMemoryStatus(MEMORYSTATUS *ms);
+
+/* Threads, as in Win32. Each has its own stack (64 KB by default, a guard
+ * page below it) and its own GetLastError, errno and TLS slots. Only the
+ * first thread may use the window system. Handles: CloseHandle. */
+#define INFINITE                0xFFFFFFFFu
+#define STILL_ACTIVE            259
+#define CREATE_SUSPENDED        0x04
+#define WAIT_OBJECT_0           0x000
+#define WAIT_TIMEOUT            0x102
+#define WAIT_FAILED             0xFFFFFFFFu
+#define MAXIMUM_WAIT_OBJECTS    32
+#define TLS_OUT_OF_INDEXES      0xFFFFFFFFu
+#define ERROR_TOO_MANY_POSTS    298
+#define ERROR_NOT_OWNER         288
+typedef uint32_t (*LPTHREAD_START_ROUTINE)(void *arg);
+typedef struct {
+    volatile int32_t  lock;
+    volatile uint32_t owner;            /* its thread id, or 0 */
+    int32_t           recursion;
+} CRITICAL_SECTION;                     /* all zero is a ready one */
+HANDLE   CreateThread(void *security, uint32_t stack_size, LPTHREAD_START_ROUTINE fn, void *arg,
+                      uint32_t flags, uint32_t *tid);
+__attribute__((noreturn)) void ExitThread(uint32_t code);
+bool     TerminateThread(HANDLE thread, uint32_t code);
+uint32_t ResumeThread(HANDLE thread);                   /* one CREATE_SUSPENDED */
+bool     GetExitCodeThread(HANDLE thread, uint32_t *code);   /* STILL_ACTIVE while it runs */
+uint32_t GetCurrentThreadId(void);
+HANDLE   GetCurrentThread(void);
+HANDLE   GetCurrentProcess(void);
+void    *GetThreadInformationBlock(void);               /* struct user_tib, at FS:0 */
+void     InitializeCriticalSection(CRITICAL_SECTION *cs);
+void     DeleteCriticalSection(CRITICAL_SECTION *cs);
+void     EnterCriticalSection(CRITICAL_SECTION *cs);
+bool     TryEnterCriticalSection(CRITICAL_SECTION *cs);
+void     LeaveCriticalSection(CRITICAL_SECTION *cs);
+HANDLE   CreateEvent(void *security, bool manual_reset, bool initial, const char *name);
+bool     SetEvent(HANDLE event);
+bool     ResetEvent(HANDLE event);
+HANDLE   CreateMutex(void *security, bool initial_owner, const char *name);
+bool     ReleaseMutex(HANDLE mutex);
+HANDLE   CreateSemaphore(void *security, int32_t initial, int32_t max, const char *name);
+bool     ReleaseSemaphore(HANDLE sem, int32_t n, int32_t *previous);
+uint32_t WaitForSingleObject(HANDLE h, uint32_t ms);    /* a thread, process, event ... */
+uint32_t WaitForMultipleObjects(uint32_t n, const HANDLE *hs, bool wait_all, uint32_t ms);
+uint32_t TlsAlloc(void);
+bool     TlsFree(uint32_t index);
+void    *TlsGetValue(uint32_t index);
+bool     TlsSetValue(uint32_t index, void *value);
+int32_t  InterlockedIncrement(volatile int32_t *p);
+int32_t  InterlockedDecrement(volatile int32_t *p);
+int32_t  InterlockedExchange(volatile int32_t *p, int32_t v);
+int32_t  InterlockedExchangeAdd(volatile int32_t *p, int32_t v);
+int32_t  InterlockedCompareExchange(volatile int32_t *p, int32_t v, int32_t compare);
+
+/* Processes beyond CreateProcess (-> a pid): a handle to wait on */
+HANDLE   OpenProcess(uint32_t access, bool inherit, int pid);
+bool     GetExitCodeProcess(HANDLE process, uint32_t *code);   /* STILL_ACTIVE while it runs */
+const char *GetCommandLine(void);
+uint32_t GetModuleFileName(void *module, char *buf, uint32_t size);
 
 /* The display, for UI.DLL (programs use EnumDisplaySettings and
  * ChangeDisplaySettings): the current mode, the modes there are, a switch. */

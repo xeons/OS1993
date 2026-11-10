@@ -1,11 +1,11 @@
 /*
- * errno.c -- errno, and the C runtime's locks.
+ * errno.c -- errno: each thread's own, in its TIB (FS:0).
  */
 #include "crt.h"
 
-static int errno_value;
-
-int *__errno(void) { return &errno_value; }
-
-void __crt_lock(int n)   { (void)n; }
-void __crt_unlock(int n) { (void)n; }
+int *__errno(void)
+{
+    struct user_tib *t;
+    __asm__ volatile("movl %%fs:0, %0" : "=r"(t));
+    return &t->err;
+}

@@ -213,7 +213,7 @@ errno_t fopen_s(FILE *restrict *restrict out, const char *restrict path, const c
     return *out ? 0 : errno;
 }
 
-int fflush(FILE *f)
+static int fflush_unlocked(FILE *f)
 {
     if (!f) {                                       /* all of them */
         int r = 0;
@@ -229,7 +229,7 @@ int fflush(FILE *f)
     return flush_write(f);
 }
 
-int fclose(FILE *f)
+static int fclose_unlocked(FILE *f)
 {
     if (!f || !f->used)
         return EOF;
@@ -258,7 +258,7 @@ int setvbuf(FILE *restrict f, char *restrict buf, int mode, size_t size)
 
 /* ---- reading -------------------------------------------------------------------- */
 
-int fgetc(FILE *f)
+static int fgetc_unlocked(FILE *f)
 {
     if (!start(f, M_READ))
         return EOF;
@@ -275,7 +275,7 @@ int fgetc(FILE *f)
 int getc(FILE *f)     { return fgetc(f); }
 int getchar(void)     { return fgetc(stdin); }
 
-int ungetc(int c, FILE *f)
+static int ungetc_unlocked(int c, FILE *f)
 {
     if (c == EOF || !start(f, M_READ) || f->unget != EOF)
         return EOF;
@@ -284,7 +284,7 @@ int ungetc(int c, FILE *f)
     return (uint8_t)c;
 }
 
-size_t fread(void *restrict p, size_t size, size_t n, FILE *restrict f)
+static size_t fread_unlocked(void *restrict p, size_t size, size_t n, FILE *restrict f)
 {
     if (!size || !n)
         return 0;
@@ -327,7 +327,7 @@ size_t fread(void *restrict p, size_t size, size_t n, FILE *restrict f)
     return got / size;
 }
 
-char *fgets(char *restrict s, int n, FILE *restrict f)
+static char *fgets_unlocked(char *restrict s, int n, FILE *restrict f)
 {
     if (!s || n <= 0)
         return NULL;
@@ -383,7 +383,7 @@ static size_t put_bytes(FILE *f, const uint8_t *p, size_t n)
     return done;
 }
 
-size_t fwrite(const void *restrict p, size_t size, size_t n, FILE *restrict f)
+static size_t fwrite_unlocked(const void *restrict p, size_t size, size_t n, FILE *restrict f)
 {
     if (!size || !n)
         return 0;
@@ -394,7 +394,7 @@ size_t fwrite(const void *restrict p, size_t size, size_t n, FILE *restrict f)
     return put_bytes(f, p, size * n) / size;
 }
 
-int fputc(int c, FILE *f)
+static int fputc_unlocked(int c, FILE *f)
 {
     uint8_t b = (uint8_t)c;
     return put_bytes(f, &b, 1) == 1 ? b : EOF;
@@ -403,7 +403,7 @@ int fputc(int c, FILE *f)
 int putc(int c, FILE *f) { return fputc(c, f); }
 int putchar(int c)       { return fputc(c, stdout); }
 
-int fputs(const char *restrict s, FILE *restrict f)
+static int fputs_unlocked(const char *restrict s, FILE *restrict f)
 {
     size_t n = strlen(s);
     return put_bytes(f, (const uint8_t *)s, n) == n ? 0 : EOF;
@@ -416,7 +416,7 @@ int puts(const char *s)
 
 /* ---- positions ------------------------------------------------------------------- */
 
-long ftell(FILE *f)
+static long ftell_unlocked(FILE *f)
 {
     if (!f || f->kind != K_FILE) {
         errno = ESPIPE;
@@ -436,7 +436,7 @@ long ftell(FILE *f)
     return (long)at;
 }
 
-int fseek(FILE *f, long off, int whence)
+static int fseek_unlocked(FILE *f, long off, int whence)
 {
     if (!f || f->kind != K_FILE) {
         errno = ESPIPE;
@@ -510,6 +510,96 @@ void perror(const char *s)
         fprintf(stderr, "%s\n", strerror(errno));
 }
 
+/* ---- the locked entry points (a process's threads share the FILEs) ---- */
+
+int fflush(FILE *f)
+{
+    __crt_lock(CRT_LOCK_FILES);
+    int r = fflush_unlocked(f);
+    __crt_unlock(CRT_LOCK_FILES);
+    return r;
+}
+
+int fclose(FILE *f)
+{
+    __crt_lock(CRT_LOCK_FILES);
+    int r = fclose_unlocked(f);
+    __crt_unlock(CRT_LOCK_FILES);
+    return r;
+}
+
+int fgetc(FILE *f)
+{
+    __crt_lock(CRT_LOCK_FILES);
+    int r = fgetc_unlocked(f);
+    __crt_unlock(CRT_LOCK_FILES);
+    return r;
+}
+
+int ungetc(int c, FILE *f)
+{
+    __crt_lock(CRT_LOCK_FILES);
+    int r = ungetc_unlocked(c, f);
+    __crt_unlock(CRT_LOCK_FILES);
+    return r;
+}
+
+size_t fread(void *restrict p, size_t size, size_t n, FILE *restrict f)
+{
+    __crt_lock(CRT_LOCK_FILES);
+    size_t r = fread_unlocked(p, size, n, f);
+    __crt_unlock(CRT_LOCK_FILES);
+    return r;
+}
+
+char *fgets(char *restrict s, int n, FILE *restrict f)
+{
+    __crt_lock(CRT_LOCK_FILES);
+    char * r = fgets_unlocked(s, n, f);
+    __crt_unlock(CRT_LOCK_FILES);
+    return r;
+}
+
+size_t fwrite(const void *restrict p, size_t size, size_t n, FILE *restrict f)
+{
+    __crt_lock(CRT_LOCK_FILES);
+    size_t r = fwrite_unlocked(p, size, n, f);
+    __crt_unlock(CRT_LOCK_FILES);
+    return r;
+}
+
+int fputc(int c, FILE *f)
+{
+    __crt_lock(CRT_LOCK_FILES);
+    int r = fputc_unlocked(c, f);
+    __crt_unlock(CRT_LOCK_FILES);
+    return r;
+}
+
+int fputs(const char *restrict s, FILE *restrict f)
+{
+    __crt_lock(CRT_LOCK_FILES);
+    int r = fputs_unlocked(s, f);
+    __crt_unlock(CRT_LOCK_FILES);
+    return r;
+}
+
+long ftell(FILE *f)
+{
+    __crt_lock(CRT_LOCK_FILES);
+    long r = ftell_unlocked(f);
+    __crt_unlock(CRT_LOCK_FILES);
+    return r;
+}
+
+int fseek(FILE *f, long off, int whence)
+{
+    __crt_lock(CRT_LOCK_FILES);
+    int r = fseek_unlocked(f, off, whence);
+    __crt_unlock(CRT_LOCK_FILES);
+    return r;
+}
+
 /* ---- formatted output --------------------------------------------------------------- */
 
 struct file_out {
@@ -526,11 +616,19 @@ static void file_put(struct fmt_out *o, const char *s, size_t n)
     o->count += n;
 }
 
-static int to_file(FILE *f, const char *fmt, va_list ap, unsigned mode)
+static int to_file_unlocked(FILE *f, const char *fmt, va_list ap, unsigned mode)
 {
     struct file_out fo = { { file_put, 0 }, f, false };
     int r = __crt_format(&fo.o, fmt, ap, mode);
     return fo.failed ? -1 : r;
+}
+
+static int to_file(FILE *f, const char *fmt, va_list ap, unsigned mode)
+{
+    __crt_lock(CRT_LOCK_FILES);
+    int r = to_file_unlocked(f, fmt, ap, mode);
+    __crt_unlock(CRT_LOCK_FILES);
+    return r;
 }
 
 int vfprintf(FILE *restrict f, const char *restrict fmt, va_list ap) { return to_file(f, fmt, ap, 0); }

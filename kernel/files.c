@@ -373,6 +373,67 @@ int file_op(struct proc_files *pf, uint32_t op, struct file_args *a)
             return -ERROR_INVALID_HANDLE;
         pf->find[s].used = false;
         return 0;
+    case FOP_TRUNCATE:                                  /* a write of 0 bytes */
+    case FOP_FLUSH:
+    case FOP_GETTIME:
+    case FOP_SETTIME: {
+        if ((s = slot_of(pf, a->handle)) < 0)
+            return -ERROR_INVALID_HANDLE;
+        r.ebx = (uint32_t)pf->dos[s];
+        if (op == FOP_TRUNCATE) {
+            r.eax = 0x4000;
+            r.ecx = 0;
+        } else if (op == FOP_FLUSH) {
+            r.eax = 0x6800;                             /* commit file (DOS 3.3) */
+        } else {
+            r.eax = op == FOP_GETTIME ? 0x5700 : 0x5701;
+            r.ecx = a->a >> 16;
+            r.edx = a->a & 0xFFFF;
+        }
+        if ((rc = dos(&r)) < 0)
+            return rc;
+        if (op == FOP_GETTIME) {
+            uint32_t when = ((r.ecx & 0xFFFF) << 16) | (r.edx & 0xFFFF);
+            if (!user_writable((uint32_t)(uintptr_t)a->buf, 4))
+                return -ERROR_NOACCESS;
+            memcpy(a->buf, &when, 4);
+        }
+        return 0;
+    }
+    case FOP_SETATTR:
+        if ((rc = user_path(pf, a->path, 0, path)) < 0)
+            return rc;
+        r.eax = 0x4301;
+        r.ecx = a->a & 0x27;                            /* read-only, hidden, system, archive */
+        return dos(&r);
+    case FOP_FULLPATH: {
+        if ((rc = user_path(pf, a->path, 0, path)) < 0)
+            return rc;
+        size_t n = strlen(path) + 1;
+        if (a->len < n || !user_writable((uint32_t)(uintptr_t)a->buf, (uint32_t)n))
+            return a->len < n ? (int)n : -ERROR_NOACCESS;   /* too small: the size needed */
+        memcpy(a->buf, path, n);
+        return (int)n - 1;
+    }
+    case FOP_DISKFREE: {
+        struct disk_free df;
+        uint8_t drive = 0;                              /* the current one */
+        if (a->path) {
+            if ((rc = user_path(pf, a->path, 0, path)) < 0)
+                return rc;
+            drive = (uint8_t)(path[0] - 'A' + 1);
+        } else {
+            drive = (uint8_t)(pf->cwd[0] - 'A' + 1);
+        }
+        r = (struct v86_regs){ .eax = 0x3600, .edx = drive };
+        if (v86_int(0x21, &r) != 0 || (r.eax & 0xFFFF) == 0xFFFF)
+            return -ERROR_INVALID_PARAMETER;
+        df = (struct disk_free){ r.eax & 0xFFFF, r.ecx & 0xFFFF, r.ebx & 0xFFFF, r.edx & 0xFFFF };
+        if (!user_writable((uint32_t)(uintptr_t)a->buf, sizeof df))
+            return -ERROR_NOACCESS;
+        memcpy(a->buf, &df, sizeof df);
+        return 0;
+    }
     }
     return -ERROR_INVALID_PARAMETER;
 }

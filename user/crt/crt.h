@@ -30,8 +30,8 @@ static inline void __crt_fail(int reason, const char *msg)
 /* Annex K: a broken constraint (safe.c). */
 void __crt_constraint(const char *msg, errno_t e);
 
-/* Locks for what a process's threads share (the heap, the open files).
- * Single-threaded processes need none; threads will make them real. */
+/* Locks for what a process's threads share (the heap, the open files,
+ * atexit's list): critical sections, recursive (lock.c). */
 enum { CRT_LOCK_HEAP, CRT_LOCK_FILES, CRT_LOCK_EXIT, CRT_LOCKS };
 void __crt_lock(int n);
 void __crt_unlock(int n);

@@ -99,8 +99,9 @@ user_enter:
         mov     ax, UDATA_SEL
         mov     ds, ax
         mov     es, ax
-        mov     fs, ax
         mov     gs, ax
+        mov     ax, UTLS_SEL            ; FS:0 -> the thread's TIB (the scheduler set it)
+        mov     fs, ax
         push    dword UDATA_SEL         ; ss
         push    edx                     ; esp
         push    dword 0x00000202        ; eflags: IF

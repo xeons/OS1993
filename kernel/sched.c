@@ -115,8 +115,11 @@ void schedule(void)
     current = next;
     vm_switch_to(next->vm);                 /* PDE 0 and TSS.ESP0 */
     proc_switch(next->proc);                /* user PDEs (ring-3 processes) */
-    if (next->user)                         /* traps from ring 3 land here */
+    if (next->user) {                       /* traps from ring 3 land here */
         kernel_tss.esp0 = (uint32_t)(uintptr_t)next->stack + THREAD_STACK;
+        if (next->tib)
+            gdt_set_tls(next->tib);         /* FS, when it returns to ring 3 */
+    }
     switch_context(&prev->esp, next->esp);
 }
 

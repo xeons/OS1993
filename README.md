@@ -27,6 +27,7 @@ are for later stages.
 | `make qemu-sessions` | types into two concurrent DOS sessions via QEMU's monitor |
 | `make qemu-absmouse` | absolute pointer through QEMU's VMware port: the cursor lands on the exact pixel, and clicks hit their control |
 | `make qemu-crt` | the C runtime: CRTTEST.BIN (CRT.DLL) and CRTSTAT.BIN (libcrt.a) pass its checks; a stack overrun, a heap overrun, a double free, a fortified memcpy, a broken Annex K constraint, `%n` and a failed assert each end the program with the reason logged; every process has its own canary |
+| `make qemu-threads` | threads: 67 checks (joins and exit codes, critical sections, events, semaphores, mutexes, timeouts, TLS and errno per thread, suspend/terminate, the 16-thread limit, malloc and printf from several threads, virtual memory, private heaps, a child process, the file calls); a stack overflow hits the guard page, a read-only page faults, the last thread's code ends the process, `exit` from a second thread ends them all |
 | `make qemu-vesa` | the VBE display driver: Display Properties switches to 1024×768 high colour, 800×600 in 256 colours and true colour, No and the 15-second timeout go back, a DOS session and back keeps the mode, OS1993.INI restores it next session, and 640×480×16 is VGA again |
 | `make qemu-tasklist` | Ctrl+Alt+Del: Close Program ends a program, works from a DOS session, and the VMM's screen ends a program that froze the GUI |
 | `make qemu-notepad` | Notepad: typing, Save As with CR LF, the clipboard between two processes, Open, select/delete/undo, unsaved-changes questions, Find/Find Next/whole words, Replace All and its undo, Word Wrap, the file's bytes on disk |
@@ -203,8 +204,8 @@ That needs VCPI/DPMI.
 
 The GUI is 32-bit flat protected-mode code in ring 3, as Windows 3.x ran
 its protected-mode code in the System VM (`kernel/user.c`, `user/`). A GUI
-session is a set of **processes**, each with one thread and its own
-address space, like Win95's 32-bit side.
+session is a set of **processes**, each with its own address space and up
+to 16 threads, like Win95's 32-bit side.
 
 - **Segments.** Ring-3 flat code and data descriptors (selectors 23h/2Bh).
   Isolation comes from paging: user pages have the U bit, kernel pages don't.
@@ -241,11 +242,46 @@ address space, like Win95's 32-bit side.
   table (closed when it ends, however it ends), its own searches, and its
   own current directory, at first the OS1993 directory. KERNEL.DLL wraps
   it Win32-style: `CreateFile`, `ReadFile`, `WriteFile`, `SetFilePointer`,
-  `GetFileSize`, `CloseHandle`, `DeleteFile`, `MoveFile`,
-  `Create`/`RemoveDirectory`, `GetFileAttributes`, `Get`/`SetCurrentDirectory`,
+  `GetFileSize`, `SetEndOfFile`, `FlushFileBuffers`, `CloseHandle`,
+  `DeleteFile`, `MoveFile`, `CopyFile`, `Create`/`RemoveDirectory`,
+  `Get`/`SetFileAttributes`, `Get`/`SetFileTime` (DOS keeps the last write,
+  to 2 seconds; `FileTimeToSystemTime` and back), `GetFullPathName`,
+  `GetDiskFreeSpace`, `Get`/`SetCurrentDirectory`,
   `FindFirstFile`/`FindNextFile`/`FindClose`, `GetLastError`.
-- **Memory.** `SYS_SBRK` grows a per-process heap at `2000_0000`;
-  KERNEL.DLL's `LocalAlloc`/`LocalReAlloc`/`LocalFree` manage it.
+- **Threads.** A process has up to 16 (`kernel/user.c`, KERNEL.DLL's
+  `thread.c`). Each has its own kernel thread, a stack in a region of its
+  own (64 KB by default, up to 1 MB) with an uncommitted guard page below
+  it -- running into it ends the process with "overflowed its stack"; all
+  ring-3 code is compiled with `-fstack-clash-protection`, so a big frame
+  can't step over it -- and a **TIB** at `FS:0` (as Win32's TEB: a ring-3
+  descriptor the scheduler points at the running thread's TIB) holding its
+  id, its own `errno` and `GetLastError`, and 64 TLS slots. `CreateThread`
+  (`CREATE_SUSPENDED`, `ResumeThread`), `ExitThread`, `TerminateThread`,
+  `GetExitCodeThread`. The last thread to end ends the process with its
+  code; `ExitProcess` (or `exit`, or a fault) from any thread ends them all.
+  Only the first thread may use the window system.
+- **Synchronization** is built on one kernel primitive, a futex
+  (`SYS_FUTEX_WAIT`: sleep while a word holds a value, with a timeout;
+  `SYS_FUTEX_WAKE`). On it KERNEL.DLL builds critical sections (recursive;
+  taking a free one is one `CMPXCHG`, no system call), events (manual and
+  auto-reset), mutexes (recursive, owner-checked), semaphores,
+  `WaitForSingleObject` on any of them or on a thread or process, and
+  `WaitForMultipleObjects` (one or all). `Interlocked*` use the 486's
+  `XADD` and `CMPXCHG`. The C runtime takes critical sections around its
+  `FILE`s, so threads can share `printf`.
+- **Processes.** `CreateProcess` gives a pid; `OpenProcess` a handle to
+  wait on (`WaitForSingleObject`) and `GetExitCodeProcess`;
+  `GetCommandLine`, `GetModuleFileName`.
+- **Memory.** `SYS_SBRK` grows the process heap at `2000_0000`; KERNEL.DLL
+  manages it (`LocalAlloc`, `GetProcessHeap`), locked for threads, every
+  block header checked as the heap is walked. `HeapCreate` makes private
+  heaps in regions of their own (`HeapAlloc`, `HeapReAlloc`, `HeapFree`,
+  `HeapSize`, `HeapValidate`, `HeapDestroy`). **Virtual memory**
+  (`SYS_VMEM`): `VirtualAlloc` reserves regions of `6200_0000`-`7F00_0000`
+  in 64 KB steps and commits pages; `VirtualFree` decommits or releases,
+  `VirtualProtect` makes pages read-only or writable, `VirtualQuery`
+  describes them; `GlobalMemoryStatus`. There is no paging to disk:
+  committing allocates the memory at once.
 - **Ctrl+Alt+Del** never reaches a DOS session (its BIOS would reboot).
   With a GUI it comes to the front and the shell shows **Close Program**
   (the running programs by window title; End Task, Shut Down, Cancel).
@@ -326,6 +362,9 @@ It is hardened, by default and in every ring-3 module:
   (data can't be imported), and the module header points at it: the loader
   stores a fresh random value there for each process, its low byte zero so
   a string copy can't reproduce it.
+- **Stack-clash probes.** `-fstack-clash-protection`: a function whose
+  frame is bigger than a page touches each page on the way down, so it
+  can't jump over a thread stack's guard page.
 - **Random numbers.** `kernel/random.c`: a ChaCha20 generator whose key
   every request first mixes with an entropy pool (interrupt timing, the
   RTC and the PIT at boot) and then replaces ("fast key erasure").
@@ -697,8 +736,8 @@ tools/                   check486.sh, check-test.sh
    and Notepad (word wrap, Find/Replace), a Ctrl+Alt+Del task list, combo
    boxes, tabs and up-downs, and code shared between processes, and higher resolutions and colour depths
    (the VBE display driver, Display Properties), and a hardened C runtime
-   (CRT.DLL and libcrt.a). Next: threads and the process, memory and file
-   APIs; then a network driver, TCP/IP, sockets and PING.
+   (CRT.DLL and libcrt.a), threads with Win32's synchronization, virtual
+   memory and heaps. Next: a network driver, TCP/IP, sockets and PING.
 7. **Win16-style API layer.** 16-bit protected-mode apps in ring 3 with LDTs,
    built with Open Watcom.
 8. **Coexisting with EMM386** through VCPI/GEMMIS, and acting as a DPMI host.

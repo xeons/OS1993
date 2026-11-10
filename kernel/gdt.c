@@ -10,6 +10,7 @@
  * Ring-3 segments cover all 4 GB; paging keeps user code out of kernel pages.
  */
 #include "gdt.h"
+#include "mm.h"
 #include "kernel.h"
 
 struct gdt_entry {
@@ -21,7 +22,7 @@ struct gdt_entry {
     uint8_t  base_hi;
 } __attribute__((packed));
 
-static struct gdt_entry gdt[6];
+static struct gdt_entry gdt[7];
 struct tss kernel_tss;
 
 static void gdt_set(int i, uint32_t base, uint32_t limit, uint8_t access, uint8_t flags)
@@ -41,6 +42,7 @@ void gdt_init(void)
     gdt_set(KDATA_SEL >> 3, 0, 0xFFFFF, 0x92, 0xC0);   /* ring 0 data, flat 4G */
     gdt_set(UCODE_SEL >> 3, 0, 0xFFFFF, 0xFA, 0xC0);   /* ring 3 code, flat 4G */
     gdt_set(UDATA_SEL >> 3, 0, 0xFFFFF, 0xF2, 0xC0);   /* ring 3 data, flat 4G */
+    gdt_set(UTLS_SEL >> 3, 0, PAGE_SIZE - 1, 0xF2, 0x40);  /* ring 3 data, one page: the TIB */
 
     /* All ports allowed by default (bitmap zeroed in .bss); the terminating
      * byte past the bitmap must have all bits set. */
@@ -55,6 +57,14 @@ void gdt_init(void)
     gdtr.base  = (uint32_t)(uintptr_t)gdt;
     gdt_load(&gdtr);
     __asm__ volatile("ltr %w0" : : "r"(TSS_SEL));
+}
+
+/* The scheduler, switching to a user thread: FS is reloaded from here on
+ * the way back to ring 3 (isr_common pops it), so it finds that thread's
+ * TIB. */
+void gdt_set_tls(uint32_t base)
+{
+    gdt_set(UTLS_SEL >> 3, base, PAGE_SIZE - 1, 0xF2, 0x40);
 }
 
 void tss_trap_port(uint16_t port, bool trap)

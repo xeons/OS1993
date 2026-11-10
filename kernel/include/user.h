@@ -30,6 +30,9 @@
 #define USER_FB         0x60C00000u     /*   a linear framebuffer (up to 16 MB) */
 #define USER_FB_MAX     0x01000000u
 #define USER_SHARED_END 0x61C00000u
+#define USER_VM         0x62000000u     /* VirtualAlloc, thread stacks and TIBs: from here ... */
+#define USER_VM_LIMIT   0x7F000000u     /* ... to here, in 64 KB-aligned regions */
+#define VM_GRANULE      0x00010000u
 #define PROC_MAX        8               /* processes at once */
 #define ARGS_MAX        128
 
@@ -156,6 +159,71 @@ struct user_event {
 #define FAIL_ASSERT         6           /* assert() */
 #define FAIL_EXIT           (-0x409)    /* cf. STATUS_STACK_BUFFER_OVERRUN */
 
+#define SYS_THREAD_CREATE 28            /* EBX = struct thread_args * -> tid, or -error */
+#define SYS_THREAD_EXIT 29              /* EBX = exit code (the last thread: the process's) */
+#define SYS_THREAD_WAIT 30              /* EBX = tid, ECX = ms, EDX = int *code (or 0)
+                                           -> 0 it has ended, 1 timed out, -1 no such thread */
+#define SYS_THREAD_RESUME 31            /* EBX = tid: start one created THREAD_SUSPENDED */
+#define SYS_THREAD_KILL 32              /* EBX = tid, ECX = its exit code */
+#define SYS_FUTEX_WAIT  33              /* EBX = address, ECX = expected value, EDX = ms
+                                           -> 0 woken, 1 the value differed, 2 timed out */
+#define SYS_FUTEX_WAKE  34              /* EBX = address, ECX = how many -> how many woke */
+#define SYS_VMEM        35              /* EBX = VM_*, ECX = struct vmem_args * -> 0, or -error */
+#define SYS_PROC_WAIT   36              /* EBX = pid, ECX = ms, EDX = int *code (or 0)
+                                           -> 0 it has ended, 1 timed out, -1 unknown pid */
+#define SYS_MEMINFO     37              /* EBX = struct mem_info * */
+
+
+/* Each thread's information block, at FS:0 (as Win32's TEB): its own
+ * errno, last error, thread-local storage. The kernel fills it in. */
+#define TLS_SLOTS       64
+#define TIB_MAIN        0x01            /* the process's first thread */
+struct user_tib {
+    uint32_t self;                      /* its own address */
+    uint32_t tid, pid;
+    uint32_t flags;
+    int      err;                       /* the C runtime's errno */
+    uint32_t last_error;                /* GetLastError */
+    uint32_t stack_base, stack_limit;   /* the stack: [limit, base) */
+    volatile uint32_t sleep_word;       /* Sleep waits on it */
+    uint32_t reserved[7];
+    uint32_t tls[TLS_SLOTS];            /* TlsGetValue / TlsSetValue */
+};
+
+#define THREADS_PER_PROC 16
+#define THREAD_STACK_DEFAULT 0x10000u   /* 64 KB, and a guard page below */
+#define THREAD_STACK_MAX     0x100000u
+#define THREAD_SUSPENDED 0x04           /* created stopped (SYS_THREAD_RESUME) */
+struct thread_args {
+    uint32_t start;                     /* entered with [ESP] = fn, [ESP+4] = arg */
+    uint32_t fn, arg;
+    uint32_t stack_size;                /* 0: THREAD_STACK_DEFAULT */
+    uint32_t flags;
+};
+
+/* SYS_VMEM: regions of USER_VM, reserved, then committed page by page */
+#define VM_RESERVE      1               /* addr (0: anywhere), size -> base */
+#define VM_COMMIT       2               /* addr, size, prot (reserves too if addr is 0) -> base */
+#define VM_DECOMMIT     3               /* addr, size */
+#define VM_RELEASE      4               /* addr: the region's base */
+#define VM_PROTECT      5               /* addr, size, prot -> old prot */
+#define VM_QUERY        6               /* addr -> base, size, state, prot */
+#define VM_PROT_READ    1
+#define VM_PROT_WRITE   2
+#define VM_STATE_FREE    0x10000        /* as Win32's MEM_FREE, MEM_RESERVE, MEM_COMMIT */
+#define VM_STATE_RESERVE 0x2000
+#define VM_STATE_COMMIT  0x1000
+struct vmem_args {
+    uint32_t addr, size, prot;          /* in */
+    uint32_t base, region_size;         /* out: the region (or the page run, VM_QUERY) */
+    uint32_t state, old_prot;           /* out */
+};
+
+struct mem_info {
+    uint32_t total_pages, free_pages;   /* physical memory */
+    uint32_t process_pages;             /* the caller's private pages */
+};
+
 /* The display (SYS_DISPLAY_*): VGA's 640x480 in 16 colours (4 bits,
  * planar), or a linear mode in 8 (palette), 16 (5:6:5) or 32 (8:8:8) bits. */
 struct display_mode { uint16_t width, height; uint8_t bpp, pad[3]; };
@@ -178,6 +246,7 @@ struct proc_entry {                     /* a running process (SYS_PROC_LIST) */
 #define PROC_LEADER     0x01            /* the session's first process (the shell) */
 #define PROC_UI_LOCK    0x02            /* it holds lock 0 (the window manager's) */
 #define WAIT_INFINITE   0xFFFFFFFFu
+#define WAIT_FOREVER    WAIT_INFINITE   /* the ms of SYS_FUTEX_WAIT, SYS_THREAD_WAIT ... */
 #define WAIT_INPUT      1               /* also end the wait when input is pending */
 #define LOCK_MAX        8
 
@@ -185,7 +254,18 @@ struct proc_entry {                     /* a running process (SYS_PROC_LIST) */
  * values match Win32 where Win32 has them. */
 enum { FOP_OPEN, FOP_READ, FOP_WRITE, FOP_CLOSE, FOP_SEEK, FOP_SIZE, FOP_DELETE,
        FOP_RENAME, FOP_MKDIR, FOP_RMDIR, FOP_ATTRIB, FOP_GETCWD, FOP_SETCWD,
-       FOP_FIND_FIRST, FOP_FIND_NEXT, FOP_FIND_CLOSE };
+       FOP_FIND_FIRST, FOP_FIND_NEXT, FOP_FIND_CLOSE,
+       FOP_TRUNCATE,                    /* handle: the file ends at its pointer */
+       FOP_FLUSH,                       /* handle: to the disk */
+       FOP_SETATTR,                     /* path, a = FILE_ATTRIBUTE_* */
+       FOP_FULLPATH,                    /* path -> buf (len): the full path; -> its length */
+       FOP_DISKFREE,                    /* path (a drive, or 0: the current one) -> buf: struct disk_free */
+       FOP_GETTIME,                     /* handle -> buf (uint32_t): DOS time << 16 | DOS date */
+       FOP_SETTIME };                   /* handle, a: DOS time << 16 | DOS date */
+
+struct disk_free {
+    uint32_t sectors_per_cluster, bytes_per_sector, free_clusters, total_clusters;
+};
 
 struct file_args {
     const char *path, *path2;           /* OPEN, DELETE, RENAME, ..., FIND_FIRST */
@@ -227,6 +307,9 @@ struct find_data {                      /* a directory entry (FIND_FIRST/NEXT) *
 #define ERROR_INVALID_PARAMETER  87
 #define ERROR_INVALID_NAME       123
 #define ERROR_NOACCESS           998     /* a bad user pointer */
+#define ERROR_NOT_ENOUGH_MEMORY  8
+#define ERROR_INVALID_ADDRESS    487
+#define ERROR_TOO_MANY_THREADS   164     /* ERROR_MAX_THRDS_REACHED */
 
 #ifndef USER_SIDE                       /* kernel only */
 struct regs;

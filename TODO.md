@@ -53,7 +53,13 @@ README.md for what already works.
       freed when it ends, not when their last user does; data pages are
       copied whole at start, not copy-on-write; a DLL changed on disk during
       a session isn't noticed.
-- [ ] Several threads per process; per-thread message queues.
+- [ ] Threads: done (16 per process). Only the first may use the window
+      system (UI.DLL's lock and queues are per process); per-thread message
+      queues would lift that. No SuspendThread of a running thread, no
+      named objects shared between processes, WaitForMultipleObjects with
+      wait_all takes the objects one at a time rather than atomically.
+- [ ] Virtual memory: no demand paging (committing allocates at once), no
+      PAGE_NOACCESS or PAGE_GUARD on committed pages, no paging to disk.
 - [ ] The window manager lock is held from a process's first UI call until
       it waits, like Win16Mutex: a program that computes for a long time
       inside a message handler freezes the GUI. Finer-grained locking.
@@ -72,8 +78,7 @@ README.md for what already works.
       returned to the system until the process ends.
 - [ ] C runtime: no floating point (no FPU on a 486SX; a soft-float
       library would be needed), no locales or wide characters, no
-      environment variables; text files aren't translated (CR LF); its
-      locks are empty until processes have several threads.
+      environment variables; text files aren't translated (CR LF).
 - [ ] Heap checks catch overruns and double frees when a block is freed,
       not when the bytes are written; a freed block reused by a new
       allocation can't be told from it.
@@ -99,6 +104,28 @@ README.md for what already works.
       BIOS can still move the real cursor).
 - [ ] DOS sessions in a window on the desktop (render the VM's text screen).
 - [ ] Monochrome adapters get no graphics desktop.
+
+## File systems
+
+Files go through DOS today (FAT12/16, FAT32 where the DOS has it). Native
+file systems need two pieces first, then one driver per format:
+
+- [ ] Native disk access in the VMM: an IDE/ATA driver, MBR partitions, a
+      block cache; arbitration with DOS and BIOS INT 13h in the VMs
+      (exclusive partitions, or virtualized INT 13h as 32-bit disk access).
+- [ ] DOS sees them as drive letters through a network redirector
+      (INT 2Fh AH=11h, as MSCDEX and network drives): 8.3 short aliases for
+      long names, no permissions or symlinks, nothing over 2-4 GB, names that
+      differ only in case collide. OS1993 programs get the full names.
+- [ ] FAT16 and FAT32 natively (FSInfo, VFAT long names); first, since DOS
+      can check the redirector against its own reading of the same disk.
+- [ ] exFAT (allocation bitmap, upcase table, checksummed entry sets).
+- [ ] ext2; ext3 (journal replay to read, journalled writes); ext4
+      (extents, 64-bit blocks, htree directories, CRC32C metadata) read-only
+      first.
+- [ ] btrfs, read-only (CoW B-trees, chunk tree, checksums, zlib/LZO/zstd).
+- [ ] 64-bit offsets everywhere without libgcc's division; caches that fit
+      in 16 MB.
 
 ## DOS virtual machines
 

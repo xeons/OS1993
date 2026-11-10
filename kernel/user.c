@@ -69,6 +69,21 @@ struct module {
     struct image *img;                      /* shared from this image, or NULL */
 };
 
+struct uthread {                            /* a thread of a process */
+    struct thread *t;                       /* NULL once it ended and was freed */
+    int      tid;                           /* 0: a free slot */
+    bool     done, suspended;
+    int      exit_code;
+    uint32_t region;                        /* its VM region: guard, stack, TIB */
+    uint32_t start, esp;                    /* where it enters ring 3 */
+};
+
+#define VREGION_MAX 64
+struct vregion {                            /* a region of USER_VM */
+    uint32_t base, size;
+    bool     used;
+};
+
 enum pstate { P_FREE, P_RUNNING, P_DEAD };
 
 struct process {
@@ -90,6 +105,10 @@ struct process {
     struct proc_files files;                /* open files, current directory */
     uint32_t       heap_end;                /* SYS_SBRK: USER_HEAP .. heap_end */
     uint32_t       shared_pages;            /* mapped from other processes' images */
+    struct thread *wait_thread;             /* the thread in SYS_WAIT */
+    struct thread *lock_thread;             /* the thread waiting for lock_wait */
+    struct uthread th[THREADS_PER_PROC];    /* th[0]: the first; thread = its kernel thread */
+    struct vregion vm[VREGION_MAX];
 };
 
 void user_enter(uint32_t eip, uint32_t esp, uint32_t ebx);  /* entry.asm */
@@ -209,6 +228,11 @@ static void release_address_space(struct process *p)
     if (p->heap_end > USER_HEAP)
         unmap_free(USER_HEAP, PAGE_ALIGN_UP(p->heap_end) - USER_HEAP);
     p->heap_end = USER_HEAP;
+    for (int i = 0; i < VREGION_MAX; i++)           /* thread stacks, VirtualAlloc */
+        if (p->vm[i].used) {
+            unmap_free(p->vm[i].base, p->vm[i].size);
+            memset(&p->vm[i], 0, sizeof p->vm[i]);
+        }
     volatile uint32_t *pd = (volatile uint32_t *)PD_WINDOW;
     for (int i = 1; i < USER_PDES; i++) {
         if (i >= SHARED_FIRST && i <= SHARED_LAST)  /* shared_destroy's business */
@@ -634,8 +658,327 @@ static bool resolve(struct process *p, struct module *m, int depth)
 static void user_thread_main(void *arg)
 {
     struct process *p = arg;
+    if (p->killed)
+        thread_exit();
     user_enter(p->entry, USER_STACK_TOP, USER_INFO);
 }
+
+/* ---- virtual memory regions (VirtualAlloc, thread stacks) ------------------ */
+
+/* USER_VM is handed out in regions, 64 KB aligned, reserved first and then
+ * committed page by page (a committed page is a mapped one). With no
+ * demand paging, committing allocates the frames at once; a reserved page
+ * that isn't committed faults -- a thread stack's guard page is one. */
+
+static struct vregion *vm_region(struct process *p, uint32_t addr)
+{
+    for (int i = 0; i < VREGION_MAX; i++)
+        if (p->vm[i].used && addr >= p->vm[i].base && addr - p->vm[i].base < p->vm[i].size)
+            return &p->vm[i];
+    return NULL;
+}
+
+/* -> the base of a new region of size bytes at addr (0: the lowest free
+ * place), or 0. */
+static uint32_t vm_reserve(struct process *p, uint32_t addr, uint32_t size)
+{
+    size = PAGE_ALIGN_UP(size);
+    if (!size || size > USER_VM_LIMIT - USER_VM)
+        return 0;
+    struct vregion *slot = NULL;
+    for (int i = 0; i < VREGION_MAX && !slot; i++)
+        if (!p->vm[i].used)
+            slot = &p->vm[i];
+    if (!slot)
+        return 0;
+    uint32_t base = addr ? addr & ~(VM_GRANULE - 1) : USER_VM;
+    for (;;) {
+        if (base < USER_VM || base > USER_VM_LIMIT - size)
+            return 0;
+        uint32_t clash = 0;
+        for (int i = 0; i < VREGION_MAX; i++) {
+            const struct vregion *r = &p->vm[i];
+            if (r->used && base < r->base + r->size && r->base < base + size && r->base + r->size > clash)
+                clash = r->base + r->size;
+        }
+        if (!clash)
+            break;
+        if (addr)
+            return 0;                               /* the place asked for is taken */
+        base = (clash + VM_GRANULE - 1) & ~(VM_GRANULE - 1);
+    }
+    *slot = (struct vregion){ .base = base, .size = size, .used = true };
+    return base;
+}
+
+static uint32_t pte_for(uint32_t prot) { return PTE_U | ((prot & VM_PROT_WRITE) ? PTE_W : 0); }
+
+/* Commit [addr, addr + size), or give committed pages the new protection. */
+static int vm_commit(uint32_t addr, uint32_t size, uint32_t prot)
+{
+    for (uint32_t va = addr; va - addr < size; va += PAGE_SIZE) {
+        uint32_t pa;
+        if (vmm_translate(va, &pa)) {
+            vmm_unmap(va);
+            vmm_map(va, pa & PAGE_MASK, pte_for(prot));
+            continue;
+        }
+        uint32_t frame = pmm_alloc();
+        if (!frame || vmm_map(va, frame, PTE_W | PTE_U) != 0) {
+            if (frame)
+                pmm_free(frame);
+            return -ERROR_NOT_ENOUGH_MEMORY;
+        }
+        memset((void *)(uintptr_t)va, 0, PAGE_SIZE);
+        if (!(prot & VM_PROT_WRITE)) {
+            vmm_unmap(va);
+            vmm_map(va, frame, pte_for(prot));
+        }
+    }
+    return 0;
+}
+
+static void vm_release(struct process *p, uint32_t base)
+{
+    struct vregion *r = vm_region(p, base);
+    if (!r)
+        return;
+    unmap_free(r->base, r->size);
+    memset(r, 0, sizeof *r);
+}
+
+static uint32_t vm_committed_pages(struct process *p)
+{
+    uint32_t n = 0;
+    for (int i = 0; i < VREGION_MAX; i++)
+        for (uint32_t va = p->vm[i].base; p->vm[i].used && va - p->vm[i].base < p->vm[i].size; va += PAGE_SIZE)
+            n += vmm_translate(va, NULL);
+    return n;
+}
+
+/* SYS_VMEM (p installed) -> 0, or -ERROR_* */
+static int vm_op(struct process *p, uint32_t op, struct vmem_args *a)
+{
+    uint32_t addr = a->addr, size = a->size;
+    struct vregion *r;
+    switch (op) {
+    case VM_RESERVE:
+    case VM_COMMIT:
+        if (!size || size > USER_VM_LIMIT - USER_VM)
+            return -ERROR_INVALID_PARAMETER;
+        if (op == VM_RESERVE || !addr) {
+            uint32_t base = vm_reserve(p, addr, size);
+            if (!base)
+                return addr ? -ERROR_INVALID_ADDRESS : -ERROR_NOT_ENOUGH_MEMORY;
+            a->base = base;
+            a->region_size = PAGE_ALIGN_UP(size);
+            if (op == VM_RESERVE)
+                return 0;
+            addr = base;
+        }
+        r = vm_region(p, addr);
+        size = PAGE_ALIGN_UP(addr + size) - PAGE_ALIGN_DOWN(addr);
+        addr = PAGE_ALIGN_DOWN(addr);
+        if (!r || size > r->base + r->size - addr)
+            return -ERROR_INVALID_ADDRESS;
+        a->base = addr;
+        a->region_size = size;
+        return vm_commit(addr, size, a->prot ? a->prot : VM_PROT_READ | VM_PROT_WRITE);
+    case VM_DECOMMIT:
+    case VM_PROTECT:
+        r = vm_region(p, addr);
+        size = PAGE_ALIGN_UP(addr + size) - PAGE_ALIGN_DOWN(addr);
+        addr = PAGE_ALIGN_DOWN(addr);
+        if (!r || !a->size || size > r->base + r->size - addr)
+            return -ERROR_INVALID_ADDRESS;
+        if (op == VM_DECOMMIT) {
+            unmap_free(addr, size);
+            return 0;
+        }
+        for (uint32_t va = addr; va - addr < size; va += PAGE_SIZE)
+            if (!vmm_translate(va, NULL))
+                return -ERROR_INVALID_ADDRESS;      /* only committed pages */
+        a->old_prot = VM_PROT_READ | (vmm_writable(addr) ? VM_PROT_WRITE : 0);
+        return vm_commit(addr, size, a->prot);
+    case VM_RELEASE:
+        r = vm_region(p, addr);
+        if (!r || r->base != addr)
+            return -ERROR_INVALID_ADDRESS;
+        for (int i = 0; i < THREADS_PER_PROC; i++)  /* not a thread's stack */
+            if (p->th[i].t && p->th[i].region == addr)
+                return -ERROR_INVALID_ADDRESS;
+        vm_release(p, addr);
+        return 0;
+    case VM_QUERY: {
+        uint32_t page = PAGE_ALIGN_DOWN(addr);
+        if (page < USER_VM || page >= USER_VM_LIMIT)
+            return -ERROR_INVALID_ADDRESS;
+        r = vm_region(p, page);
+        if (!r) {                                   /* free: up to the next region */
+            uint32_t end = USER_VM_LIMIT;
+            for (int i = 0; i < VREGION_MAX; i++)
+                if (p->vm[i].used && p->vm[i].base > page && p->vm[i].base < end)
+                    end = p->vm[i].base;
+            a->base = page;
+            a->region_size = end - page;
+            a->state = VM_STATE_FREE;
+            a->old_prot = 0;
+            return 0;
+        }
+        bool committed = vmm_translate(page, NULL), writable = committed && vmm_writable(page);
+        uint32_t va = page;
+        while (va - r->base < r->size && vmm_translate(va, NULL) == committed &&
+               (!committed || vmm_writable(va) == writable))
+            va += PAGE_SIZE;
+        a->base = page;
+        a->region_size = va - page;
+        a->state = committed ? VM_STATE_COMMIT : VM_STATE_RESERVE;
+        a->old_prot = committed ? VM_PROT_READ | (writable ? VM_PROT_WRITE : 0) : 0;
+        return 0;
+    }
+    }
+    return -ERROR_INVALID_PARAMETER;
+}
+
+/* ---- threads -------------------------------------------------------------- */
+
+static int next_tid = 1;
+
+static void user_thread_start(void *arg)            /* a new thread's first kernel code */
+{
+    struct uthread *ut = arg;
+    struct process *p = current->proc;
+    if (p->killed || p->state != P_RUNNING || current->killed) {
+        ut->done = true;                            /* ended before it began */
+        thread_exit();
+    }
+    user_enter(ut->start, ut->esp, 0);
+}
+
+/* A new thread of p (installed): a region for its stack (a guard page
+ * below it) and its TIB, and a kernel thread, created stopped. The first
+ * thread uses the fixed stack at USER_STACK_TOP. -> its slot, or -ERROR_* */
+static int thread_new(struct process *p, const struct thread_args *a, bool first)
+{
+    int slot = -1;
+    for (int i = 0; i < THREADS_PER_PROC && slot < 0; i++)
+        if (!p->th[i].t && (!p->th[i].tid || p->th[i].done))
+            slot = i;
+    if (slot < 0)
+        return -ERROR_TOO_MANY_THREADS;
+    uint32_t stack = first ? 0 : PAGE_ALIGN_UP(a->stack_size ? a->stack_size : THREAD_STACK_DEFAULT);
+    if (stack > THREAD_STACK_MAX)
+        return -ERROR_INVALID_PARAMETER;
+    uint32_t size = first ? PAGE_SIZE : PAGE_SIZE + stack + PAGE_SIZE;
+    uint32_t base = vm_reserve(p, 0, size);
+    if (!base)
+        return -ERROR_NOT_ENOUGH_MEMORY;
+    uint32_t from = first ? base : base + PAGE_SIZE;
+    if (vm_commit(from, base + size - from, VM_PROT_READ | VM_PROT_WRITE) < 0) {
+        vm_release(p, base);
+        return -ERROR_NOT_ENOUGH_MEMORY;
+    }
+    struct uthread *ut = &p->th[slot];
+    memset(ut, 0, sizeof *ut);
+    ut->region = base;
+    struct thread *t = first ? thread_create(p->name, user_thread_main, p, NULL)
+                             : thread_create(p->name, user_thread_start, ut, NULL);
+    if (!t) {
+        vm_release(p, base);
+        ut->region = 0;
+        return -ERROR_TOO_MANY_THREADS;
+    }
+    ut->tid = next_tid++;
+    uint32_t tib = base + size - PAGE_SIZE;
+    struct user_tib *tb = (struct user_tib *)(uintptr_t)tib;
+    tb->self = tib;
+    tb->tid = (uint32_t)ut->tid;
+    tb->pid = (uint32_t)p->pid;
+    tb->flags = first ? TIB_MAIN : 0;
+    if (first) {
+        tb->stack_base = USER_STACK_TOP;
+        tb->stack_limit = USER_STACK_TOP - USER_STACK_SIZE;
+    } else {
+        tb->stack_base = tib;
+        tb->stack_limit = base + PAGE_SIZE;
+        uint32_t *sp = (uint32_t *)(uintptr_t)tib;  /* the start code finds fn, arg */
+        *--sp = a->arg;
+        *--sp = a->fn;
+        ut->esp = (uint32_t)(uintptr_t)sp;
+        ut->start = a->start;
+    }
+    t->user = true;
+    t->proc = p;
+    t->tib = tib;
+    t->uth = slot;
+    ut->t = t;
+    return slot;
+}
+
+static struct uthread *uthread_of(struct process *p, int tid)
+{
+    for (int i = 0; tid > 0 && i < THREADS_PER_PROC; i++)
+        if (p->th[i].tid == tid)
+            return &p->th[i];
+    return NULL;
+}
+
+static void wake_threads(struct process *p)
+{
+    for (int i = 0; i < THREADS_PER_PROC; i++)
+        if (p->th[i].t)
+            thread_wake(p->th[i].t);
+}
+
+/* Futex keys: a user address, or one of these (kernel addresses, so they
+ * can't clash) for waiting on a thread or a process to end. */
+#define KEY_THREAD(tid) (0x80000000u | (uint32_t)(tid))
+#define KEY_PROC(pid)   (0xC0000000u | (uint32_t)(pid))
+
+static int futex_wake(struct process *p, uint32_t key, int n)
+{
+    int woke = 0;
+    for (int i = 0; i < THREADS_PER_PROC && woke < n; i++) {
+        struct thread *t = p->th[i].t;
+        if (t && t->futex == key && !t->woken) {
+            t->woken = true;
+            thread_wake(t);
+            woke++;
+        }
+    }
+    return woke;
+}
+
+static bool must_stop(struct process *p)
+{
+    return p->killed || p->state != P_RUNNING || current->killed;
+}
+
+/* Block the calling thread on key until a wake, ms milliseconds, or the
+ * end of the thread or its process. -> true if woken. */
+static bool futex_block(struct process *p, uint32_t key, uint32_t ms)
+{
+    if (ms != WAIT_FOREVER && ms > 0x7FFFFFF)
+        ms = 0x7FFFFFF;
+    current->futex = key;
+    current->woken = false;
+    current->deadline = ms == WAIT_FOREVER ? 0 : (timer_ticks() + (ms * 10 + 548) / 549) | 1;
+    while (!current->woken && !must_stop(p)) {
+        if (current->deadline && (int32_t)(timer_ticks() - current->deadline) >= 0)
+            break;
+        current->state = T_BLOCKED;
+        schedule();
+    }
+    bool woken = current->woken;
+    current->futex = 0;
+    current->woken = false;
+    current->deadline = 0;
+    return woken;
+}
+
+/* Recent ends, for SYS_PROC_WAIT after the process is gone. */
+static struct { int pid, code; } ended[16];
+static unsigned ended_next;
 
 /* Create a process running program `name` (console thread only: loading
  * goes through DOS). -> its pid, or -1. */
@@ -694,8 +1037,10 @@ static int spawn(const char *name, const char *args)
         for (char *c = p->name; *c; c++)            /* DOS names: upper case */
             if (*c >= 'a' && *c <= 'z')
                 *c = (char)(*c - 32);
-        p->thread = thread_create(p->name, user_thread_main, p, NULL);
-        ok = p->thread != NULL;
+        int slot = thread_new(p, NULL, true);      /* the first thread, and its TIB */
+        ok = slot >= 0;
+        if (ok)
+            p->thread = p->th[slot].t;
         if (ok)
             keep_images(p);                         /* before any of its code runs */
         for (int i = 0; ok && i < p->nmods; i++)    /* then: canaries of its own */
@@ -750,8 +1095,8 @@ int  user_result(void)  { return u.result; }
 static void wake_proc(struct process *p)
 {
     p->wake = true;
-    if (p->waiting && p->thread)
-        thread_wake(p->thread);
+    if (p->waiting && p->wait_thread)
+        thread_wake(p->wait_thread);
 }
 
 /* Give lock n to its next waiter, if any. Interrupts off. */
@@ -763,7 +1108,7 @@ static void lock_handoff(int n)
         if (p->state == P_RUNNING && p->lock_wait == n) {
             p->lock_wait = -1;
             u.lock_owner[n] = p->pid;
-            thread_wake(p->thread);
+            thread_wake(p->lock_thread);
             return;
         }
     }
@@ -798,7 +1143,7 @@ static void kill_proc(struct process *p)
     klog("VMM: ending %s (process %d)\n", p->name, p->pid);
     p->killed = true;
     p->lock_wait = -1;
-    thread_wake(p->thread);                         /* ends on its way to ring 3 */
+    wake_threads(p);                                /* ends on its way to ring 3 */
 }
 
 #define EM_ATTR  0x1F                               /* white on blue */
@@ -888,9 +1233,34 @@ void user_service(void)
     uint32_t f = irq_save();
     for (int i = 0; i < PROC_MAX; i++) {
         struct process *p = &procs[i];
-        if (p->state != P_DEAD || p->thread->state != T_DEAD)
+        if (p->state == P_RUNNING) {                /* threads that ended: free them */
+            for (int k = 0; k < THREADS_PER_PROC; k++) {
+                struct uthread *ut = &p->th[k];
+                if (!ut->t || !ut->done || ut->t->state != T_DEAD)
+                    continue;
+                if (p->thread == ut->t)
+                    p->thread = NULL;
+                thread_reap(ut->t);
+                ut->t = NULL;
+                current->proc = p;
+                proc_switch(p);
+                vm_release(p, ut->region);
+                ut->region = 0;
+                current->proc = NULL;
+            }
             continue;
-        thread_reap(p->thread);
+        }
+        if (p->state != P_DEAD)
+            continue;
+        bool all_dead = true;
+        for (int k = 0; k < THREADS_PER_PROC; k++)
+            if (p->th[k].t && p->th[k].t->state != T_DEAD)
+                all_dead = false;
+        if (!all_dead)
+            continue;
+        for (int k = 0; k < THREADS_PER_PROC; k++)
+            if (p->th[k].t)
+                thread_reap(p->th[k].t);
         current->proc = p;                          /* free its pages */
         proc_switch(p);
         files_close_all(&p->files);
@@ -947,6 +1317,12 @@ static void finish(int result)
     klog("USER: %s exited with code %d\n", p->name, result);
     p->state = P_DEAD;
     p->result = result;
+    p->killed = true;                               /* its other threads end too */
+    p->th[current->uth].done = true;
+    wake_threads(p);
+    ended[ended_next % 16].pid = p->pid;
+    ended[ended_next % 16].code = result;
+    ended_next++;
     u.exits++;
     for (int n = 0; n < LOCK_MAX; n++)
         if (u.lock_owner[n] == p->pid)
@@ -957,12 +1333,34 @@ static void finish(int result)
             if (procs[i].state == P_RUNNING) {
                 procs[i].killed = true;
                 procs[i].lock_wait = -1;
-                thread_wake(procs[i].thread);
+                wake_threads(&procs[i]);
             }
     }
     for (int i = 0; i < PROC_MAX; i++)              /* others may wait on us */
-        if (procs[i].state == P_RUNNING)
+        if (procs[i].state == P_RUNNING) {
             wake_proc(&procs[i]);
+            futex_wake(&procs[i], KEY_PROC(p->pid), THREADS_PER_PROC);
+        }
+    thread_exit();
+}
+
+/* The calling thread ends; the last one ends its process (with its code). */
+__attribute__((noreturn))
+static void thread_end(int code)
+{
+    struct process *p = cur_proc();
+    struct uthread *ut = &p->th[current->uth];
+    ut->done = true;
+    ut->exit_code = code;
+    if (p->state == P_RUNNING) {
+        int live = 0;
+        for (int i = 0; i < THREADS_PER_PROC; i++)
+            if (p->th[i].t && !p->th[i].done)
+                live++;
+        if (!live)
+            finish(code);
+        futex_wake(p, KEY_THREAD(ut->tid), THREADS_PER_PROC);
+    }
     thread_exit();
 }
 
@@ -971,8 +1369,14 @@ void user_return(struct regs *r)
 {
     (void)r;
     struct process *p = cur_proc();
-    if (p && p->killed && p->state == P_RUNNING)
+    if (!p)
+        return;
+    if (p->state == P_DEAD)                         /* another thread ended it */
+        thread_end(0);
+    if (p->killed)
         finish(-1);
+    if (current->killed)                            /* TerminateThread */
+        thread_end(current->kill_code);
 }
 
 static bool input_pending(void)
@@ -990,10 +1394,17 @@ void user_tick(void)
     bool input = input_pending();
     for (int i = 0; i < PROC_MAX; i++) {
         struct process *p = &procs[i];
-        if (p->state != P_RUNNING || !p->waiting)
+        if (p->state != P_RUNNING)
+            continue;
+        for (int k = 0; k < THREADS_PER_PROC; k++) {   /* futex waits that time out */
+            struct thread *t = p->th[k].t;
+            if (t && t->futex && t->deadline && (int32_t)(now - t->deadline) >= 0)
+                thread_wake(t);
+        }
+        if (!p->waiting)
             continue;
         if ((input && p->wait_input) || (p->deadline && (int32_t)(now - p->deadline) >= 0))
-            thread_wake(p->thread);
+            thread_wake(p->wait_thread);
     }
 }
 
@@ -1106,7 +1517,140 @@ void syscall_dispatch(struct regs *r)
         schedule();
         r->eax = 0;
         break;
+    case SYS_THREAD_CREATE: {
+        struct thread_args a;
+        if (!user_range_ok(r->ebx, sizeof a)) {
+            r->eax = (uint32_t)-ERROR_NOACCESS;
+            break;
+        }
+        memcpy(&a, (const void *)(uintptr_t)r->ebx, sizeof a);
+        if (a.start >= USER_LIMIT || a.fn >= USER_LIMIT) {
+            r->eax = (uint32_t)-ERROR_INVALID_PARAMETER;
+            break;
+        }
+        int slot = thread_new(self, &a, false);
+        if (slot < 0) {
+            r->eax = (uint32_t)slot;
+            break;
+        }
+        if (a.flags & THREAD_SUSPENDED)
+            self->th[slot].suspended = true;
+        else
+            thread_wake(self->th[slot].t);
+        r->eax = (uint32_t)self->th[slot].tid;
+        break;
+    }
+    case SYS_THREAD_EXIT:
+        thread_end((int)r->ebx);
+    case SYS_THREAD_RESUME: {
+        struct uthread *ut = uthread_of(self, (int)r->ebx);
+        r->eax = (uint32_t)-1;
+        if (ut && ut->t && ut->suspended) {
+            ut->suspended = false;
+            thread_wake(ut->t);
+            r->eax = 0;
+        }
+        break;
+    }
+    case SYS_THREAD_KILL: {
+        struct uthread *ut = uthread_of(self, (int)r->ebx);
+        if (!ut || !ut->t || ut->done) {
+            r->eax = (uint32_t)-1;
+            break;
+        }
+        if (ut->t == current)
+            thread_end((int)r->ecx);
+        ut->t->killed = true;
+        ut->t->kill_code = (int)r->ecx;
+        ut->suspended = false;
+        thread_wake(ut->t);
+        r->eax = 0;
+        break;
+    }
+    case SYS_THREAD_WAIT: {
+        struct uthread *ut = uthread_of(self, (int)r->ebx);
+        if (!ut || ut->t == current || (r->edx && !user_writable(r->edx, 4))) {
+            r->eax = (uint32_t)-1;
+            break;
+        }
+        int tid = ut->tid;
+        if (!ut->done && r->ecx)
+            futex_block(self, KEY_THREAD(tid), r->ecx);
+        if (ut->tid == tid && ut->done) {
+            if (r->edx)
+                *(int *)(uintptr_t)r->edx = ut->exit_code;
+            r->eax = 0;
+        } else {
+            r->eax = ut->tid == tid ? 1 : (uint32_t)-1;
+        }
+        break;
+    }
+    case SYS_FUTEX_WAIT: {
+        if ((r->ebx & 3) || !user_range_ok(r->ebx, 4)) {
+            r->eax = (uint32_t)-1;
+            break;
+        }
+        if (*(volatile uint32_t *)(uintptr_t)r->ebx != r->ecx) {
+            r->eax = 1;
+            break;
+        }
+        r->eax = !r->edx ? 2 : futex_block(self, r->ebx, r->edx) ? 0 : 2;
+        break;
+    }
+    case SYS_FUTEX_WAKE:
+        r->eax = (r->ebx & 3) || r->ebx >= USER_LIMIT ? 0 : (uint32_t)futex_wake(self, r->ebx, (int)r->ecx);
+        break;
+    case SYS_PROC_WAIT: {
+        if (r->edx && !user_writable(r->edx, 4)) {
+            r->eax = (uint32_t)-1;
+            break;
+        }
+        int pid = (int)r->ebx;
+        if (pid == self->pid) {
+            r->eax = (uint32_t)-1;
+            break;
+        }
+        if (proc_of(pid) && r->ecx)
+            futex_block(self, KEY_PROC(pid), r->ecx);
+        if (proc_of(pid)) {
+            r->eax = 1;
+            break;
+        }
+        r->eax = (uint32_t)-1;
+        for (unsigned i = 0; i < 16; i++)
+            if (ended[i].pid == pid && pid) {
+                if (r->edx)
+                    *(int *)(uintptr_t)r->edx = ended[i].code;
+                r->eax = 0;
+            }
+        break;
+    }
+    case SYS_VMEM: {
+        struct vmem_args a;
+        if (!user_writable(r->ecx, sizeof a)) {
+            r->eax = (uint32_t)-ERROR_NOACCESS;
+            break;
+        }
+        memcpy(&a, (const void *)(uintptr_t)r->ecx, sizeof a);
+        int rc = vm_op(self, r->ebx, &a);
+        memcpy((void *)(uintptr_t)r->ecx, &a, sizeof a);
+        r->eax = (uint32_t)rc;
+        break;
+    }
+    case SYS_MEMINFO: {
+        struct mem_info mi = { pmm_total_pages(), pmm_free_pages(),
+                               (PAGE_ALIGN_UP(self->heap_end) - USER_HEAP) / PAGE_SIZE +
+                               vm_committed_pages(self) + USER_STACK_SIZE / PAGE_SIZE };
+        if (!user_writable(r->ebx, sizeof mi)) {
+            r->eax = (uint32_t)-1;
+            break;
+        }
+        memcpy((void *)(uintptr_t)r->ebx, &mi, sizeof mi);
+        r->eax = 0;
+        break;
+    }
     case SYS_WAIT_TICK:
+        self->wait_thread = current;
         self->waiting = true;
         self->deadline = timer_ticks() + 1;
         current->state = T_BLOCKED;
@@ -1132,9 +1676,10 @@ void syscall_dispatch(struct regs *r)
         }
         uint32_t ticks = ms == WAIT_INFINITE ? 0 : (ms * 10 + 548) / 549;
         self->deadline = ticks ? timer_ticks() + ticks : 0;
+        self->wait_thread = current;
         self->waiting = true;
         self->wait_input = for_input;
-        while (!self->wake && !self->killed) {
+        while (!self->wake && !must_stop(self)) {
             current->state = T_BLOCKED;
             schedule();
             if (self->deadline && (int32_t)(timer_ticks() - self->deadline) >= 0)
@@ -1173,7 +1718,7 @@ void syscall_dispatch(struct regs *r)
         p->killed = true;
         if (p->lock_wait >= 0)
             p->lock_wait = -1;
-        thread_wake(p->thread);
+        wake_threads(p);
         r->eax = 0;
         if (p == self)
             finish(-1);
@@ -1191,7 +1736,8 @@ void syscall_dispatch(struct regs *r)
             u.lock_owner[n] = self->pid;
         } else if (u.lock_owner[n] != self->pid) {
             self->lock_wait = (int)n;               /* lock_handoff wakes us */
-            while (self->lock_wait == (int)n && !self->killed) {
+            self->lock_thread = current;
+            while (self->lock_wait == (int)n && !must_stop(self)) {
                 current->state = T_BLOCKED;
                 schedule();
             }
@@ -1405,9 +1951,13 @@ void user_fault(struct regs *r)
     if (emulate_vga_io(r))
         return;
     struct process *p = cur_proc();
+    uint32_t cr2 = read_cr2();
+    for (int i = 0; r->int_no == 14 && i < THREADS_PER_PROC; i++)    /* a guard page */
+        if (p->th[i].t && p->th[i].start && cr2 - p->th[i].region < PAGE_SIZE)
+            klog("USER: %s: thread %d overflowed its stack\n", p->name, p->th[i].tid);
     if (r->int_no == 14)
         klog("USER: %s killed by exception 0E (page fault, %s %08X) at %04X:%08X\n",
-             p->name, (r->err_code & 2) ? "write to" : "read from", read_cr2(),
+             p->name, (r->err_code & 2) ? "write to" : "read from", cr2,
              r->cs & 0xFFFF, r->eip);
     else
         klog("USER: %s killed by exception %02X at %04X:%08X\n",
