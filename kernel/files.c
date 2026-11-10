@@ -214,7 +214,7 @@ static int transfer(struct proc_files *pf, struct file_args *a, bool write)
     if (s < 0)
         return -ERROR_INVALID_HANDLE;
     uint32_t ubuf = (uint32_t)(uintptr_t)a->buf;
-    if (a->len && !user_range_ok(ubuf, a->len))
+    if (a->len && !(write ? user_range_ok(ubuf, a->len) : user_writable(ubuf, a->len)))
         return -ERROR_NOACCESS;
     uint32_t chunk = v86_buf_size(), done = 0;
     while (done < a->len) {
@@ -250,7 +250,7 @@ static void put_find(const uint8_t *dta, struct find_data *fd)
  * transfer buffer for the call and the caller's DTA put back after. */
 static int find(struct proc_files *pf, int slot, bool first, struct file_args *a)
 {
-    if (!user_range_ok((uint32_t)(uintptr_t)a->buf, sizeof(struct find_data)))
+    if (!user_writable((uint32_t)(uintptr_t)a->buf, sizeof(struct find_data)))
         return -ERROR_NOACCESS;
     struct v86_regs g = { .eax = 0x2F00 };              /* the DTA now */
     dos(&g);
@@ -336,7 +336,7 @@ int file_op(struct proc_files *pf, uint32_t op, struct file_args *a)
         return attributes(0);
     case FOP_GETCWD: {
         size_t n = strlen(pf->cwd) + 1;
-        if (a->len < n || !user_range_ok((uint32_t)(uintptr_t)a->buf, (uint32_t)n))
+        if (a->len < n || !user_writable((uint32_t)(uintptr_t)a->buf, (uint32_t)n))
             return -ERROR_NOACCESS;
         memcpy(a->buf, pf->cwd, n);
         return (int)n - 1;

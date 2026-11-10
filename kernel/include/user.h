@@ -199,6 +199,7 @@ void user_fault(struct regs *r);
 
 void user_return(struct regs *r);       /* about to return to ring 3 */
 bool user_range_ok(uint32_t p, uint32_t len);       /* mapped user memory? */
+bool user_writable(uint32_t p, uint32_t len);       /* ... that the kernel may write */
 bool user_string(uint32_t p, char *out, size_t size);  /* copy in a string */
 struct process;
 void proc_switch(struct process *p);    /* scheduler: install its address space */

@@ -4,7 +4,7 @@
 #                   build/OS1993.COM, VMM.BIN, the DLLs and the programs (*.BIN)
 #   make run        boot it in DOSBox-X (386, 16 MB, HIMEM-style XMS)
 #   make test       headless DOSBox-X run; checks the full round trip to DOS
-#   make check386   verify the kernel contains no post-386 instructions
+#   make check486   verify nothing contains post-486 or FPU instructions
 #   make qemu       boot FreeDOS 1.3 in QEMU with OS1993 on C: (real DOS)
 #   make qemu-test  the same, headless: run OS1993 /T and check the results
 #   make qemu-emm386  OS1993 must refuse to run with JEMM386 loaded
@@ -30,7 +30,7 @@ QEMU    := qemu-system-i386
 
 BUILD   := build
 
-CFLAGS  := -std=gnu11 -march=i386 -mtune=i386 -mgeneral-regs-only \
+CFLAGS  := -std=gnu11 -march=i486 -mtune=i486 -mgeneral-regs-only \
            -ffreestanding -fno-pic -fno-pie -fno-stack-protector \
            -fno-asynchronous-unwind-tables -fno-delete-null-pointer-checks \
            -fno-strict-aliasing --param=min-pagesize=0 -O2 -g -Wall -Wextra \
@@ -83,7 +83,7 @@ KERNEL_ASM := $(wildcard kernel/*.asm)
 KERNEL_OBJ := $(patsubst kernel/%.asm,$(BUILD)/kernel/%.o,$(KERNEL_ASM)) \
               $(patsubst kernel/%.c,$(BUILD)/kernel/%.o,$(KERNEL_C))
 
-.PHONY: all run test check386 qemu qemu-test qemu-emm386 qemu-sessions qemu-vga qemu-wm qemu-absmouse qemu-menu qemu-controls qemu-msgbox qemu-shell qemu-files qemu-notepad qemu-tasklist clean
+.PHONY: all run test check486 qemu qemu-test qemu-emm386 qemu-sessions qemu-vga qemu-wm qemu-absmouse qemu-menu qemu-controls qemu-msgbox qemu-shell qemu-files qemu-notepad qemu-tasklist clean
 
 all: $(BUILD)/OS1993.COM $(BUILD)/VMM.BIN $(MODULES)
 
@@ -176,6 +176,12 @@ test: all
 	SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy $(DOSBOX) $(DOSBOX_ARGS) \
 	    -nogui -time-limit 60 -c "OS1993 /T > LOADER.LOG" -c "exit"
 	@tools/check-test.sh $(BUILD)
+	@rm -f $(BUILD)/CPU386.LOG
+	@SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy $(DOSBOX) $(DOSBOX_ARGS) -set "cpu cputype=386" \
+	    -nogui -time-limit 20 -c "OS1993 > CPU386.LOG" -c "exit" >/dev/null 2>&1
+	@if grep -q "requires an 80486" $(BUILD)/CPU386.LOG; then \
+	    echo "  PASS  on a 386 the loader refuses to start"; \
+	else echo "  FAIL  on a 386 the loader refuses to start"; exit 1; fi
 
 # QEMU has no 386 model; a 486 with 16 MB is the closest 1993 machine.
 QEMU_ARGS := -M isapc,vmport=on -cpu 486 -m 16 -drive file=$(BUILD)/freedos.img,format=raw,if=ide \
@@ -237,8 +243,8 @@ qemu-notepad: all
 qemu-tasklist: all
 	@tools/qemu-tasklist-test.py
 
-check386: $(BUILD)/vmm.elf $(MODULE_ELFS)
-	@for f in $^; do tools/check386.sh $(OBJDUMP) $$f || exit 1; done
+check486: $(BUILD)/vmm.elf $(MODULE_ELFS)
+	@for f in $^; do tools/check486.sh $(OBJDUMP) $$f || exit 1; done
 
 clean:
 	rm -rf $(BUILD)

@@ -59,6 +59,7 @@ void    *phys_to_virt(uint32_t phys);   /* arena or KLOW window, else NULL */
 int      vmm_map(uint32_t va, uint32_t pa, uint32_t flags);  /* 0, or <0 */
 uint32_t vmm_unmap(uint32_t va);        /* returns old frame, 0 if none */
 bool     vmm_translate(uint32_t va, uint32_t *pa);
+bool     vmm_writable(uint32_t va);         /* present and writable */
 void     tlb_flush(void);
 void     klow_init(void);               /* map the KLOW window */
 

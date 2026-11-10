@@ -3,7 +3,7 @@
 A hobby operating environment written as if it were 1993: a 32-bit,
 paged, protected-mode **Virtual Machine Manager** that starts from the DOS
 prompt, in the spirit of Windows 3.1's 386 Enhanced mode. Built with modern
-tools; the output runs on a real (or emulated) 386 with DOS and HIMEM.SYS.
+tools; the output runs on a real (or emulated) 486 with DOS and HIMEM.SYS.
 
 ```
 C:\> OS1993
@@ -18,9 +18,9 @@ are for later stages.
 | Command          | What it does                                                  |
 |------------------|---------------------------------------------------------------|
 | `make`           | builds `build/OS1993.COM` (loader), `build/VMM.BIN` (kernel), the ring-3 DLLs and programs (`*.DLL`, `*.BIN`) |
-| `make run`       | boots it in DOSBox-X: 386, 16 MB, XMS, no EMS                 |
+| `make run`       | boots it in DOSBox-X: 486, 16 MB, XMS, no EMS                 |
 | `make test`      | headless round trip DOS → VMM → DOS, checked automatically    |
-| `make check386`  | fails if the kernel contains any post-386 or FPU instruction  |
+| `make check486`  | fails if any binary contains a post-486 or FPU instruction    |
 | `make qemu`      | boots real FreeDOS 1.3 in QEMU (486, 16 MB, ISA PC); `OS1993` is in `C:\OS1993` |
 | `make qemu-test` | headless FreeDOS run of the same checks as `make test`        |
 | `make qemu-emm386` | FreeDOS with JEMM386: the loader must refuse to start       |
@@ -38,22 +38,23 @@ are for later stages.
 
 There are two test machines because they catch different bugs:
 
-- **DOSBox-X** is fast and can emulate a strict 386, but its DOS and
-  COMMAND.COM are emulator built-ins written in C++.
+- **DOSBox-X** is fast and emulates a 486 (and a 386, for the test that the
+  loader refuses one), but its DOS and COMMAND.COM are emulator built-ins
+  written in C++.
 - **QEMU + FreeDOS** runs a real DOS kernel, FreeCOM, HIMEMX and JEMM386.
   `tools/mkfreedos.sh` downloads the official FreeDOS 1.3 Lite image once
   into `.cache/freedos` and checks its SHA-256. It then writes its own
   `FDCONFIG.SYS`/`FDAUTO.BAT` and copies OS1993 onto the image with mtools.
-  The `isa-debug-exit` device lets an automated run power off QEMU. QEMU has
-  no 386 model, so it runs as a 486.
+  The `isa-debug-exit` device lets an automated run power off QEMU. It runs
+  as a 486.
 
 Kernel debug output goes to COM1; under DOSBox-X it lands in
 `build/SERIAL.LOG`.
 
 ## How it boots
 
-1. **`OS1993.COM`** (real mode, `loader/os1993.asm`) checks for a 386 that is
-   in real mode, not V86 mode under EMM386/QEMM. It then allocates the largest
+1. **`OS1993.COM`** (real mode, `loader/os1993.asm`) checks for a 486 (one
+   that can set EFLAGS.AC; a 386 is refused with a message) that is in real mode, not V86 mode under EMM386/QEMM. It then allocates the largest
    free extended memory block from HIMEM.SYS (XMS), locks it, and enables A20.
 2. It reads **`VMM.BIN`** from its own directory and copies it into the XMS
    block with XMS moves.
@@ -551,14 +552,16 @@ kernel/gdt.c idt.c pic.c timer.c keyboard.c console.c serial.c kprintf.c panic.c
 kernel/include/          headers; bootinfo.h is shared with the loader
 kernel/linker.ld         links at 0x80000000, header first
 test/dosbox-x.conf       the emulated 1993 machine
-tools/                   check386.sh, check-test.sh
+tools/                   check486.sh, check-test.sh
 ```
 
 ## Rules of the house
 
-- **386 only.** No `invlpg` (486): flush the TLB by reloading CR3. No FPU
-  (`-mgeneral-regs-only`). No libgcc, so no 64-bit division. `make check386`
-  enforces this.
+- **486SX.** The 486's instructions are fine (`INVLPG` flushes single pages,
+  CR0.WP makes read-only pages read-only for the kernel too, so it checks
+  user buffers it writes into with `user_writable`), but no FPU
+  (`-mgeneral-regs-only`), no CPUID (early 486s lack it), nothing Pentium.
+  No libgcc, so no 64-bit division. `make check486` enforces this.
 - **The loader and kernel share `bootinfo`.** Change both sides together; the
   `_Static_assert`s and the `%if` in the loader catch layout drift.
 

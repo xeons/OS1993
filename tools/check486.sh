@@ -1,10 +1,12 @@
 #!/bin/sh
-# Fail if the kernel contains instructions a 386 (without a 387) can't run.
+# Fail if a binary contains instructions a 486SX (no FPU) can't run.
+# 486 additions (BSWAP, CMPXCHG, XADD, INVLPG, INVD, WBINVD) are fine;
+# CPUID isn't (early 486s lack it), nor is anything Pentium or later.
 # The loader needs no check: nasm's `cpu 386` directive enforces it.
 objdump=$1
 elf=$2
 
-bad='^(cmov|bswap|cmpxchg|xadd|invlpg|invd|wbinvd|cpuid|rdtsc|rdmsr|wrmsr|rdpmc|sysenter|sysexit|syscall|ud2|endbr|movbe|popcnt|lzcnt|tzcnt|f[a-z]|(v?p?(add|sub|mul|mov|xor|and|or)[a-z]*(ps|pd|ss|sd)$)|emms|movq|movd)'
+bad='^(cmov|cmpxchg8b|cpuid|rdtsc|rdmsr|wrmsr|rdpmc|sysenter|sysexit|syscall|ud2|endbr|movbe|popcnt|lzcnt|tzcnt|f[a-z]|(v?p?(add|sub|mul|mov|xor|and|or)[a-z]*(ps|pd|ss|sd)$)|emms|movq|movd)'
 
 # Ring-3 modules start .text with the 52-byte MOD3 header: data, not code.
 start=
@@ -18,8 +20,8 @@ hits=$("$objdump" -d --no-show-raw-insn $start "$elf" |
        grep -E "$bad")
 
 if [ -n "$hits" ]; then
-    echo "check386: post-386 / FPU instructions found:"
+    echo "check486: post-486 / FPU instructions found:"
     echo "$hits" | cut -f2- | head -20
     exit 1
 fi
-echo "check386: OK -- $(basename "$elf") is clean 386 code"
+echo "check486: OK -- $(basename "$elf") is clean 486 code"

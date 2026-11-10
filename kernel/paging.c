@@ -5,9 +5,9 @@
  *   the PTE for linear address va is at  PT_WINDOW + (va >> 12) * 4
  *   the PDE for va is at                 PD_WINDOW + (va >> 22) * 4
  *
- * The 386 has no INVLPG, so any change to a present entry flushes the whole
- * TLB by reloading CR3. Not-present entries are never cached, so creating a
- * mapping needs no flush.
+ * A change to a present entry flushes that page from the TLB with INVLPG
+ * (486); swapping whole page tables reloads CR3. Not-present entries are
+ * never cached, so creating a mapping needs no flush.
  *
  * TODO(V86): once each VM has its own page directory, kernel PDEs (>= 2 GB)
  * must stay identical in all of them. Either preallocate the kernel page
@@ -61,10 +61,15 @@ uint32_t vmm_unmap(uint32_t va)
     if ((PDE(va) & PTE_P) && (PTE(va) & PTE_P)) {
         old = PTE(va) & PAGE_MASK;
         PTE(va) = 0;
-        tlb_flush();
+        invlpg(va);
     }
     irq_restore(irq);
     return old;
+}
+
+bool vmm_writable(uint32_t va)
+{
+    return (PDE(va) & PTE_P) && (PTE(va) & (PTE_P | PTE_W)) == (PTE_P | PTE_W);
 }
 
 bool vmm_translate(uint32_t va, uint32_t *pa)

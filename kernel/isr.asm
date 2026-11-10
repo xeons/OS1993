@@ -6,7 +6,7 @@
 ; Every stub builds a struct regs (kernel/include/interrupts.h) and calls
 ; interrupt_dispatch(struct regs *).
 ; =============================================================================
-        cpu     386
+        cpu     486
         bits    32
 
 %include "selectors.inc"

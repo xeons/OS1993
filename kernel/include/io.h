@@ -41,6 +41,10 @@ static inline void cpu_idle(void) { __asm__ volatile("sti; hlt" ::: "memory"); }
 static inline uint32_t read_cr0(void) { uint32_t v; __asm__ volatile("mov %%cr0, %0" : "=r"(v)); return v; }
 static inline uint32_t read_cr2(void) { uint32_t v; __asm__ volatile("mov %%cr2, %0" : "=r"(v)); return v; }
 static inline uint32_t read_cr3(void) { uint32_t v; __asm__ volatile("mov %%cr3, %0" : "=r"(v)); return v; }
+static inline void write_cr0(uint32_t v) { __asm__ volatile("mov %0, %%cr0" : : "r"(v) : "memory"); }
+static inline void invlpg(uint32_t va)   { __asm__ volatile("invlpg (%0)" : : "r"(va) : "memory"); }
+
+#define CR0_WP 0x00010000u      /* 486: ring 0 honours read-only pages too */
 
 /* Physical/linear low memory (identity mapped by the loader). */
 #define LOWMEM8(addr)   (*(volatile uint8_t  *)(uintptr_t)(addr))

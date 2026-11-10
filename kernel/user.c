@@ -251,6 +251,17 @@ bool user_range_ok(uint32_t p, uint32_t len)
     return true;
 }
 
+/* ... and writable: the kernel can't write into read-only (shared) pages. */
+bool user_writable(uint32_t p, uint32_t len)
+{
+    if (!user_range_ok(p, len))
+        return false;
+    for (uint32_t a = PAGE_ALIGN_DOWN(p); a < p + len; a += PAGE_SIZE)
+        if (!vmm_writable(a))
+            return false;
+    return true;
+}
+
 bool user_string(uint32_t p, char *out, size_t size)
 {
     for (size_t n = 0; n < size; n++) {
@@ -1209,7 +1220,7 @@ void syscall_dispatch(struct regs *r)
     }
     case SYS_TIME: {
         struct systime t;
-        if (!user_range_ok(r->ebx, sizeof t)) {
+        if (!user_writable(r->ebx, sizeof t)) {
             r->eax = (uint32_t)-1;
             break;
         }
@@ -1223,7 +1234,7 @@ void syscall_dispatch(struct regs *r)
         break;
     case SYS_GET_EVENT: {
         struct user_event e = { 0 };
-        if (!user_range_ok(r->ebx, sizeof e)) {
+        if (!user_writable(r->ebx, sizeof e)) {
             r->eax = (uint32_t)-1;
             break;
         }
@@ -1256,7 +1267,7 @@ void syscall_dispatch(struct regs *r)
     case SYS_PROC_LIST: {
         uint32_t n = 0, max = r->ecx;
         if (max > PROC_MAX) max = PROC_MAX;
-        if (!user_range_ok(r->ebx, max * sizeof(struct proc_entry))) {
+        if (!user_writable(r->ebx, max * sizeof(struct proc_entry))) {
             r->eax = (uint32_t)-1;
             break;
         }

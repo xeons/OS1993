@@ -4,7 +4,7 @@
  * The standard calculator: the four operations, square root, percent,
  * reciprocal, sign, and a memory, by mouse or keyboard (digits, + - * /,
  * Enter or =, Esc clears, Backspace, % and @ for square root). The 386 has
- * no FPU here, so numbers are 64-bit fixed point with six decimals and up
+ * no FPU on a 486SX, so numbers are 64-bit fixed point with six decimals and up
  * to twelve digits before the point -- with our own 64-bit division, since
  * ring-3 code has no libgcc either.
  */

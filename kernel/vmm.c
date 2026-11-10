@@ -133,7 +133,8 @@ void kmain(const struct bootinfo *bi)
     pic_init(IRQ_BASE, IRQ_BASE + 8);
     ok("8259 PICs remapped to vectors 20h-2Fh");
     check_paging(bi);
-    ok("Paging (recursive page directory)");
+    write_cr0(read_cr0() | CR0_WP);                 /* read-only means read-only, ring 0 too */
+    ok("Paging (recursive page directory, write-protect)");
     pmm_init(bi);
     heap_init();
     klow_init();

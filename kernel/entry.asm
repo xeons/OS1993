@@ -1,7 +1,7 @@
 ; =============================================================================
 ; kernel/entry.asm -- VMM.BIN header, entry point and low-level helpers
 ; =============================================================================
-        cpu     386
+        cpu     486
         bits    32
 
 %include "selectors.inc"

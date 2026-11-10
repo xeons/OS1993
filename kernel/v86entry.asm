@@ -7,7 +7,7 @@
 ; over (or the VM crashed), v86_leave() discards those frames and returns
 ; from v86_enter() as if from a normal call -- a setjmp/longjmp pair.
 ; =============================================================================
-        cpu     386
+        cpu     486
         bits    32
 
 %include "selectors.inc"

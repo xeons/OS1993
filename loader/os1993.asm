@@ -3,7 +3,7 @@
 ;
 ; Plays the role WIN.COM + WIN386.EXE's startup code played in 1993:
 ;
-;   1. verify a 386+ CPU running in real mode (not V86 under EMM386/QEMM)
+;   1. verify a 486+ CPU running in real mode (not V86 under EMM386/QEMM)
 ;   2. allocate extended memory from HIMEM.SYS through the XMS interface
 ;   3. load VMM.BIN (from the same directory as this program) into it
 ;   4. switch to protected mode, build page tables, enable paging
@@ -69,6 +69,11 @@ start:
         mov     dx, err_cpu
         jmp     die
 .is386:
+        call    check_486               ; 386 instructions are safe now
+        jnc     .is486
+        mov     dx, err_cpu486
+        jmp     die
+.is486:
         smsw    ax                      ; MSW.PE set while in real mode => V86
         test    al, 1
         jz      .real_mode
@@ -337,6 +342,26 @@ rm_return:
 ; -----------------------------------------------------------------------------
 ; Subroutines (real mode)
 ; -----------------------------------------------------------------------------
+
+; CF clear if 486 or better: only a 486 can set EFLAGS.AC (bit 18).
+check_486:
+        pushfd
+        pop     eax
+        mov     ecx, eax
+        xor     eax, 0x00040000         ; flip AC
+        push    eax
+        popfd
+        pushfd
+        pop     eax
+        push    ecx                     ; put EFLAGS back
+        popfd
+        xor     eax, ecx
+        test    eax, 0x00040000         ; did it stick?
+        jz      .no
+        clc
+        ret
+.no:    stc
+        ret
 
 ; CF clear if 386 or better. Must use 8086 instructions only.
 check_386:
@@ -691,7 +716,8 @@ msg_go          db  'Starting the Virtual Machine Manager...', 13, 10, '$'
 msg_back        db  'OS1993 has ended. Exit code $'
 msg_crlf        db  13, 10, '$'
 
-err_cpu         db  'OS1993 requires an 80386 or better processor.', 13, 10, '$'
+err_cpu         db  'OS1993 requires an 80486 or better processor.', 13, 10, '$'
+err_cpu486      db  'OS1993 requires an 80486 or better processor (this is a 386).', 13, 10, '$'
 err_v86         db  'The processor is in virtual 8086 mode. A memory manager such as', 13, 10
                 db  'EMM386 or QEMM is loaded; remove it from CONFIG.SYS and try again.', 13, 10, '$'
 err_noxms       db  'No XMS driver found. Add DEVICE=HIMEM.SYS to CONFIG.SYS.', 13, 10, '$'
