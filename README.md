@@ -27,7 +27,7 @@ are for later stages.
 | `make qemu-sessions` | types into two concurrent DOS sessions via QEMU's monitor |
 | `make qemu-absmouse` | absolute pointer through QEMU's VMware port: the cursor lands on the exact pixel, and clicks hit their control |
 | `make qemu-crt` | the C runtime: CRTTEST.BIN (CRT.DLL) and CRTSTAT.BIN (libcrt.a) pass its checks; a stack overrun, a heap overrun, a double free, a fortified memcpy, a broken Annex K constraint, `%n` and a failed assert each end the program with the reason logged; every process has its own canary |
-| `make qemu-fat` | the VMM's own disks, run twice: with the data disk on the secondary channel and beside the boot disk (whose INT 13h the VMM then does); FAT32, FAT16, exFAT, two ext2 logical drives and an ext3 one left needing recovery, plus a 5 GB exFAT disk; FreeDOS had mounted the FAT ones as D: and E:, exFAT is F:, ext2 G: and H:, ext3 I:, the big disk J:; a DOS session works on them through the redirector (DIR, TYPE, COPY, MD, REN, DEL, a batch file read from E:), FSTEST.BIN's 161 checks through KERNEL.DLL (long names and aliases, numbered aliases, a 300 KB file in pieces, writing, gaps, truncating, folders, moves, read-only, locks, directories that grow, an exFAT file that can't stay contiguous, ext2's indirect blocks and 8 KB blocks, links, an ext3 journal replayed and ext3 written through its journal, case and dot files, a 4.5 GB exFAT file on a 4 KB-sector disk, a 5 GB sparse ext2 file, the time zone), LFNTEST.COM's long-name calls, share modes and locks from DOS, DOS sees D: and E: as its own drives again after OS1993 ends, and mtools, `tools/exfat.py`, debugfs, fsck.fat, fsck.exfat and e2fsck check the image; then a crash: QEMU killed right after writes to ext3, e2fsck and the next boot both replay the journal |
+| `make qemu-fat` | the VMM's own disks, run twice: with the data disk on the secondary channel and beside the boot disk (whose INT 13h the VMM then does); FAT32, FAT16, exFAT, two ext2 logical drives and an ext3 one left needing recovery, plus a 5 GB exFAT disk; FreeDOS had mounted the FAT ones as D: and E:, exFAT is F:, ext2 G: and H:, ext3 I:, the big disk J:; a DOS session works on them through the redirector (DIR, TYPE, COPY, MD, REN, DEL, a batch file read from E:), FSTEST.BIN's 175 checks through KERNEL.DLL (long names and aliases, numbered aliases, a 300 KB file in pieces, writing, gaps, truncating, folders, moves, read-only, locks, directories that grow, an exFAT file that can't stay contiguous, ext2's indirect blocks and 8 KB blocks, links, an ext3 journal replayed and ext3 written through its journal (internal, and an external one with data=journal and CRC32 checksums), ext4 read with its checksums, a long name on C:, case and dot files, a 4.5 GB exFAT file on a 4 KB-sector disk, a 5 GB sparse ext2 file, the time zone), LFNTEST.COM's long-name calls, share modes and locks from DOS, DOS sees D: and E: as its own drives again after OS1993 ends, and mtools, `tools/exfat.py`, debugfs, fsck.fat, fsck.exfat and e2fsck check the image; then a crash: QEMU killed right after writes to ext3, e2fsck and the next boot both replay the journal; then btrfs (zstd with a subvolume, LZO, zlib with a damaged sector) on a disk of its own |
 | `make qemu-net` | the network: the NE2000 and a DHCP lease, NETTEST.BIN's 26 checks (loopback UDP and TCP with a server thread, refused connections, ICMP port unreachable, timeouts, non-blocking sockets and select, 64 KB echoed by a server on the host), PING to the host, the loopback and nobody, IPCONFIG, and the host connecting in to a server in the guest |
 | `make qemu-threads` | threads: 67 checks (joins and exit codes, critical sections, events, semaphores, mutexes, timeouts, TLS and errno per thread, suspend/terminate, the 16-thread limit, malloc and printf from several threads, virtual memory, private heaps, a child process, the file calls); a stack overflow hits the guard page, a read-only page faults, the last thread's code ends the process, `exit` from a second thread ends them all |
 | `make qemu-vesa` | the VBE display driver: Display Properties switches to 1024×768 high colour, 800×600 in 256 colours and true colour, No and the 15-second timeout go back, a DOS session and back keeps the mode, OS1993.INI restores it next session, and 640×480×16 is VGA again |
@@ -505,8 +505,14 @@ and DOS programs get them too.
   symbolic links read as their target. **Hard and symbolic links** can be
   made (`CreateHardLink`, `CreateSymbolicLink`). Times are kept in UTC,
   through the time zone. A volume with read-only-compatible features it
-  doesn't know mounts read-only; ext4's incompatible features (extents,
-  64-bit ...) aren't mounted at all.
+  doesn't know mounts read-only.
+  **ext4**, read-only: extent trees (index blocks, uninitialized extents
+  as zeros), 64-bit block group descriptors, flex_bg, meta_bg, hashed
+  directories (read as the linear lists they also are), and metadata_csum:
+  the superblock's, group descriptors', inodes', extent blocks' and
+  directory blocks' CRC32C checksums are checked, and what fails isn't
+  read. Inline data, encryption and journal devices of its own aren't
+  mounted.
   **ext3 journal replay**: a volume that wasn't unmounted cleanly
   (needs_recovery) has its journal replayed first, as Linux and e2fsck do
   it: the committed transactions found, revoke records gathered, every
@@ -521,8 +527,24 @@ and DOS programs get them too.
   (written behind). A full journal is checkpointed: everything home, the
   log starts over. needs_recovery is set while mounted and cleared by a
   clean shutdown; after a crash, the next mount -- or Linux, or e2fsck --
-  replays what was committed. Journals with checksums or async commit, and
-  external journals, stay read-only.
+  replays what was committed. Several calls share a transaction: it
+  commits after two seconds (the cache's flusher), when it grows big, on a
+  flush (FlushFileBuffers, DOS's commit) and at shutdown. Journal
+  checksums -- v2/v3 (CRC32C per block) and the old CRC32 in the commit
+  block -- are checked when replaying (a transaction whose checksums fail
+  didn't happen; a damaged copy is left out) and written. An **external
+  journal** (a journal device of its own, found by UUID) is used like an
+  internal one. **data=journal** (the volume's default mount option) logs
+  file data too. Journals with async commit, and JBD v1, stay read-only.
+- **btrfs** (`kernel/fs/btrfs.c`), read-only, one device: the chunk tree
+  (bootstrapped from the superblock's system chunks; single and DUP), the
+  root tree, file system trees and subvolumes (shown as folders), inode
+  and directory items, inline and regular extents, holes (no_holes) and
+  preallocated ranges as zeros, symbolic links. Compressed extents are
+  decompressed with zlib, LZO or zstd (`kernel/fs/decomp.c`, written for
+  this and checked on the host against the real compressors). Every node's
+  CRC32C is checked as it is read, and the checksum tree's CRC32C of every
+  data sector.
 - **Drivers** plug in through an operations table (`kernel/fs/fsimpl.h`);
   `fs.c` mounts each partition with the first driver that knows it, and
   holds the lock, the list of volumes, the share modes and byte-range
@@ -533,8 +555,11 @@ and DOS programs get them too.
   `name`, the 8.3 `short_name` and `size_high`; `SetFilePointerEx` and
   `GetFileSizeEx` reach past 4 GB; `LockFile`/`UnlockFile` lock byte
   ranges against other handles and DOS programs; `SetTimeZoneInformation`
-  sets the time zone, which the shell keeps in OS1993.INI
-  (`[timezone] tzbias=`, minutes, UTC = local + bias).
+  sets the time zone and its daylight saving rules (Win32's
+  TIME_ZONE_INFORMATION), which the shell keeps in OS1993.INI (`[timezone]
+  tzbias=`, `dstbias=`, `dststart=`, `dstend=`: minutes, UTC = local +
+  bias; month,week,day_of_week,hour). Timestamps are converted with the
+  offset of their own moment.
 - **DOS** (`kernel/fs/redir.c`) sees the same volumes as network drives: the
   drive letter's current directory structure is marked "network", so DOS
   sends every call for it to the network redirector, INT 2Fh AH=11h, as it
@@ -548,8 +573,12 @@ and DOS programs get them too.
   A volume DOS had mounted itself (the same boot sector, or serial number)
   keeps its letter: DOS's buffers are flushed and dropped first, and when
   OS1993 ends the drive is given back and DOS rebuilds it from the disk.
-  DOS's boot drive, and a drive with files open, stay DOS's (the VMM lets
-  go of that volume). Other volumes get free letters below LASTDRIVE.
+  DOS's boot drive C: is taken over too, as Windows 95 did, with its
+  current directory -- unless DOS has a file open on it for writing (as
+  OS1993 /T's redirected log); another drive with files open stays DOS's
+  (the VMM lets go of that volume). So OS1993 programs and DOS programs
+  get long names on C: as well. Other volumes get free letters below
+  LASTDRIVE.
 - **Long names for DOS programs** (`kernel/fs/lfn.c`): Windows 95's
   INT 21h AX=71xxh calls (mkdir, rmdir, chdir, delete, attributes and
   times, current directory, find first/next/close, rename, full path,
@@ -559,8 +588,8 @@ and DOS programs get them too.
   drives DOS answers 7100h ("not supported"), so programs use 8.3 names
   there, as on a DOS without long names.
 
-What doesn't work: ext4 (see TODO.md); long names on
-DOS's own drives (C:); TexFAT (exFAT with two FATs, which only Windows CE
+What doesn't work: writing ext4 and btrfs, btrfs on several devices or
+RAID (see TODO.md); TexFAT (exFAT with two FATs, which only Windows CE
 uses: desktop Windows doesn't mount it either) and ATAPI or 4 KB-sector
 drives; Unix owners, permissions beyond the write bit, and extended
 attributes on ext2 (kept as they are, not shown: nothing in a Win32-style
@@ -856,7 +885,7 @@ kernel/dosmgr.c                          one DOS shared by all VMs
 kernel/random.c                          random numbers (ChaCha20 from interrupt timing)
 kernel/net/                              the NE2000, Ethernet/ARP/IP/ICMP/DHCP, sockets and UDP, TCP
 kernel/disk/                             IDE (ATA PIO, interrupts, LBA48), INT 13h for DOS, partitions, the block cache
-kernel/fs/                               FAT12/16/32 with long names, exFAT, ext2, the DOS redirector (INT 2Fh AH=11h), long names for DOS (INT 21h AX=71xxh)
+kernel/fs/                               FAT12/16/32 with long names, exFAT, ext2/3/4, btrfs (and zlib/LZO/zstd), the DOS redirector (INT 2Fh AH=11h), long names for DOS (INT 21h AX=71xxh)
 kernel/files.c                           file calls for ring 3: DOS's drives through DOS, the VMM's directly
 kernel/vga.c gfx.c                       VGA state (VDD), planar drawing
 kernel/display.c vbe.c                   display modes: the VBE adapter, the VBE BIOS probe
@@ -874,7 +903,7 @@ kernel/gdt.c idt.c pic.c timer.c keyboard.c console.c serial.c kprintf.c panic.c
 kernel/include/          headers; bootinfo.h is shared with the loader
 kernel/linker.ld         links at 0x80000000, header first
 test/dosbox-x.conf       the emulated 1993 machine
-tools/                   check486.sh, check-test.sh, mkfreedos.sh, mkdata.sh, exfat.py, the QEMU tests
+tools/                   check486.sh, check-test.sh, mkfreedos.sh, mkdata.sh, exfat.py, decomp-test.c, the QEMU tests
 test/dos/lfntest.asm     a DOS program using the long-name calls, share modes and locks
 ```
 

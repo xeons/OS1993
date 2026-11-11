@@ -20,7 +20,7 @@
 #include "user.h"
 
 #define FS_NAME_MAX 255
-#define VOL_MAX     8
+#define VOL_MAX     24
 
 
 struct vol;
@@ -65,6 +65,7 @@ int  fs_volume_count(void);
 struct vol *fs_volume_at(int i);
 void fs_set_letter(struct vol *v, char letter);
 void fs_drop_volume(struct vol *v);     /* DOS keeps it (redir.c) */
+void fs_commit_all(void);               /* journals' transactions, committed now */
 int  fs_boot_sector(struct vol *v, uint8_t *out);   /* its first sector */
 uint32_t fs_serial(const struct vol *v);
 const char *fs_label(const struct vol *v);
@@ -143,8 +144,11 @@ void rtc_dos_time_odd(uint16_t *date, uint16_t *time, uint8_t *odd);
 
 /* The time zone: the RTC keeps local time; UTC = local + bias minutes
  * (Win32's sign). ext2 keeps UTC, exFAT local time with its offset. */
-void fs_set_timezone(int32_t bias);
-int32_t fs_timezone(void);
+void fs_set_timezone(const struct fs_timezone *z);
+void fs_get_timezone(struct fs_timezone *z);
 bool fs_timezone_known(void);
+int32_t fs_timezone(void);              /* the bias now */
+int32_t fs_bias_local(uint16_t date, uint16_t time);
+int32_t fs_bias_utc(uint32_t unix_utc);
 
 #endif

@@ -98,20 +98,51 @@ bool AcquireLock(int n)                     { return sys_lock(n) == 0; }
 bool ReleaseLock(int n)                     { return sys_unlock(n) == 0; }
 void GetLocalTime(SYSTEMTIME *t)            { sys_time(t); }
 
+static void rule_out(const struct fs_tzrule *r, SYSTEMTIME *st)
+{
+    memset(st, 0, sizeof *st);
+    st->month = r->month;
+    st->day = r->week;                                  /* as Win32: the week, 5 the last */
+    st->day_of_week = r->day_of_week;
+    st->hour = r->hour;
+    st->minute = r->minute;
+}
+
+static void rule_in(const SYSTEMTIME *st, struct fs_tzrule *r)
+{
+    r->month = (uint8_t)st->month;
+    r->week = (uint8_t)st->day;
+    r->day_of_week = (uint8_t)st->day_of_week;
+    r->hour = (uint8_t)st->hour;
+    r->minute = (uint8_t)st->minute;
+}
+
 uint32_t GetTimeZoneInformation(TIME_ZONE_INFORMATION *tz)
 {
+    struct fs_timezone z;
+    int id = sys_timezone(0, &z);
     memset(tz, 0, sizeof *tz);
-    tz->Bias = sys_timezone(0, 0);
-    return 0;                                           /* TIME_ZONE_ID_UNKNOWN: no daylight saving */
+    tz->Bias = z.bias;
+    tz->StandardBias = z.std_bias;
+    tz->DaylightBias = z.dst_bias;
+    rule_out(&z.std, &tz->StandardDate);
+    rule_out(&z.dst, &tz->DaylightDate);
+    return id < 0 ? 0 : (uint32_t)id;                   /* TIME_ZONE_ID_UNKNOWN, _STANDARD, _DAYLIGHT */
 }
 
 bool SetTimeZoneInformation(const TIME_ZONE_INFORMATION *tz)
 {
-    if (tz->Bias < -14 * 60 || tz->Bias > 14 * 60) {
+    struct fs_timezone z = { tz->Bias, tz->StandardBias, tz->DaylightBias, { 0 }, { 0 } };
+    rule_in(&tz->StandardDate, &z.std);
+    rule_in(&tz->DaylightDate, &z.dst);
+    if (z.bias < -14 * 60 || z.bias > 14 * 60 || z.std.month > 12 || z.dst.month > 12 ||
+        (z.dst.month && (z.dst.week < 1 || z.dst.week > 5 || z.std.week < 1 || z.std.week > 5))) {
         k_error(ERROR_INVALID_PARAMETER);
         return false;
     }
-    return sys_timezone(1, tz->Bias) == tz->Bias;
+    struct fs_timezone back = z;
+    sys_timezone(1, &back);
+    return back.bias == z.bias;
 }
 
 /* A DLL that holds a lock across calls (UI.DLL's window manager lock) lets

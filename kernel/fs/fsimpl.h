@@ -40,6 +40,7 @@ struct fs_ops {
     void (*sync)(struct vol *v);                /* open files' entries, then the cache */
     int  (*link)(struct vol *v, const char *existing, const char *path);    /* NULL: not supported */
     int  (*symlink)(struct vol *v, const char *path, const char *target);
+    void (*commit)(struct vol *v);              /* a journal's transaction, now (NULL: none) */
 };
 
 struct vol {
@@ -78,5 +79,7 @@ uint16_t fs_hash16(const char *name);
 void fs_unix_to_dos(uint32_t t, uint16_t *date, uint16_t *time);
 uint32_t fs_dos_to_unix(uint16_t date, uint16_t time);
 struct vol *ext2_mount(struct partition *p);
+struct vol *btrfs_mount(struct partition *p);
+uint32_t fs_crc32c(uint32_t crc, const void *data, uint32_t len);   /* no final inversion */
 
 #endif

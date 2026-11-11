@@ -93,9 +93,23 @@ bool     GetFileSizeEx(HANDLE h, int64_t *size);
 bool     CreateHardLink(const char *path, const char *existing, void *security);
 #define  SYMBOLIC_LINK_FLAG_DIRECTORY 1
 bool     CreateSymbolicLink(const char *link, const char *target, uint32_t flags);
-/* The time zone (the clock keeps local time): UTC = local time + Bias minutes.
- * The shell sets it from OS1993.INI ([timezone] tzbias=). */
-typedef struct { int32_t Bias; char StandardName[32]; } TIME_ZONE_INFORMATION;
+/* The time zone (the clock keeps local time): UTC = local time + Bias +
+ * StandardBias, or + DaylightBias between DaylightDate and StandardDate
+ * (month, day_of_week, day = the week 1-5, 5 the last, hour, minute).
+ * The shell sets it from OS1993.INI ([timezone] tzbias=, dstbias=,
+ * dststart= and dstend= as month,week,day_of_week,hour). */
+typedef struct {
+    int32_t    Bias;
+    char       StandardName[32];
+    SYSTEMTIME StandardDate;
+    int32_t    StandardBias;
+    char       DaylightName[32];
+    SYSTEMTIME DaylightDate;
+    int32_t    DaylightBias;
+} TIME_ZONE_INFORMATION;
+#define TIME_ZONE_ID_UNKNOWN  0
+#define TIME_ZONE_ID_STANDARD 1
+#define TIME_ZONE_ID_DAYLIGHT 2
 uint32_t GetTimeZoneInformation(TIME_ZONE_INFORMATION *tz);
 bool     SetTimeZoneInformation(const TIME_ZONE_INFORMATION *tz);
 bool     SetFileAttributes(const char *path, uint32_t attributes);

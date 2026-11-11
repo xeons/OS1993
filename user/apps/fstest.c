@@ -1,7 +1,8 @@
 /*
  * fstest.c -- tests of the VMM's own disks: FAT32 (D:), FAT16 (E:),
- * exFAT (F:), ext2 (G:, 1 KB blocks; H:, 8 KB), ext3 needing recovery (I:)
- * on one disk, and a 5 GB exFAT disk with 4 KB sectors (J:), reached directly through
+ * exFAT (F:), ext2 (G:, 1 KB blocks; H:, 8 KB), ext3 needing recovery (I:),
+ * ext4 (J:), ext3 with an external journal and data=journal (K:) on one
+ * disk, and a 5 GB exFAT disk with 4 KB sectors (L:), reached directly through
  * KERNEL.DLL's file calls, long names and all.
  *
  * tools/qemu-fat-test.py builds the disk (tools/mkdata.sh), lets a DOS
@@ -11,6 +12,7 @@
  * afterwards. One line per failure and a total in the debug log.
  */
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include "os1993.h"
 
@@ -129,6 +131,11 @@ static void test_reading(void)
 
 static void test_dos_results(void)
 {
+    /* C:, DOS's boot drive, is the VMM's while OS1993 runs: long names there too */
+    CHECK(spit("C:\\OS1993\\A long name on drive C.txt", "long, on C:\r\n", 13) &&
+          text_is("c:\\os1993\\A LONG NAME ON DRIVE C.TXT", "long, on C:\r\n") &&
+          listed("C:\\OS1993\\A long*", "A long name on drive C.txt", "ALONGN~1.TXT", NULL),
+          "C: (DOS's boot drive): a long name");
     /* E:\DOSTEST.BAT ran in a DOS session before the GUI started */
     int n = slurp("E:\\BIG2.BIN", buf, sizeof buf);
     CHECK(n == (int)sizeof big && !memcmp(buf, big, sizeof big), "DOS's COPY D:\\BIG.BIN E:\\BIG2.BIN: the same bytes");
@@ -251,7 +258,7 @@ static void test_writing(void)
     CHECK(count("E:\\GUIDIR\\*") == 20, "... delete every other one: 20 left");
 
     uint32_t spc, bps, freec, total;
-    CHECK(GetDiskFreeSpace("D:\\", &spc, &bps, &freec, &total) && spc == 1 && bps == 512 && total == 96760 &&
+    CHECK(GetDiskFreeSpace("D:\\", &spc, &bps, &freec, &total) && spc == 1 && bps == 512 && total == 96736 &&
           freec > 0 && freec < total, "GetDiskFreeSpace D:");
     CHECK(spit("D:\\FROMGUI.TXT", "Written by an OS1993 program.\r\n", 31), "leave D:\\FROMGUI.TXT");
 }
@@ -461,7 +468,7 @@ static void test_big(void)
 {
     /* I: exFAT with 4 KB sectors, a 4.5 GB file tools/exfat.py made */
     int64_t size = 0, at = 0;
-    HANDLE h = CreateFile("J:\\Huge file.bin", GENERIC_READ | GENERIC_WRITE, OPEN_EXISTING);
+    HANDLE h = CreateFile("L:\\Huge file.bin", GENERIC_READ | GENERIC_WRITE, OPEN_EXISTING);
     CHECK(h != INVALID_HANDLE_VALUE && GetFileSizeEx(h, &size) && size == 4608LL * 1024 * 1024,
           "exFAT, 4 KB sectors: a 4.5 GB file (GetFileSizeEx)");
     char b[32] = "";
@@ -476,10 +483,10 @@ static void test_big(void)
     CHECK(SetFilePointer(h, 0, FILE_END) == INVALID_SET_FILE_POINTER, "SetFilePointer (32-bit) refuses a position past 2 GB");
     CloseHandle(h);
     WIN32_FIND_DATA fd;
-    h = FindFirstFile("J:\\Huge*", &fd);
+    h = FindFirstFile("L:\\Huge*", &fd);
     CHECK(h != INVALID_HANDLE_VALUE && fd.size_high == 1 && fd.size == 512u * 1024 * 1024, "FindFirstFile: the size's high part");
     FindClose(h);
-    CHECK(text_is("J:\\small.txt", "a small file on a big disk\r\n"), "... and a small file beside it");
+    CHECK(text_is("L:\\small.txt", "a small file on a big disk\r\n"), "... and a small file beside it");
 
     /* H: ext2 with 8 KB blocks */
     CHECK(text_is("H:\\hello8k.txt", "ext2 with 8 KB blocks.\n"), "ext2, 8 KB blocks: read");
@@ -502,18 +509,24 @@ static void test_big(void)
     CHECK(ReadFile(h, b, 4, &got) && got == 4 && !memcmp(b, "tail", 4), "... and its end is there");
     CloseHandle(h);
 
-    /* the time zone: UTC = local + bias */
-    TIME_ZONE_INFORMATION tz = { -60, "" };
-    CHECK(SetTimeZoneInformation(&tz), "SetTimeZoneInformation (UTC+1)");
+    /* the time zone: UTC+1, and daylight saving from October to April (as
+     * in the south): November is in daylight time, UTC+2 */
+    TIME_ZONE_INFORMATION tz;
+    memset(&tz, 0, sizeof tz);
+    tz.Bias = -60;
+    tz.DaylightBias = -60;
+    tz.DaylightDate = (SYSTEMTIME){ .month = 10, .day = 1, .day_of_week = 0, .hour = 2 };
+    tz.StandardDate = (SYSTEMTIME){ .month = 4, .day = 1, .day_of_week = 0, .hour = 3 };
+    CHECK(SetTimeZoneInformation(&tz), "SetTimeZoneInformation (UTC+1, daylight saving October-April)");
     TIME_ZONE_INFORMATION back_tz;
-    GetTimeZoneInformation(&back_tz);
-    CHECK(back_tz.Bias == -60, "GetTimeZoneInformation");
+    CHECK(GetTimeZoneInformation(&back_tz) == TIME_ZONE_ID_DAYLIGHT && back_tz.Bias == -60 && back_tz.DaylightBias == -60,
+          "GetTimeZoneInformation: in daylight time now");
     SYSTEMTIME st;
     GetLocalTime(&st);
     char when[64];
     snprintf(when, sizeof when, "%04u-%02u-%02u %02u:%02u:%02u", st.year, st.month, st.day, st.hour, st.minute, st.second);
     CHECK(spit("G:\\tz.txt", when, (uint32_t)strlen(when)) && spit("F:\\tz.txt", when, (uint32_t)strlen(when)),
-          "files written in UTC+1 on ext2 and exFAT");
+          "files written in UTC+2 (daylight time) on ext2 and exFAT");
 }
 
 static void test_links(void)
@@ -556,10 +569,13 @@ static void test_ext3(void)
     CHECK(SetEndOfFile(h) && GetFileSize(h) == 1000, "ext3: truncate (its blocks freed and revoked)");
     CloseHandle(h);
     bool made = true;
-    for (int i = 0; i < 150 && made; i++) {
+    for (int i = 0; i < 150 && made; i++) {             /* each flushed: a transaction each */
         char name[64];
         snprintf(name, sizeof name, "I:\\Journal Dir\\file %d with a longer name.txt", i);
-        made = spit(name, name, (uint32_t)strlen(name));
+        HANDLE f = CreateFile(name, GENERIC_WRITE, CREATE_ALWAYS);
+        uint32_t put;
+        made = f != INVALID_HANDLE_VALUE && WriteFile(f, name, (uint32_t)strlen(name), &put) && FlushFileBuffers(f);
+        CloseHandle(f);
     }
     CHECK(made && count("I:\\Journal Dir\\*") == 151, "ext3: 150 more files: many transactions (the journal wraps)");
 }
@@ -574,6 +590,11 @@ static void crash_write(void)
     spit("I:\\Crash Dir\\inside.txt", "inside, before the crash\r\n", 26);
     DeleteFile("I:\\second.txt");
     MoveFile("I:\\before.txt", "I:\\Crash Dir\\before, moved.txt");
+    spit("K:\\Crash K.txt", "external, before the crash\r\n", 28);
+    HANDLE f1 = CreateFile("I:\\Crash One.txt", GENERIC_READ, OPEN_EXISTING);
+    HANDLE f2 = CreateFile("K:\\Crash K.txt", GENERIC_READ, OPEN_EXISTING);
+    FlushFileBuffers(f1);                               /* committed: durable, though not yet home */
+    FlushFileBuffers(f2);
     printf("FS: crash point\n");
     for (;;)
         Sleep(1000);
@@ -586,6 +607,113 @@ static void after_crash(void)
     CHECK(GetFileAttributes("I:\\second.txt") == INVALID_FILE_ATTRIBUTES, "after the crash: the deleted file is gone");
     CHECK(text_is("I:\\Crash Dir\\before, moved.txt", "written before the crash\n") &&
           GetFileAttributes("I:\\before.txt") == INVALID_FILE_ATTRIBUTES, "after the crash: the moved file moved");
+    CHECK(text_is("K:\\Crash K.txt", "external, before the crash\r\n"), "after the crash: the external journal's too");
+    printf("FS: %d of %d checks passed\n", checks - failures, checks);
+}
+
+/* J: ext4 (read-only): extents, 64-bit descriptors, metadata checksums. */
+static void test_ext4(void)
+{
+    CHECK(text_is("J:\\Hello ext4.txt", "Hello from ext4.\n"), "ext4: read a file (extents)");
+    int n = slurp("J:\\big.bin", buf, sizeof buf);
+    CHECK(n == (int)sizeof big && !memcmp(buf, big, sizeof big), "ext4: 300000 bytes");
+    static uint8_t frag[1048576 / 4];
+    HANDLE h = CreateFile("J:\\frag.bin", GENERIC_READ, OPEN_EXISTING);
+    bool good = h != INVALID_HANDLE_VALUE && GetFileSize(h) == 1048576;
+    for (uint32_t part = 0; part < 4 && good; part++) {             /* 26 extents, a depth-1 tree */
+        uint32_t got = 0;
+        good = ReadFile(h, frag, sizeof frag, &got) && got == sizeof frag;
+        for (uint32_t i = 0; i < sizeof frag && good; i++) {
+            uint32_t at = part * sizeof frag + i, blk = at / 4096;
+            uint8_t want = blk % 10 == 0 && blk >= 10 && blk <= 250 ? 0 : (uint8_t)(at * 13 + 1);
+            good = frag[i] == want;
+        }
+    }
+    CloseHandle(h);
+    CHECK(good, "ext4: a file of 26 extents (an index block), punched holes read as zeros");
+    static uint8_t pre[40960];
+    n = slurp("J:\\prealloc.bin", pre, sizeof pre);
+    good = n == 40960;
+    for (int i = 0; i < 40960 && good; i++)
+        good = pre[i] == (i < 8192 ? 'P' : 0);
+    CHECK(good, "ext4: an uninitialized extent reads as zeros");
+    CHECK(count("J:\\Extent Dir\\*") == 120 && text_is("J:\\Extent Dir\\entry number 77 in a big directory.txt", "Hello from ext4.\n"),
+          "ext4: a hashed directory of 120 names");
+    CHECK(text_is("J:\\journal.txt", "replayed, checksummed\n"), "ext4: its journal replayed (64-bit, checksum v3 tags)");
+    CHECK(slurp("J:\\corrupt.txt", buf, 64) < 0 && GetLastError() == ERROR_FILE_CORRUPT,
+          "ext4: an inode whose checksum is wrong isn't read");
+    CHECK(!spit("J:\\new.txt", "x", 1) && GetLastError() == ERROR_WRITE_PROTECT, "ext4: read-only");
+}
+
+/* K: ext3 with an external journal (a partition of its own), data=journal,
+ * the old CRC32 checksums: one transaction replayed, one whose commit
+ * checksum was broken not. */
+static void test_ext3x(void)
+{
+    CHECK(text_is("K:\\ext.txt", "external repl"), "ext3, external journal: its transaction replayed");
+    CHECK(text_is("K:\\uncommitted.txt", "not committed\n"), "... the one whose commit checksum is wrong isn't");
+    CHECK(text_is("K:\\hello.txt", "data journalled\n"), "... the rest as it was");
+    for (uint32_t i = 0; i < 100000; i++)
+        buf[i] = (uint8_t)(i * 5 + 3);
+    static uint8_t back[100000];
+    CHECK(spit("K:\\Data through the journal.bin", buf, 100000) &&
+          slurp("K:\\Data through the journal.bin", back, sizeof back) == 100000 && !memcmp(back, buf, 100000),
+          "... write 100000 bytes (data=journal: the data logged too)");
+    CHECK(CreateDirectory("K:\\Ext Dir") && spit("K:\\Ext Dir\\x.txt", "x", 1) &&
+          MoveFile("K:\\Ext Dir\\x.txt", "K:\\Ext Dir\\y.txt") && text_is("K:\\Ext Dir\\y.txt", "x"),
+          "... a folder, a file, a rename");
+}
+
+/* fstest btrfs: D: zstd (with a subvolume), E: LZO, F: zlib (one data
+ * sector damaged), the same files on each -- read-only. */
+static void test_btrfs(void)
+{
+    static const char *const vol[3] = { "D:", "E:", "F:" }, *const kind[3] = { "zstd", "LZO", "zlib" };
+    uint8_t *text = malloc(800000);                    /* (too big for the program's own data) */
+    if (!text)
+        return;
+    for (int i = 0; i < 3; i++) {
+        char p[MAX_PATH], what[96];
+#define BP(name) (snprintf(p, sizeof p, "%s\\%s", vol[i], name), p)
+#define BW(desc) (snprintf(what, sizeof what, "btrfs %s: %s", kind[i], desc), what)
+        CHECK(text_is(BP("hello.txt"), "Hello from btrfs.\n"), BW("a small file (inline)"));
+        int n = slurp(BP("big.bin"), buf, sizeof buf);
+        CHECK(n == (int)sizeof big && !memcmp(buf, big, sizeof big), BW("300000 bytes, compressed"));
+        n = slurp(BP("text.txt"), text, 800000);
+        bool good = n == 768890;
+        for (int k = 0, at = 0; good && k < 20000; k++) {
+            char line[64];
+            int ll = snprintf(line, sizeof line, "line %d of a compressible text file\n", k);
+            good = !memcmp(text + at, line, (size_t)ll);
+            at += ll;
+        }
+        CHECK(good, BW("768890 bytes of text, in many compressed extents"));
+        CHECK(text_is(BP("Long Folder Name\\A file with a long name.txt"), "Inside btrfs.\n"), BW("a long path"));
+        CHECK(text_is(BP("Sub Volume Dir\\small.txt"), "inline, in a subvolume\n"),
+              BW(i == 0 ? "a file in a subvolume" : "a file in a folder"));
+        CHECK(text_is(BP("link"), "hello.txt"), BW("a symbolic link reads as its target"));
+        HANDLE rf = CreateFile(BP("random.bin"), GENERIC_READ, OPEN_EXISTING);
+        uint32_t rgot = 0;
+        bool rok = ReadFile(rf, buf, 16384, &rgot);
+        uint32_t rerr = GetLastError();
+        CloseHandle(rf);
+        if (i < 2)
+            CHECK(rok && rgot == 16384 && !memcmp(buf, "UNIQUE-MARKER-0001", 18), BW("an incompressible file, its checksums right"));
+        else
+            CHECK(!rok && rerr == ERROR_FILE_CORRUPT, BW("a damaged sector fails its checksum"));
+        CHECK(count(BP("*")) == 7, BW("FindFirstFile: 7 names"));
+        WIN32_FIND_DATA fd;
+        HANDLE f = FindFirstFile(BP("Long*"), &fd);
+        char alias[MAX_PATH];
+        snprintf(alias, sizeof alias, "%s\\%s\\A file with a long name.txt", vol[i], f != INVALID_HANDLE_VALUE ? fd.short_name : "?");
+        FindClose(f);
+        CHECK(alias_form(fd.short_name) && text_is(alias, "Inside btrfs.\n"), BW("a DOS alias opens the folder"));
+        CHECK(!spit(BP("new.txt"), "x", 1) && GetLastError() == ERROR_WRITE_PROTECT, BW("read-only"));
+#undef BP
+#undef BW
+    }
+    for (uint32_t i = 0; i < sizeof big; i++)
+        big[i] = pattern(i);
     printf("FS: %d of %d checks passed\n", checks - failures, checks);
 }
 
@@ -594,6 +722,12 @@ int main(void)
     if (!strcmp(GetCommandLine(), "crash")) {
         crash_write();
         return 0;
+    }
+    if (!strcmp(GetCommandLine(), "btrfs")) {
+        for (uint32_t i = 0; i < sizeof big; i++)
+            big[i] = pattern(i);
+        test_btrfs();
+        return failures ? 1 : 0;
     }
     if (!strcmp(GetCommandLine(), "aftercrash")) {
         after_crash();
@@ -608,6 +742,8 @@ int main(void)
     test_alias_clash("G:", "Same start 11.txt", "Same start 30.txt");
     test_links();
     test_ext3();
+    test_ext4();
+    test_ext3x();
     test_big();
     printf("FS: %d of %d checks passed\n", checks - failures, checks);
     return failures ? 1 : 0;

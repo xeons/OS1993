@@ -58,7 +58,7 @@ void fs_init(void)
     fs_lock();
     part_scan();
     for (int i = 0; i < nparts; i++)
-        if (!exfat_mount(&parts[i]) && !ext2_mount(&parts[i]))
+        if (!exfat_mount(&parts[i]) && !ext2_mount(&parts[i]) && !btrfs_mount(&parts[i]))
             fat_mount(&parts[i]);
     fs_unlock();
     redir_init();
@@ -96,6 +96,16 @@ int fs_boot_sector(struct vol *v, uint8_t *out)
     }
     fs_unlock();
     return b ? 0 : -1;
+}
+
+/* Every journal's transaction, committed (the flusher, DOS's flush-all). */
+void fs_commit_all(void)
+{
+    fs_lock();
+    for (int i = 0; i < nvols; i++)
+        if (vols[i]->ops->commit)
+            vols[i]->ops->commit(vols[i]);
+    fs_unlock();
 }
 
 int fs_volume_count(void)                 { return nvols; }
@@ -553,18 +563,101 @@ bool fs_alias_parse(const char *name, uint8_t base[11], int *n)
     return true;
 }
 
-/* ---- the time zone ---------------------------------------------------------------------- */
+/* ---- the time zone --------------------------------------------------------------------- */
 
-static int32_t tz_bias;
+/*
+ * The RTC keeps local time. UTC = local + bias, Win32's way: Bias plus
+ * StandardBias, or plus DaylightBias between the daylight rule's moment
+ * (in standard time) and the standard rule's (in daylight time). A rule
+ * is "the week'th day_of_week of month, at hour:minute" (week 5: the
+ * last); month 0: no daylight saving. Timestamps are converted with the
+ * bias of their own moment, not of now.
+ */
+static struct fs_timezone tz;
 static bool tz_known;
 
-void fs_set_timezone(int32_t bias)
+void fs_set_timezone(const struct fs_timezone *z)
 {
-    if (bias < -14 * 60 || bias > 14 * 60)
+    if (z->bias < -14 * 60 || z->bias > 14 * 60 || z->dst.month > 12 || z->std.month > 12)
         return;
-    tz_bias = bias;
+    tz = *z;
     tz_known = true;
 }
 
-int32_t fs_timezone(void)     { return tz_bias; }
-bool fs_timezone_known(void)  { return tz_known; }
+void fs_get_timezone(struct fs_timezone *z) { *z = tz; }
+bool fs_timezone_known(void)                { return tz_known; }
+
+static uint32_t days_from_civil(uint32_t y, uint32_t m, uint32_t d)
+{
+    y -= m <= 2;
+    uint32_t era = y / 400, yoe = y - era * 400;
+    uint32_t doy = (153 * (m > 2 ? m - 3 : m + 9) + 2) / 5 + d - 1;
+    return era * 146097 + yoe * 365 + yoe / 4 - yoe / 100 + doy - 719468;
+}
+
+/* The minute of the year when a rule falls in year y (0-based day count). */
+static uint32_t rule_minute(const struct fs_tzrule *r, uint32_t y)
+{
+    static const uint8_t mdays[12] = { 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+    uint32_t first = days_from_civil(y, r->month, 1);
+    uint32_t wd1 = (first + 4) % 7;                     /* 1970-01-01 was a Thursday */
+    uint32_t day = 1 + (r->day_of_week + 7 - wd1) % 7 + (uint32_t)(r->week - 1) * 7;
+    uint32_t dim = mdays[r->month - 1] + (r->month == 2 && y % 4 == 0 && (y % 100 || y % 400 == 0));
+    while (day > dim)
+        day -= 7;
+    return (days_from_civil(y, r->month, day) - days_from_civil(y, 1, 1)) * 1440 + r->hour * 60u + r->minute;
+}
+
+static bool in_daylight(uint16_t date, uint16_t time)
+{
+    if (!tz_known || !tz.dst.month || !tz.std.month)
+        return false;
+    uint32_t y = 1980 + (date >> 9), m = (date >> 5) & 15, d = date & 31;
+    if (m < 1 || m > 12 || !d)
+        return false;
+    uint32_t now = (days_from_civil(y, m, d) - days_from_civil(y, 1, 1)) * 1440 + (time >> 11) * 60u + ((time >> 5) & 63);
+    uint32_t on = rule_minute(&tz.dst, y), off = rule_minute(&tz.std, y);
+    return on < off ? now >= on && now < off : now >= on || now < off;      /* the south: across the new year */
+}
+
+/* The bias (minutes, UTC = local + bias) in force at a local time ... */
+int32_t fs_bias_local(uint16_t date, uint16_t time)
+{
+    return tz.bias + (in_daylight(date, time) ? tz.dst_bias : tz.std_bias);
+}
+
+/* ... and at a UTC moment. */
+int32_t fs_bias_utc(uint32_t unix_utc)
+{
+    uint16_t d, t;
+    fs_unix_to_dos(unix_utc - (uint32_t)((tz.bias + tz.std_bias) * 60), &d, &t);   /* its standard local time */
+    return fs_bias_local(d, t);
+}
+
+int32_t fs_timezone(void)               /* the bias now */
+{
+    uint16_t d, t;
+    rtc_dos_time(&d, &t);
+    return fs_bias_local(d, t);
+}
+
+/* ---- CRC32C (Castagnoli), for ext4, JBD2 and btrfs ----------------------------------- */
+
+static uint32_t crc_table[256];
+
+/* crc: the running value as the file systems keep it (start with ~0 or a
+ * seed); no final inversion here -- each caller does what its format says. */
+uint32_t fs_crc32c(uint32_t crc, const void *data, uint32_t len)
+{
+    if (!crc_table[1])
+        for (uint32_t i = 0; i < 256; i++) {
+            uint32_t c = i;
+            for (int k = 0; k < 8; k++)
+                c = (c & 1) ? (c >> 1) ^ 0x82F63B78u : c >> 1;
+            crc_table[i] = c;
+        }
+    const uint8_t *p = data;
+    while (len--)
+        crc = crc_table[(crc ^ *p++) & 0xFF] ^ (crc >> 8);
+    return crc;
+}

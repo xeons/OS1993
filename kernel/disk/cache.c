@@ -87,6 +87,7 @@ static void flusher_main(void *arg)
         schedule();
         irq_restore(f);
         fs_lock();
+        fs_commit_all();                                /* ext3: transactions first, then home */
         cache_sync();
         fs_unlock();
     }

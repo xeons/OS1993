@@ -269,26 +269,24 @@ static void put_int(char *out, int v)
     out[k] = '\0';
 }
 
-/* OS1993.INI keeps the mode for the next session, and the time zone. */
-static bool have_tz;
-static int32_t ini_tz;
+/* OS1993.INI keeps the mode for the next session, and the time zone:
+ *   [timezone] tzbias=-60  dstbias=-60  dststart=3,5,0,2  dstend=10,5,0,3
+ * (minutes, UTC = local + bias; month,week,day_of_week,hour; week 5: the
+ * last). Its lines are kept as they were read and written back. */
+static char tz_lines[160];
 
 static void save_mode(const DEVMODE *dm)
 {
-    char text[160] = "[display]\r\nwidth=", num[12];
+    char text[352] = "[display]\r\nwidth=", num[12];
     put_int(num, (int)dm->dmPelsWidth);  strncpy0(text + strlen(text), num, sizeof text - strlen(text));
     strncpy0(text + strlen(text), "\r\nheight=", sizeof text - strlen(text));
     put_int(num, (int)dm->dmPelsHeight); strncpy0(text + strlen(text), num, sizeof text - strlen(text));
     strncpy0(text + strlen(text), "\r\nbits=", sizeof text - strlen(text));
     put_int(num, (int)dm->dmBitsPerPel); strncpy0(text + strlen(text), num, sizeof text - strlen(text));
     strncpy0(text + strlen(text), "\r\n", sizeof text - strlen(text));
-    if (have_tz) {
-        strncpy0(text + strlen(text), "[timezone]\r\ntzbias=", sizeof text - strlen(text));
-        if (ini_tz < 0)
-            strncpy0(text + strlen(text), "-", sizeof text - strlen(text));
-        put_int(num, ini_tz < 0 ? -(int)ini_tz : (int)ini_tz);
-        strncpy0(text + strlen(text), num, sizeof text - strlen(text));
-        strncpy0(text + strlen(text), "\r\n", sizeof text - strlen(text));
+    if (tz_lines[0]) {
+        strncpy0(text + strlen(text), "[timezone]\r\n", sizeof text - strlen(text));
+        strncpy0(text + strlen(text), tz_lines, sizeof text - strlen(text));
     }
     HANDLE f = CreateFile("OS1993.INI", GENERIC_WRITE, CREATE_ALWAYS);
     if (f != INVALID_HANDLE_VALUE) {
@@ -298,9 +296,30 @@ static void save_mode(const DEVMODE *dm)
     }
 }
 
+static int parse_int(const char **p)
+{
+    bool neg = **p == '-';
+    if (neg) (*p)++;
+    int v = 0;
+    while (**p >= '0' && **p <= '9') v = v * 10 + (*(*p)++ - '0');
+    return neg ? -v : v;
+}
+
+static void parse_rule(const char *p, SYSTEMTIME *st)          /* month,week,day_of_week,hour */
+{
+    memset(st, 0, sizeof *st);
+    st->month = (uint16_t)parse_int(&p);
+    if (*p == ',') p++;
+    st->day = (uint16_t)parse_int(&p);
+    if (*p == ',') p++;
+    st->day_of_week = (uint16_t)parse_int(&p);
+    if (*p == ',') p++;
+    st->hour = (uint16_t)parse_int(&p);
+}
+
 static bool load_mode(DEVMODE *dm)
 {
-    char text[256];
+    char text[352];
     uint32_t got = 0;
     HANDLE f = CreateFile("OS1993.INI", GENERIC_READ, OPEN_EXISTING);
     if (f == INVALID_HANDLE_VALUE)
@@ -309,27 +328,45 @@ static bool load_mode(DEVMODE *dm)
     CloseHandle(f);
     text[got] = '\0';
     *dm = (DEVMODE){ 0, 0, 0 };
+    TIME_ZONE_INFORMATION tz;
+    memset(&tz, 0, sizeof tz);
+    bool have_tz = false, have_dst = false;
     for (char *p = text; *p; ) {
-        char *key = p;
+        char *line = p, *key = p;
         while (*p && *p != '=' && *p != '\n') p++;
         if (*p != '=') { while (*p && *p != '\n') p++; if (*p) p++; continue; }
         *p++ = '\0';
-        bool neg = *p == '-';
-        if (neg) p++;
-        uint32_t v = 0;
-        while (*p >= '0' && *p <= '9') v = v * 10 + (uint32_t)(*p++ - '0');
-        if (!strcmp(key, "tzbias")) {
-            TIME_ZONE_INFORMATION tz = { neg ? -(int32_t)v : (int32_t)v, "" };
-            if (SetTimeZoneInformation(&tz)) {
-                have_tz = true;
-                ini_tz = tz.Bias;
-            }
+        const char *val = p;
+        while (*p && *p != '\n' && *p != '\r') p++;
+        char end = *p;
+        *p = '\0';
+        bool tzkey = true;
+        if (!strcmp(key, "tzbias"))        { const char *q = val; tz.Bias = parse_int(&q); have_tz = true; }
+        else if (!strcmp(key, "dstbias"))  { const char *q = val; tz.DaylightBias = parse_int(&q); }
+        else if (!strcmp(key, "dststart")) { parse_rule(val, &tz.DaylightDate); have_dst = true; }
+        else if (!strcmp(key, "dstend"))   { parse_rule(val, &tz.StandardDate); }
+        else tzkey = false;
+        if (tzkey && strlen(tz_lines) + strlen(key) + strlen(val) + 4 < sizeof tz_lines) {
+            strncpy0(tz_lines + strlen(tz_lines), key, sizeof tz_lines - strlen(tz_lines));
+            strncpy0(tz_lines + strlen(tz_lines), "=", sizeof tz_lines - strlen(tz_lines));
+            strncpy0(tz_lines + strlen(tz_lines), val, sizeof tz_lines - strlen(tz_lines));
+            strncpy0(tz_lines + strlen(tz_lines), "\r\n", sizeof tz_lines - strlen(tz_lines));
         }
+        const char *q = val;
+        uint32_t v = (uint32_t)parse_int(&q);
         if (!strcmp(key, "width"))  dm->dmPelsWidth = v;
         if (!strcmp(key, "height")) dm->dmPelsHeight = v;
         if (!strcmp(key, "bits"))   dm->dmBitsPerPel = v;
+        (void)line;
+        *p = end;
         while (*p && *p != '\n') p++;
         if (*p) p++;
+    }
+    if (have_tz) {
+        if (have_dst && !tz.DaylightBias)
+            tz.DaylightBias = -60;
+        if (!SetTimeZoneInformation(&tz))
+            tz_lines[0] = '\0';
     }
     return dm->dmPelsWidth && dm->dmPelsHeight && dm->dmBitsPerPel;
 }

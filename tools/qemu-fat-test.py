@@ -74,7 +74,9 @@ def read(part, path):
 
 IMG = os.path.join(QDIR, "fat.img")
 BIG = os.path.join(QDIR, "big.img")
-E1, E8, E3 = 198656, 266240, 333824                    # the logical drives: ext2 (1 KB, 8 KB blocks), ext3
+BTRFS = os.path.join(QDIR, "btrfs.img")
+E1, E8, E3, E4 = 198656, 266240, 333824, 401408       # the logical drives: ext2 (1 KB, 8 KB blocks), ext3, ext4
+JD, FX = 468992, 479232                                # ... a journal device, and ext3 using it
 
 
 def run_fstest(m, args):
@@ -118,6 +120,18 @@ def crash_test():
         check(r.returncode in (0, 1) and not noise and dbg('cat "Crash One.txt"') == b"written before the crash\r\n"
               and dbg('cat "Crash Dir/inside.txt"') == b"inside, before the crash\r\n",
               "e2fsck replays our journal: the files are there, nothing else to fix")
+    with tempfile.NamedTemporaryFile(suffix=".img") as t, tempfile.NamedTemporaryFile(suffix=".jnl") as j:
+        with open(IMG, "rb") as f:
+            f.seek(FX * 512)
+            t.write(f.read(65536 * 512))
+            f.seek(JD * 512)
+            j.write(f.read(8192 * 512))
+        t.flush()
+        j.flush()
+        r = subprocess.run(["e2fsck", "-fy", "-j", j.name, t.name], capture_output=True, text=True)
+        k = subprocess.run(["debugfs", "-R", 'cat "Crash K.txt"', t.name], capture_output=True).stdout
+        check(r.returncode in (0, 1) and k == b"external, before the crash\r\n",
+              "e2fsck replays our external journal (CRC32 checksums) too")
     with Machine(data_disk=IMG, big_disk=BIG) as m:
         m.wait_log("PS/2 mouse")
         log = m.log()
@@ -128,7 +142,7 @@ def crash_test():
         log = m.log()
         for f in re.findall(r"FS: FAIL .*", log):
             print("        " + f)
-        check("FS: 4 of 4 checks passed" in log, "... and everything written before the crash is there")
+        check("FS: 5 of 5 checks passed" in log, "... and everything written before the crash is there")
         m.shut_down()
         m.key("x", 1)
         m.wait_exit(30)
@@ -137,6 +151,26 @@ def crash_test():
         t.flush()
         r = subprocess.run(["e2fsck", "-fn", t.name], capture_output=True, text=True)
         check(r.returncode == 0, "e2fsck: clean after that")
+
+
+def btrfs_test():
+    """btrfs, read-only, on a disk of its own: D: zstd, E: LZO, F: zlib."""
+    subprocess.run([os.path.join(ROOT, "tools", "mkdata.sh"), "--btrfs", BTRFS], check=True)
+    with Machine(data_disk=BTRFS) as m:
+        m.wait_log("PS/2 mouse")
+        log = m.log()
+        check(log.count("FS: btrfs on disk 2 at ") == 3 and "REDIR: D: for the VMM's btrfs volume" in log
+              and "REDIR: F: for the VMM's btrfs volume" in log, "btrfs: three volumes mounted, D: to F:")
+        m.start_gui()
+        run_fstest(m, "btrfs")
+        m.wait_log("USER: FSTEST.BIN exited", timeout=120)
+        log = m.log()
+        for f in re.findall(r"FS: FAIL .*", log):
+            print("        " + f)
+        line = re.search(r"FS: (\d+) of (\d+) checks passed", log)
+        check(line and line.group(1) == line.group(2) and int(line.group(2)) >= 30,
+              "btrfs: " + (line.group(0) if line else "no result") + " (zstd, LZO, zlib, a subvolume, checksums)")
+        m.shut_down()
 
 
 def main():
@@ -161,12 +195,13 @@ def main():
         if not m.wait_log("PS/2 mouse"):
             raise SystemExit("  FAIL  VMM did not boot")
         log = m.log()
-        check(re.search(rf"ATA: disk {dnum} \({pos}\): QEMU HARDDISK, 200 MB, LBA48, BIOS {drive} \(\d+/\d+/\d+\), the VMM's", log)
+        check(re.search(rf"ATA: disk {dnum} \({pos}\): QEMU HARDDISK, 270 MB, LBA48, BIOS {drive} \(\d+/\d+/\d+\), the VMM's", log)
               and re.search(r"ATA: disk 0 \(primary master\).*BIOS 80h.*the VMM's", log)
-              and "REDIR: C: stays DOS's (its boot drive)" in log,
-              "IDE: both disks are the VMM's; DOS's C: goes through its INT 13h")
-        check(f"FAT32 on disk {dnum} at 2048: 96760 clusters of 512 bytes, serial 3232-3232" in log
-              and f"FAT16 on disk {dnum} at 100352: 7655 clusters of 2048 bytes" in log, "FAT32 and FAT16 mounted")
+,
+              "IDE: both disks are the VMM's")
+        check("REDIR: C: is the VMM's now (FAT16" in log, "DOS's boot drive C: is the VMM's too (long names there)")
+        check(f"FAT32 on disk {dnum} at 2048: 96736 clusters of 512 bytes, serial 3232-3232" in log
+              and f"FAT16 on disk {dnum} at 100352: 7645 clusters of 2048 bytes" in log, "FAT32 and FAT16 mounted")
         check("REDIR: D: is the VMM's now (FAT32" in log and "REDIR: E: is the VMM's now (FAT16" in log,
               "DOS's D: and E: go through the redirector now")
         check(f"exFAT on disk {dnum} at 131072: 7" in log and "REDIR: F: for the VMM's exFAT volume" in log,
@@ -179,8 +214,14 @@ def main():
               and re.search(rf"ext3 on disk {dnum} at {E3}: [^\n]*groups, label", log)
               and "REDIR: I: for the VMM's ext3 volume" in log,
               "ext3 needing recovery: its journal replayed (2 transactions, a revoke), mounted read-write, I:")
-        check("exFAT on disk 3 at 0: " in log and "REDIR: J: for the VMM's exFAT volume" in log,
-              "a 5 GB exFAT disk with 4 KB sectors and no partition table, J:")
+        check(f"ext4 on disk {dnum} at {E4}: 8192 blocks of 4096 bytes" in log and "REDIR: J: for the VMM's ext4 volume" in log
+              and "EXT2: replayed 1 transaction(s) from the journal: 1 block(s), 0 revoked" in log,
+              "ext4 (64-bit, metadata_csum): its journal replayed (checksum v3), J:")
+        check(f"ext3 on disk {dnum} at {FX}: " in log and "REDIR: K: for the VMM's ext3 volume" in log
+              and "replayed 1 transaction(s) from the journal: 1 block(s), 0 revoked" in log,
+              "ext3 with an external journal (CRC32 checksums, data=journal): replayed, K:")
+        check("exFAT on disk 3 at 0: " in log and "REDIR: L: for the VMM's exFAT volume" in log,
+              "a 5 GB exFAT disk with 4 KB sectors and no partition table, L:")
 
         m.key("n")
         m.wait_log("Started DOS 1")
@@ -202,9 +243,11 @@ def main():
         for f in re.findall(r"FS: FAIL .*", log):
             print("        " + f)
         line = re.search(r"FS: (\d+) of (\d+) checks passed", log)
-        check(line and line.group(1) == line.group(2) and int(line.group(2)) >= 161,
+        check(line and line.group(1) == line.group(2) and int(line.group(2)) >= 175,
               line.group(0) if line else "FSTEST: no result")
         check("EXT2: journal full at transaction" in m.log(), "ext3: the journal filled up and started over (a checkpoint)")
+        with open(os.path.join(QDIR, "SERIAL-main.LOG"), "w") as f:
+            f.write(m.log())                            # the crash test's runs start their own
         check(m.shut_down(), "the GUI shuts down")
         m.key("x", 1)
         check(m.wait_exit(30), "OS1993 returns to DOS")
@@ -218,6 +261,9 @@ def main():
     check("Written by an OS1993 program." in after and "made by DOS" in after and "NEWLON~1" in after,
           "back in DOS, D: and E: are DOS's own again and show what the VMM wrote")
     check(read(P1, "::/AFTERDOS.TXT") == "DOS again\r\n", "... and DOS writes to D: itself")
+    r = subprocess.run(["mdir", "-i", os.path.join(BUILD, "freedos.img") + "@@32256", "::/OS1993"],
+                       env=env, capture_output=True)
+    check(b"A long name on drive C.txt" in r.stdout, "mtools sees the long name written on C:")
 
     lfn = read(P2, "::/LFNOUT.TXT") or ""
     for l in lfn.splitlines():
@@ -246,7 +292,7 @@ def main():
               "... and F:\\GUIDIR's 40 long names (checksums and name hashes right)")
         check(x.read("frag1.bin") == bytes((i * 31 + 7) & 255 for i in range(6000)), "... and the file that was in pieces")
         ent = x.entry_raw("tz.txt")
-        check(ent is not None and ent[23] == 0x84, "exFAT records the UTC offset (+1 hour)")
+        check(ent is not None and ent[23] == 0x88, "exFAT records the UTC offset (+2 hours: daylight time)")
         x.f.close()
     except Exception as e:                              # noqa: BLE001
         check(False, f"tools/exfat.py reads the exFAT volume ({e})")
@@ -288,7 +334,7 @@ def main():
         if tz and mt:
             local = calendar.timegm(_t.strptime(tz, "%Y-%m-%d %H:%M:%S"))
             diff = int(mt.group(1), 16) - local
-        check(tz and mt and abs(diff + 3600) <= 2, "ext2 keeps UTC: written at UTC+1, an hour earlier than the clock")
+        check(tz and mt and abs(diff + 7200) <= 2, "ext2 keeps UTC: written at UTC+2 (daylight time), two hours earlier than the clock")
     with tempfile.NamedTemporaryFile(suffix=".img") as t:
         t.write(disk[E8 * 512:(E8 + 65536) * 512])
         t.flush()
@@ -303,8 +349,23 @@ def main():
         h = subprocess.run(["dumpe2fs", "-h", t.name], capture_output=True, text=True).stdout
         check(r.returncode == 0 and "needs_recovery" not in h and re.search(r"Journal start:\s+0", h),
               "e2fsck: the ext3 volume is clean, its journal empty, needs_recovery gone")
+    with tempfile.NamedTemporaryFile(suffix=".img") as t:
+        t.write(disk[E4 * 512:(E4 + 65536) * 512])
+        t.flush()
+        h = subprocess.run(["dumpe2fs", "-h", t.name], capture_output=True, text=True).stdout
+        check("needs_recovery" not in h, "ext4: needs_recovery gone after the replay")
+    with tempfile.NamedTemporaryFile(suffix=".img") as t, tempfile.NamedTemporaryFile(suffix=".jnl") as j:
+        t.write(disk[FX * 512:(FX + 65536) * 512])
+        t.flush()
+        j.write(disk[JD * 512:(JD + 8192) * 512])
+        j.flush()
+        r = subprocess.run(["e2fsck", "-fn", "-j", j.name, t.name], capture_output=True, text=True)
+        w = subprocess.run(["debugfs", "-R", 'cat "Data through the journal.bin"', t.name], capture_output=True).stdout
+        check(r.returncode == 0 and w == bytes((i * 5 + 3) & 255 for i in range(100000)),
+              "e2fsck (with its journal device): clean, and the data written through the journal is home")
     if not slave:
         crash_test()
+        btrfs_test()
     r = subprocess.run(["fsck.exfat", "-n", BIG], capture_output=True, text=True)
     check(r.returncode == 0 and "clean" in r.stdout, "fsck.exfat: the 5 GB disk is clean")
     xb = ExFat(BIG, 0)

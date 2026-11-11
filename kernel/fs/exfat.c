@@ -661,15 +661,15 @@ static int dir_grow(struct xvol *v, struct xdir *x)
     return set_write(v, &x->parent, x->pidx, pe.raw, pe.count);
 }
 
-/* The UTC offset byte: valid, in 15 minutes east of UTC; 0 if the time
- * zone isn't known (the time is local, offset unknown). */
-static uint8_t utc_offset(void)
+/* The UTC offset byte for a local time: valid, in 15 minutes east of UTC;
+ * 0 if the time zone isn't known (the time is local, offset unknown). */
+static uint8_t utc_offset_at(uint16_t date, uint16_t time)
 {
-    return fs_timezone_known() ? (uint8_t)(0x80 | ((-fs_timezone() / 15) & 0x7F)) : 0;
+    return fs_timezone_known() ? (uint8_t)(0x80 | ((-fs_bias_local(date, time) / 15) & 0x7F)) : 0;
 }
 
 /* A timestamp as our local time: if it carries a UTC offset other than
- * ours, it is moved by the difference. */
+ * the one ours would have, it is moved by the difference. */
 static void local_time(uint32_t ts, uint8_t off, uint16_t *date, uint16_t *time)
 {
     *date = (uint16_t)(ts >> 16);
@@ -677,11 +677,11 @@ static void local_time(uint32_t ts, uint8_t off, uint16_t *date, uint16_t *time)
     if (!(off & 0x80) || !fs_timezone_known())
         return;
     int32_t theirs = (int8_t)(uint8_t)(off << 1) / 2 * 15;     /* minutes east of UTC */
-    int32_t ours = -fs_timezone();
+    uint32_t utc = fs_dos_to_unix(*date, *time) - (uint32_t)(theirs * 60);
+    int32_t ours = -fs_bias_utc(utc);
     if (theirs == ours)
         return;
-    uint32_t u = fs_dos_to_unix(*date, *time) + (uint32_t)((ours - theirs) * 60);
-    fs_unix_to_dos(u, date, time);
+    fs_unix_to_dos(utc + (uint32_t)(ours * 60), date, time);
 }
 
 static void stamp_now(uint8_t *f, bool created)
@@ -693,11 +693,11 @@ static void stamp_now(uint8_t *f, bool created)
     put32(f + 12, ts);
     put32(f + 16, ts);
     f[21] = (uint8_t)(odd * 100);                       /* 10 ms units: the odd second */
-    f[23] = f[24] = utc_offset();
+    f[23] = f[24] = utc_offset_at(date, time);
     if (created) {
         put32(f + 8, ts);
         f[20] = (uint8_t)(odd * 100);
-        f[22] = utc_offset();
+        f[22] = utc_offset_at(date, time);
     }
 }
 
@@ -986,7 +986,7 @@ static int node_update(struct xnode *n)
     put32(f + 12, ts);
     put32(f + 16, ts);
     f[21] = n->odd;
-    f[23] = f[24] = utc_offset();
+    f[23] = f[24] = utc_offset_at(n->date, n->time);
     s[1] = (uint8_t)(F_ALLOC | (n->contig && n->first ? F_NOCHAIN : 0));
     put32(s + 8, (uint32_t)n->vdl);
     put32(s + 12, (uint32_t)(n->vdl >> 32));

@@ -1687,11 +1687,23 @@ void syscall_dispatch(struct regs *r)
         r->eax = (uint32_t)rc;
         break;
     }
-    case SYS_TIMEZONE:
-        if (r->ebx == 1)
-            fs_set_timezone((int32_t)r->ecx);
-        r->eax = (uint32_t)fs_timezone();
+    case SYS_TIMEZONE: {                            /* EBX 1: set, 0: get; ECX: struct fs_timezone * */
+        struct fs_timezone z;
+        if (!user_writable(r->ecx, sizeof z)) {
+            r->eax = (uint32_t)-1;
+            break;
+        }
+        if (r->ebx == 1) {
+            memcpy(&z, (const void *)(uintptr_t)r->ecx, sizeof z);
+            fs_set_timezone(&z);
+        }
+        fs_get_timezone(&z);
+        memcpy((void *)(uintptr_t)r->ecx, &z, sizeof z);
+        uint16_t d, t;
+        rtc_dos_time(&d, &t);
+        r->eax = !fs_timezone_known() || !z.dst.month ? 0 : fs_bias_local(d, t) != z.bias + z.std_bias ? 2 : 1;
         break;
+    }
     case SYS_MEMINFO: {
         struct mem_info mi = { pmm_total_pages(), pmm_free_pages(),
                                (PAGE_ALIGN_UP(self->heap_end) - USER_HEAP) / PAGE_SIZE +

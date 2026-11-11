@@ -225,7 +225,12 @@ struct mem_info {
 };
 /* ---- sockets (SYS_SOCKET; WSOCK.DLL wraps them as Winsock) ---------------- */
 #define SYS_SOCKET      38              /* EBX = SOP_*, ECX = struct sock_args * -> result, or -errno */
-#define SYS_TIMEZONE    39              /* EBX = 1: set ECX = bias (minutes, UTC = local + bias); -> the bias */
+#define SYS_TIMEZONE    39              /* EBX = 1 set / 0 get, ECX = struct fs_timezone * -> 0 unknown, 1 standard, 2 daylight */
+struct fs_tzrule { uint8_t month, week, day_of_week, hour, minute; };   /* month 0: none; week 5: the last */
+struct fs_timezone {                    /* UTC = local + bias + (std_bias or dst_bias) */
+    int32_t bias, std_bias, dst_bias;
+    struct fs_tzrule std, dst;          /* when standard time starts again; when daylight time starts */
+};
 
 enum { SOP_SOCKET, SOP_BIND, SOP_CONNECT, SOP_LISTEN, SOP_ACCEPT, SOP_SEND, SOP_RECV,
        SOP_SHUTDOWN, SOP_CLOSE, SOP_SETOPT, SOP_GETOPT, SOP_NAME, SOP_POLL, SOP_CONFIG };
@@ -364,6 +369,7 @@ struct find_data {                      /* a directory entry (FIND_FIRST/NEXT) *
 #define ERROR_NEGATIVE_SEEK       131
 #define ERROR_FILE_TOO_LARGE      223
 #define ERROR_TOO_MANY_LINKS      1142
+#define ERROR_FILE_CORRUPT        1392
 #define ERROR_ALREADY_EXISTS      183
 #define ERROR_HANDLE_DISK_FULL    39
 #define ERROR_CANNOT_MAKE         82

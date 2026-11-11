@@ -158,10 +158,12 @@ static void take(int d, struct vol *v, bool was_dos)
     rd.drive[d].used = true;
     rd.drive[d].taken = was_dos;
     char *path = (char *)at(c);
-    memset(path, 0, 67);
-    path[0] = (char)('A' + d);
-    path[1] = ':';
-    path[2] = '\\';
+    if (!was_dos || path[0] != 'A' + d || path[1] != ':' || path[2] != '\\') {
+        memset(path, 0, 67);                            /* a new drive: its root */
+        path[0] = (char)('A' + d);
+        path[1] = ':';
+        path[2] = '\\';
+    }                                                   /* (DOS's own: its current directory stays) */
     wr16(c + CDS_FLAGS, CDS_NETWORK | CDS_PHYSICAL);
     wr32(c + CDS_DPB, 0);
     wr32(c + CDS_START, 0xFFFFFFFFu);
@@ -192,7 +194,9 @@ static int dos_boot_sector(int d, uint8_t *out)
 }
 
 /* Has DOS a file open on drive d (0 = A:)? Then the drive stays DOS's. */
-static bool dos_files_open(uint32_t lol, int d)
+/* writing: only files open for writing count (DOS reads the others on its
+ * own, from clusters the VMM leaves alone). */
+static bool dos_files_open(uint32_t lol, int d, bool writing)
 {
     uint32_t sft = far_ptr(lol + 0x04);
     for (int tables = 0; tables < 32 && sft && (sft & 0xFFFFF) != 0xFFFFF; tables++) {
@@ -200,7 +204,8 @@ static bool dos_files_open(uint32_t lol, int d)
         for (uint16_t i = 0; i < n && i < 255; i++) {
             uint32_t e = sft + 6 + (uint32_t)i * 0x3B;
             uint16_t flags = rd16(e + SFT_FLAGS);
-            if (rd16(e + SFT_COUNT) && !(flags & (0x80 | SF_NET)) && (flags & 0x1F) == d)
+            if (rd16(e + SFT_COUNT) && !(flags & (0x80 | SF_NET)) && (flags & 0x1F) == d &&
+                (!writing || (rd16(e + SFT_MODE) & 3)))
                 return true;
         }
         uint32_t next = far_ptr(sft);
@@ -232,7 +237,7 @@ void redir_init(void)
         rd.lastdrive = 26;
 
     /* The volumes DOS mounted itself: the same boot sector (or serial
-     * number). Its boot drive, and a drive with files open, stay DOS's:
+     * number). A drive with files open stays DOS's (its boot drive: open for writing):
      * the VMM lets go of those volumes and DOS reaches them by INT 13h. */
     bool flushed = false;
     static uint8_t dbs[512], vbs[512];
@@ -253,8 +258,9 @@ void redir_init(void)
                 same = serial && fs_serial(v) == serial;
             if (!same)
                 continue;
-            if (d == boot || dos_files_open(lol, d)) {
-                klog("REDIR: %c: stays DOS's (%s)\n", 'A' + d, d == boot ? "its boot drive" : "files open");
+            if (dos_files_open(lol, d, d == boot)) {     /* the boot drive: unless a file is being written */
+                klog("REDIR: %c: stays DOS's (%s)\n", 'A' + d, d == boot ? "its boot drive, a file open for writing"
+                                                                          : "files open");
                 fs_drop_volume(v);
                 break;
             }
@@ -644,6 +650,7 @@ bool redir_int2f(struct vm *vm, struct regs *r)
         bool was = read_eflags() & 0x200;
         cpu_sti();
         fs_lock();
+        fs_commit_all();
         cache_sync();
         fs_unlock();
         if (!was)

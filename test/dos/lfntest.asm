@@ -32,14 +32,16 @@ start:
         jnz     .a0
         stc
 .a0:    check   t_a0d
-        mov     ax, 71A0h
+        mov     ax, 71A0h               ; C: too: the VMM took DOS's boot drive
         mov     dx, root_c
         mov     di, fsname
         mov     cx, 32
-        stc
         int     21h
-        cmc                             ; it should fail
-        check   t_a0c
+        jc      .a0c
+        test    bx, 4000h
+        jnz     .a0c
+        stc
+.a0c:   check   t_a0c
 
         ; 716C: create a file with a long name, write to it
         mov     ax, 716Ch
@@ -377,7 +379,7 @@ hexbuf      db  ' (0000)'
 done_msg    db  'DONE', 13, 10
 done_len    equ $ - done_msg
 t_a0d       db  '71A0 D: has long names', 0
-t_a0c       db  '71A0 C: has not', 0
+t_a0c       db  '71A0 C: has them too', 0
 t_create    db  '716C create a long name', 0
 t_mkdir     db  '7139 mkdir', 0
 t_rename    db  '7156 rename into it', 0

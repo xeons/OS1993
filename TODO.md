@@ -155,19 +155,23 @@ and file systems); DOS reaches their volumes through the redirector.
 - [x] ext3: journal replay (JBD and JBD2's layout: descriptor, commit and
       revoke blocks, escaped blocks, a wrapping log), so a volume that
       wasn't unmounted cleanly is recovered and mounted.
-- [x] ext3: journalled writes, ordered mode (transactions per call, revoke
-      records, checkpoints, needs_recovery while mounted).
-- [ ] ext3: journal checksums (csum v2/v3, async commit: such journals are
-      read past in replay and keep the volume read-only); external journal
-      devices; data=journal mode; batching several calls per transaction
-      (now every call commits, with two cache flushes).
-- [ ] ext4: extents, 64-bit block numbers, flex_bg, htree directories,
-      CRC32C metadata checksums -- read-only first (now: not mounted).
-- [ ] btrfs, read-only (CoW B-trees, chunk tree, checksums, zlib/LZO/zstd).
-- [ ] Long names in DOS's own drives for OS1993 programs (the VMM taking
-      over C: too, as Win95 did, now that it drives the disk; DOS's open
-      files on C: are the obstacle).
-- [ ] Daylight saving time (TIME_ZONE_INFORMATION's other half).
+- [x] ext3: journalled writes, ordered mode (transactions shared by
+      calls, revoke records, checkpoints, needs_recovery while mounted);
+      journal checksums (v2/v3 and the old CRC32) checked and written;
+      external journal devices; data=journal.
+- [x] ext4, read-only: extents, 64-bit descriptors, flex_bg, meta_bg,
+      hashed directories, metadata_csum checked.
+- [ ] ext4 writing (extent trees, checksums everywhere); inline data;
+      async commit journals.
+- [x] btrfs, read-only: chunk, root and file system trees, subvolumes,
+      zlib/LZO/zstd, node and data checksums (CRC32C).
+- [ ] btrfs: several devices and RAID profiles; xxhash/SHA-256/BLAKE2
+      checksums (read past now); writing.
+- [x] 64-bit file sizes and positions through the API (SetFilePointerEx,
+      GetFileSizeEx, size_high); the time zone and daylight saving
+      (SetTimeZoneInformation, OS1993.INI).
+- [x] Long names on DOS's own boot drive for OS1993 and DOS programs (the
+      VMM takes C: over unless DOS has a file open on it for writing).
 - Not planned: TexFAT (exFAT with two FATs; only Windows CE uses it, and
   desktop Windows doesn't mount it); ATAPI and 4 KB-sector drives (none
   speak ATA PIO with 512-byte sectors); Unix owners, permissions and
