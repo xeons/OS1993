@@ -74,7 +74,7 @@ def read(part, path):
 
 IMG = os.path.join(QDIR, "fat.img")
 BIG = os.path.join(QDIR, "big.img")
-E1, E8 = 198656, 266240                                 # the ext2 logical drives (1 KB, 8 KB blocks)
+E1, E8, E3 = 198656, 266240, 333824                    # the logical drives: ext2 (1 KB, 8 KB blocks), ext3
 
 
 def main():
@@ -99,7 +99,7 @@ def main():
         if not m.wait_log("PS/2 mouse"):
             raise SystemExit("  FAIL  VMM did not boot")
         log = m.log()
-        check(re.search(rf"ATA: disk {dnum} \({pos}\): QEMU HARDDISK, 168 MB, LBA48, BIOS {drive} \(\d+/\d+/\d+\), the VMM's", log)
+        check(re.search(rf"ATA: disk {dnum} \({pos}\): QEMU HARDDISK, 200 MB, LBA48, BIOS {drive} \(\d+/\d+/\d+\), the VMM's", log)
               and re.search(r"ATA: disk 0 \(primary master\).*BIOS 80h.*the VMM's", log)
               and "REDIR: C: stays DOS's (its boot drive)" in log,
               "IDE: both disks are the VMM's; DOS's C: goes through its INT 13h")
@@ -113,8 +113,12 @@ def main():
               "ext2 (a logical drive) mounted, G: for DOS")
         check(f"ext2 on disk {dnum} at {E8}: 4096 blocks of 8192 bytes" in log and "REDIR: H: for the VMM's ext2 volume" in log,
               "ext2 with 8 KB blocks (the next logical drive), H:")
-        check("exFAT on disk 3 at 0: " in log and "REDIR: I: for the VMM's exFAT volume" in log,
-              "a 5 GB exFAT disk with 4 KB sectors and no partition table, I:")
+        check("EXT2: replayed 2 transaction(s) from the journal: 2 block(s), 1 revoked" in log
+              and f"ext3 on disk {dnum} at {E3}: " in log and "read-only" in log
+              and "REDIR: I: for the VMM's ext3 volume" in log,
+              "ext3 needing recovery: its journal replayed (2 transactions, a revoke), I:")
+        check("exFAT on disk 3 at 0: " in log and "REDIR: J: for the VMM's exFAT volume" in log,
+              "a 5 GB exFAT disk with 4 KB sectors and no partition table, J:")
 
         m.key("n")
         m.wait_log("Started DOS 1")
@@ -136,7 +140,7 @@ def main():
         for f in re.findall(r"FS: FAIL .*", log):
             print("        " + f)
         line = re.search(r"FS: (\d+) of (\d+) checks passed", log)
-        check(line and line.group(1) == line.group(2) and int(line.group(2)) >= 151,
+        check(line and line.group(1) == line.group(2) and int(line.group(2)) >= 156,
               line.group(0) if line else "FSTEST: no result")
         check(m.shut_down(), "the GUI shuts down")
         m.key("x", 1)
@@ -229,6 +233,13 @@ def main():
         check(r.returncode == 0, "e2fsck: the 8 KB-block ext2 volume is clean")
         w = subprocess.run(["debugfs", "-R", "cat written.bin", t.name], capture_output=True).stdout
         check(w == bytes((i * 3 + 1) & 255 for i in range(200000)), "debugfs reads what the VMM wrote with 8 KB blocks")
+    with tempfile.NamedTemporaryFile(suffix=".img") as t:
+        t.write(disk[E3 * 512:(E3 + 65536) * 512])
+        t.flush()
+        r = subprocess.run(["e2fsck", "-fn", t.name], capture_output=True, text=True)
+        h = subprocess.run(["dumpe2fs", "-h", t.name], capture_output=True, text=True).stdout
+        check(r.returncode == 0 and "needs_recovery" not in h and re.search(r"Journal start:\s+0", h),
+              "e2fsck: the ext3 volume is clean, its journal empty, needs_recovery gone")
     r = subprocess.run(["fsck.exfat", "-n", BIG], capture_output=True, text=True)
     check(r.returncode == 0 and "clean" in r.stdout, "fsck.exfat: the 5 GB disk is clean")
     xb = ExFat(BIG, 0)

@@ -152,8 +152,12 @@ and file systems); DOS reaches their volumes through the redirector.
 - [x] 64-bit file sizes and positions through the API (SetFilePointerEx,
       GetFileSizeEx, size_high); the time zone (SetTimeZoneInformation,
       OS1993.INI).
-- [ ] ext3: journal replay so a volume that wasn't unmounted can be read
-      (now: mounted read-only as it is), then journalled writes.
+- [x] ext3: journal replay (JBD and JBD2's layout: descriptor, commit and
+      revoke blocks, escaped blocks, a wrapping log), so a volume that
+      wasn't unmounted cleanly is recovered and mounted.
+- [ ] ext3: journalled writes (now: read-only after replay); checking the
+      journal's checksums (csum v2/v3, async commit) instead of reading
+      past them; external journal devices.
 - [ ] ext4: extents, 64-bit block numbers, flex_bg, htree directories,
       CRC32C metadata checksums -- read-only first (now: not mounted).
 - [ ] btrfs, read-only (CoW B-trees, chunk tree, checksums, zlib/LZO/zstd).

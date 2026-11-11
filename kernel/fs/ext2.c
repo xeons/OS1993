@@ -26,7 +26,8 @@
  *
  * Volumes with features this driver doesn't know: an incompatible one (ext4
  * extents, 64-bit, flex_bg ...) isn't mounted; a read-only-compatible one,
- * or an ext3 journal, mounts read-only.
+ * or an ext3 journal, mounts read-only. An ext3 volume that wasn't
+ * unmounted cleanly first has its journal replayed (below).
  */
 #include "kernel.h"
 #include "disk.h"
@@ -1037,6 +1038,280 @@ static void fill_entry(struct evol *v, uint8_t *draw, const struct dent *d, cons
     e->lfn = strcmp(e->name, e->short_name) != 0;
 }
 
+/* ---- ext3: replaying the journal -------------------------------------------------- */
+
+/*
+ * ext3's journal (JBD, and JBD2's compatible layout) is a file -- usually
+ * inode 8 -- of big-endian records: a superblock, then transactions, each
+ * descriptor blocks (which name the blocks that follow, copies of
+ * metadata blocks), revoke blocks (blocks not to replay from this
+ * transaction or earlier ones) and a commit block. A volume that wasn't
+ * unmounted cleanly says needs_recovery; its journal starts at s_start.
+ *
+ * Replay is the kernel's and e2fsck's three passes: find the last
+ * committed transaction (a transaction without its commit block didn't
+ * happen), gather the revoke records, then write every logged block whose
+ * number no later revoke covers, restoring a first word the journal had to
+ * escape. Then the journal is empty (s_start 0, s_sequence the next one)
+ * and needs_recovery goes.
+ *
+ * Checksums (journal_csum_v2/v3) are read past, not checked; a 64-bit
+ * journal's blocks past 2^32 are skipped (this driver's block numbers are
+ * 32-bit); an external journal device can't be replayed (not mounted).
+ */
+#define JBD_MAGIC      0xC03B3998u
+#define JBD_DESC       1
+#define JBD_COMMIT     2
+#define JBD_SB_V1      3
+#define JBD_SB_V2      4
+#define JBD_REVOKE     5
+#define JF_ESCAPE      1
+#define JF_SAME_UUID   2
+#define JF_LAST        8
+#define JI_REVOKE      0x01
+#define JI_64BIT       0x02
+#define JI_ASYNC       0x04
+#define JI_CSUM2       0x08
+#define JI_CSUM3       0x10
+#define JI_KNOWN       0x1F
+#define INCOMPAT_RECOVER  0x0004
+#define INCOMPAT_JOURNAL_DEV 0x0008
+
+static uint32_t be32(const uint8_t *p) { return (uint32_t)p[0] << 24 | p[1] << 16 | p[2] << 8 | p[3]; }
+static uint16_t be16(const uint8_t *p) { return (uint16_t)(p[0] << 8 | p[1]); }
+static void putbe32(uint8_t *p, uint32_t v)
+{
+    p[0] = (uint8_t)(v >> 24); p[1] = (uint8_t)(v >> 16); p[2] = (uint8_t)(v >> 8); p[3] = (uint8_t)v;
+}
+
+struct journal {
+    struct evol *v;
+    uint8_t  raw[128];                  /* the journal's inode */
+    uint32_t first, maxlen, incompat;
+    uint8_t *blk;                       /* one block */
+    struct { uint32_t block, seq; } *revoked;
+    uint32_t nrevoked, cap;
+};
+
+static int block_io(struct evol *v, uint32_t b, uint8_t *buf, bool write)
+{
+    for (uint32_t s = 0; s < v->spb; s++) {
+        struct buf *bf = write ? bzero_get(v->disk, blk_lba(v, b) + s) : bread(v->disk, blk_lba(v, b) + s);
+        if (!bf)
+            return -1;
+        if (write) {
+            memcpy(bf->data, buf + s * SECTOR, SECTOR);
+            bdirty(bf);
+        } else {
+            memcpy(buf + s * SECTOR, bf->data, SECTOR);
+        }
+        brelse(bf);
+    }
+    return 0;
+}
+
+/* Journal block j (wrapping past the end to s_first) into j->blk. */
+static uint32_t jwrap(const struct journal *j, uint32_t b)
+{
+    if (!j->maxlen || b < j->maxlen)
+        return b;                                       /* (block 0, before the bounds are known) */
+    return j->first + (b - j->maxlen) % (j->maxlen - j->first);
+}
+
+static int jread(struct journal *j, uint32_t lb)
+{
+    uint32_t goal = 0, pb;
+    if (bmap(j->v, j->raw, jwrap(j, lb), false, &goal, &pb) < 0 || !pb)
+        return -1;
+    return block_io(j->v, pb, j->blk, false);
+}
+
+static uint32_t tag_bytes(const struct journal *j)
+{
+    if (j->incompat & JI_CSUM3)
+        return 16;
+    return 8 + ((j->incompat & JI_64BIT) ? 4 : 0);
+}
+
+/* The tags of the descriptor block in j->blk: calls fn for each (or just
+ * counts them). -> how many. */
+static uint32_t each_tag(struct journal *j, void (*fn)(struct journal *, uint32_t blocknr, uint32_t high,
+                                                           uint32_t flags, uint32_t index, void *ctx), void *ctx)
+{
+    uint32_t end = j->v->bsize - ((j->incompat & (JI_CSUM2 | JI_CSUM3)) ? 4 : 0);
+    uint32_t tsz = tag_bytes(j), n = 0;
+    for (uint32_t off = 12; off + tsz <= end;) {
+        const uint8_t *t = j->blk + off;
+        uint32_t flags = (j->incompat & JI_CSUM3) ? be32(t + 4) : be16(t + 6);
+        uint32_t high = (j->incompat & JI_64BIT) ? be32(t + 8) : 0;
+        if (fn)
+            fn(j, be32(t), high, flags, n, ctx);
+        n++;
+        off += tsz + ((flags & JF_SAME_UUID) ? 0 : 16);
+        if (flags & JF_LAST)
+            break;
+    }
+    return n;
+}
+
+static void add_revoke(struct journal *j, uint32_t block, uint32_t seq)
+{
+    for (uint32_t i = 0; i < j->nrevoked; i++)
+        if (j->revoked[i].block == block) {
+            if ((int32_t)(seq - j->revoked[i].seq) > 0)
+                j->revoked[i].seq = seq;
+            return;
+        }
+    if (j->nrevoked == j->cap) {
+        uint32_t cap = j->cap ? j->cap * 2 : 64;
+        void *n = kmalloc(cap * sizeof *j->revoked);
+        if (!n)
+            return;
+        if (j->revoked) {
+            memcpy(n, j->revoked, j->nrevoked * sizeof *j->revoked);
+            kfree(j->revoked);
+        }
+        j->revoked = n;
+        j->cap = cap;
+    }
+    j->revoked[j->nrevoked].block = block;
+    j->revoked[j->nrevoked++].seq = seq;
+}
+
+static bool is_revoked(const struct journal *j, uint32_t block, uint32_t seq)
+{
+    for (uint32_t i = 0; i < j->nrevoked; i++)
+        if (j->revoked[i].block == block)
+            return (int32_t)(j->revoked[i].seq - seq) >= 0;
+    return false;
+}
+
+struct replay_ctx { uint32_t data_at, seq, written; uint8_t *copy; };
+
+static void replay_tag(struct journal *j, uint32_t blocknr, uint32_t high, uint32_t flags, uint32_t index, void *c)
+{
+    struct replay_ctx *r = c;
+    if (high || blocknr >= j->v->nblocks || is_revoked(j, blocknr, r->seq))
+        return;
+    uint32_t goal = 0, pb;
+    if (bmap(j->v, j->raw, jwrap(j, r->data_at + index), false, &goal, &pb) < 0 || !pb ||
+        block_io(j->v, pb, r->copy, false) < 0)
+        return;
+    if (flags & JF_ESCAPE)
+        putbe32(r->copy, JBD_MAGIC);                    /* the journal had to hide it */
+    if (block_io(j->v, blocknr, r->copy, true) == 0)
+        r->written++;
+}
+
+/* -> 0 replayed (or nothing to do), <0 it can't be. */
+static int journal_replay(struct evol *v, uint32_t inum)
+{
+    struct journal j = { .v = v };
+    int rc = -1;
+    if (!inum || inode_read(v, inum, j.raw) < 0 || !(j.blk = kmalloc(v->bsize)))
+        return -1;
+    uint8_t *copy = kmalloc(v->bsize);
+    if (!copy || jread(&j, 0) < 0)
+        goto out;
+    uint8_t *sb = j.blk;
+    uint32_t type = be32(sb + 4);
+    if (be32(sb) != JBD_MAGIC || (type != JBD_SB_V1 && type != JBD_SB_V2) || be32(sb + 12) != v->bsize) {
+        klog("EXT2: the journal's superblock is not one\n");
+        goto out;
+    }
+    j.maxlen = be32(sb + 16);
+    j.first = be32(sb + 20);
+    uint32_t seq0 = be32(sb + 24), start = be32(sb + 28);
+    j.incompat = type == JBD_SB_V2 ? be32(sb + 40) : 0;
+    if (j.incompat & ~(uint32_t)JI_KNOWN) {
+        klog("EXT2: journal features %X: can't replay\n", j.incompat);
+        goto out;
+    }
+    if (!j.first || j.first >= j.maxlen) {
+        klog("EXT2: the journal's bounds are wrong\n");
+        goto out;
+    }
+    uint32_t end_seq = seq0, transactions = 0;
+    if (start) {
+        /* pass 1: to the last commit */
+        uint32_t b = start, seq = seq0;
+        for (uint32_t steps = 0; steps < j.maxlen; steps++) {
+            if (jread(&j, b) < 0 || be32(j.blk) != JBD_MAGIC || be32(j.blk + 8) != seq)
+                break;
+            uint32_t t = be32(j.blk + 4);
+            if (t == JBD_DESC) {
+                b += 1 + each_tag(&j, NULL, NULL);
+            } else if (t == JBD_COMMIT) {
+                seq++;
+                b++;
+                end_seq = seq;
+                transactions++;
+            } else if (t == JBD_REVOKE) {
+                b++;
+            } else {
+                break;
+            }
+            b = jwrap(&j, b);
+        }
+        /* pass 2: revoke records; pass 3: the blocks */
+        for (int pass = 2; pass <= 3; pass++) {
+            struct replay_ctx r = { .copy = copy };
+            b = start;
+            seq = seq0;
+            while ((int32_t)(end_seq - seq) > 0) {
+                if (jread(&j, b) < 0)
+                    break;
+                uint32_t t = be32(j.blk + 4);
+                if (t == JBD_DESC) {
+                    r.data_at = b + 1;
+                    r.seq = seq;
+                    uint32_t n = pass == 3 ? each_tag(&j, replay_tag, &r) : each_tag(&j, NULL, NULL);
+                    b += 1 + n;
+                } else if (t == JBD_COMMIT) {
+                    seq++;
+                    b++;
+                } else if (t == JBD_REVOKE) {
+                    if (pass == 2) {
+                        uint32_t used = be32(j.blk + 12), rsz = (j.incompat & JI_64BIT) ? 8 : 4;
+                        if (used > v->bsize)
+                            used = v->bsize;
+                        for (uint32_t off = 16; off + rsz <= used; off += rsz)
+                            if (rsz == 4 || !be32(j.blk + off))
+                                add_revoke(&j, be32(j.blk + off + rsz - 4), seq);
+                    }
+                    b++;
+                } else {
+                    break;
+                }
+                b = jwrap(&j, b);
+            }
+            if (pass == 3 && transactions)
+                klog("EXT2: replayed %u transaction(s) from the journal: %u block(s), %u revoked\n",
+                     transactions, r.written, j.nrevoked);
+        }
+    }
+    /* the journal is empty now */
+    if (jread(&j, 0) < 0)
+        goto out;
+    putbe32(j.blk + 24, end_seq);
+    putbe32(j.blk + 28, 0);
+    uint32_t goal = 0, pb;
+    if (bmap(v, j.raw, 0, false, &goal, &pb) < 0 || !pb || block_io(v, pb, j.blk, true) < 0)
+        goto out;
+    struct buf *b0 = bread(v->disk, v->start + 2);
+    if (!b0)
+        goto out;
+    put32(b0->data + 96, le32(b0->data + 96) & ~(uint32_t)INCOMPAT_RECOVER);
+    bdirty(b0);
+    brelse(b0);
+    rc = cache_sync() < 0 ? -1 : 0;
+out:
+    kfree(j.blk);
+    kfree(copy);
+    kfree(j.revoked);
+    return rc;
+}
+
 /* ---- mounting --------------------------------------------------------------------------- */
 
 struct vol *ext2_mount(struct partition *p)
@@ -1056,8 +1331,10 @@ struct vol *ext2_mount(struct partition *p)
     uint32_t rev = le32(sb + 76);
     uint32_t incompat = rev ? le32(sb + 96) : 0, ro_compat = rev ? le32(sb + 100) : 0;
     uint32_t compat = rev ? le32(sb + 92) : 0;
-    if (incompat & ~(uint32_t)INCOMPAT_KNOWN) {
-        klog("FS: ext2 at %u: incompatible features %X (ext4?): not mounted\n", p->start, incompat);
+    uint32_t known = INCOMPAT_KNOWN | ((compat & COMPAT_JOURNAL) ? INCOMPAT_RECOVER : 0);
+    if (incompat & ~known) {
+        klog("FS: ext2 at %u: incompatible features %X (ext4, or a journal device): not mounted\n",
+             p->start, incompat);
         return NULL;
     }
     uint32_t log = le32(sb + 24);
@@ -1106,6 +1383,16 @@ struct vol *ext2_mount(struct partition *p)
             return NULL;
         v->g[i] = (struct group){ le32(q), le32(q + 4), le32(q + 8), le16(q + 12), le16(q + 14), le16(q + 16) };
         brelse(b);
+    }
+    if (incompat & INCOMPAT_RECOVER) {                  /* ext3, not unmounted: replay its journal */
+        int rc = journal_replay(v, le32(sb + 0xE0));
+        kfree(v->g);
+        kfree(v->g_dirty);
+        if (rc < 0) {
+            klog("FS: ext3 at %u needs its journal replayed and it can't be: not mounted\n", p->start);
+            return NULL;
+        }
+        return ext2_mount(p);                           /* again, from what is on the disk now */
     }
     uint8_t root[128];
     if (inode_read(v, ROOT_INO, root) < 0 || (i_mode(root) & S_IFMT) != S_IFDIR)

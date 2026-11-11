@@ -1,7 +1,7 @@
 /*
  * fstest.c -- tests of the VMM's own disks: FAT32 (D:), FAT16 (E:),
- * exFAT (F:), ext2 (G:, 1 KB blocks; H:, 8 KB) on one disk, and a 5 GB
- * exFAT disk with 4 KB sectors (I:), reached directly through
+ * exFAT (F:), ext2 (G:, 1 KB blocks; H:, 8 KB), ext3 needing recovery (I:)
+ * on one disk, and a 5 GB exFAT disk with 4 KB sectors (J:), reached directly through
  * KERNEL.DLL's file calls, long names and all.
  *
  * tools/qemu-fat-test.py builds the disk (tools/mkdata.sh), lets a DOS
@@ -461,7 +461,7 @@ static void test_big(void)
 {
     /* I: exFAT with 4 KB sectors, a 4.5 GB file tools/exfat.py made */
     int64_t size = 0, at = 0;
-    HANDLE h = CreateFile("I:\\Huge file.bin", GENERIC_READ | GENERIC_WRITE, OPEN_EXISTING);
+    HANDLE h = CreateFile("J:\\Huge file.bin", GENERIC_READ | GENERIC_WRITE, OPEN_EXISTING);
     CHECK(h != INVALID_HANDLE_VALUE && GetFileSizeEx(h, &size) && size == 4608LL * 1024 * 1024,
           "exFAT, 4 KB sectors: a 4.5 GB file (GetFileSizeEx)");
     char b[32] = "";
@@ -476,10 +476,10 @@ static void test_big(void)
     CHECK(SetFilePointer(h, 0, FILE_END) == INVALID_SET_FILE_POINTER, "SetFilePointer (32-bit) refuses a position past 2 GB");
     CloseHandle(h);
     WIN32_FIND_DATA fd;
-    h = FindFirstFile("I:\\Huge*", &fd);
+    h = FindFirstFile("J:\\Huge*", &fd);
     CHECK(h != INVALID_HANDLE_VALUE && fd.size_high == 1 && fd.size == 512u * 1024 * 1024, "FindFirstFile: the size's high part");
     FindClose(h);
-    CHECK(text_is("I:\\small.txt", "a small file on a big disk\r\n"), "... and a small file beside it");
+    CHECK(text_is("J:\\small.txt", "a small file on a big disk\r\n"), "... and a small file beside it");
 
     /* H: ext2 with 8 KB blocks */
     CHECK(text_is("H:\\hello8k.txt", "ext2 with 8 KB blocks.\n"), "ext2, 8 KB blocks: read");
@@ -532,6 +532,17 @@ static void test_links(void)
           text_is("G:\\sym-long", far), "ext2: ... a long one (a block of its own; \\ becomes /)");
 }
 
+/* I: ext3, left with two committed transactions in its journal: the
+ * second revokes a block the first logged. */
+static void test_ext3(void)
+{
+    CHECK(text_is("I:\\victim.txt", "REPLAYED!!!!\n"), "ext3: a block from the journal's first transaction");
+    CHECK(text_is("I:\\second.txt", "NEW SECOND\n"), "ext3: ... and from its second");
+    CHECK(text_is("I:\\revoked.txt", "not replayed\n"), "ext3: a revoked block isn't replayed");
+    CHECK(text_is("I:\\before.txt", "written before the crash\n"), "ext3: the rest as it was");
+    CHECK(!spit("I:\\new.txt", "x", 1) && GetLastError() == ERROR_WRITE_PROTECT, "ext3: read-only (no journalled writes yet)");
+}
+
 int main(void)
 {
     test_reading();
@@ -542,6 +553,7 @@ int main(void)
     test_alias_clash("F:", "Same start 11.txt", "Same start 50.txt");
     test_alias_clash("G:", "Same start 11.txt", "Same start 30.txt");
     test_links();
+    test_ext3();
     test_big();
     printf("FS: %d of %d checks passed\n", checks - failures, checks);
     return failures ? 1 : 0;

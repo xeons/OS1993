@@ -1,8 +1,10 @@
 #!/bin/sh
 # Build a data disk for the VMM's own IDE driver and file systems:
 #   partition 1: FAT32, about 48 MB      partition 2: FAT16, about 15 MB
-#   partition 3: exFAT, 32 MB            partition 4: extended, with two logical drives:
-#     ext2, 32 MB (1 KB blocks)  and  ext2, 32 MB (8 KB blocks)
+#   partition 3: exFAT, 32 MB            partition 4: extended, with three logical drives:
+#     ext2, 32 MB (1 KB blocks); ext2, 32 MB (8 KB blocks); ext3, 32 MB, left
+#     needing recovery: two committed transactions in its journal (debugfs),
+#     the second revoking a block the first logged
 # with a few files (long names among them) written by mtools, by
 # tools/exfat.py on the exFAT one, and by debugfs on ext2.
 # usage: mkdata.sh OUT.img
@@ -30,15 +32,16 @@ fi
 out=$1
 tmp=$out.tmp
 rm -f "$tmp"
-truncate -s 168M "$tmp"
+truncate -s 200M "$tmp"
 sfdisk -q "$tmp" <<PART
 label: dos
 2048,98304,c
 100352,30720,6
 131072,65536,7
-196608,137216,5
+196608,202752,5
 198656,65536,83
 266240,65536,83
+333824,65536,83
 PART
 mkfs.fat -F 32 -n DATA32 -i 32323232 --offset 2048 "$tmp" 49152 >/dev/null
 mkfs.fat -F 16 -n DATA16 -i 16161616 --offset 100352 "$tmp" 15360 >/dev/null
@@ -110,4 +113,25 @@ debugfs -w -f "$d8/cmds" "$e8" >/dev/null 2>&1
 rm -rf "$d8"
 dd if="$e8" of="$tmp" bs=512 seek=266240 conv=notrunc status=none
 rm -f "$e8"
+e3=$tmp.e3
+rm -f "$e3"
+truncate -s 32M "$e3"
+mke2fs -q -F -t ext3 -b 1024 -L DATAE3 "$e3"
+d3=$(mktemp -d)
+printf 'old contents\n' > "$d3/v"; printf 'not replayed\n' > "$d3/r"
+printf 'old second\n' > "$d3/s"; printf 'written before the crash\n' > "$d3/b"
+printf 'write %s/v victim.txt\nwrite %s/r revoked.txt\nwrite %s/s second.txt\nwrite %s/b before.txt\n' \
+    "$d3" "$d3" "$d3" "$d3" | debugfs -w -f - "$e3" >/dev/null 2>&1
+V=$(debugfs -R "bmap victim.txt 0" "$e3" 2>/dev/null)
+R=$(debugfs -R "bmap revoked.txt 0" "$e3" 2>/dev/null)
+S=$(debugfs -R "bmap second.txt 0" "$e3" 2>/dev/null)
+python3 -c "
+import sys
+def blk(s): return s.encode().ljust(1024, b'.')
+open(sys.argv[1] + '/t1', 'wb').write(blk('REPLAYED!!!!\\n') + blk('WRONG WRONG!\\n'))
+open(sys.argv[1] + '/t2', 'wb').write(blk('NEW SECOND\\n'))" "$d3"
+printf 'jo\njw -b %s,%s %s/t1\njw -r %s -b %s %s/t2\njc\n' "$V" "$R" "$d3" "$R" "$S" "$d3" | debugfs -w -f - "$e3" >/dev/null 2>&1
+rm -rf "$d3"
+dd if="$e3" of="$tmp" bs=512 seek=333824 conv=notrunc status=none
+rm -f "$e3"
 mv "$tmp" "$out"
