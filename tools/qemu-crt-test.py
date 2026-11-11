@@ -45,10 +45,10 @@ def main():
                   f"{prog}: {line.group(0) if line else 'no result'}")
             check(f"USER: {prog} exited with code 0" in m.log(), f"{prog} exits with code 0")
         log = m.log()
-        check(re.search(r"started CRTTEST.BIN as process \d+ \(6 modules", log) is not None,
-              "CRTTEST.BIN loads CRT.DLL")
-        check(re.search(r"started CRTSTAT.BIN as process \d+ \(5 modules", log) is not None,
-              "CRTSTAT.BIN doesn't (the runtime is linked in)")
+        dyn = re.search(r"started CRTTEST.BIN as process \d+ \((\d+) modules", log)
+        stat = re.search(r"started CRTSTAT.BIN as process \d+ \((\d+) modules", log)
+        check(dyn and stat and int(dyn.group(1)) > int(stat.group(1)),
+              "CRTTEST.BIN loads CRT.DLL; CRTSTAT.BIN doesn't (the runtime is linked in)")
 
         cases = [
             ("smash", "stack buffer overrun"),

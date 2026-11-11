@@ -223,6 +223,44 @@ struct mem_info {
     uint32_t total_pages, free_pages;   /* physical memory */
     uint32_t process_pages;             /* the caller's private pages */
 };
+/* ---- sockets (SYS_SOCKET; WSOCK.DLL wraps them as Winsock) ---------------- */
+#define SYS_SOCKET      38              /* EBX = SOP_*, ECX = struct sock_args * -> result, or -errno */
+
+enum { SOP_SOCKET, SOP_BIND, SOP_CONNECT, SOP_LISTEN, SOP_ACCEPT, SOP_SEND, SOP_RECV,
+       SOP_SHUTDOWN, SOP_CLOSE, SOP_SETOPT, SOP_GETOPT, SOP_NAME, SOP_POLL, SOP_CONFIG };
+
+struct sock_args {
+    int32_t  s;                         /* the socket */
+    int32_t  a, b, c;                   /* SOCKET: type, protocol; LISTEN: backlog;
+                                           SEND/RECV: flags; SHUTDOWN: how; SETOPT/GETOPT:
+                                           level, name, value; NAME: 0 ours, 1 the peer's;
+                                           POLL: count, timeout ms (-1 none) */
+    void    *buf;                       /* SEND/RECV: data; POLL: struct sock_poll[]; CONFIG */
+    uint32_t len;
+    uint32_t ip;                        /* BIND/CONNECT/SEND to; ACCEPT/RECV/NAME from: */
+    uint16_t port, has_addr;            /*   host byte order; has_addr: SEND to ip:port */
+};
+
+struct sock_poll { int32_t s; int16_t events, revents; };
+
+struct net_config {                     /* SOP_CONFIG */
+    uint8_t  mac[6];
+    uint8_t  up;                        /* a NIC was found */
+    uint8_t  dhcp;                      /* 0 none, 1 asking, 2 leased */
+    uint32_t ip, mask, gateway, dns;    /* host order */
+    uint32_t dhcp_server, lease_secs;
+    uint32_t rx_packets, tx_packets, rx_dropped, tx_dropped;
+}; 
+
+#define NET_SOCK_STREAM 1               /* Winsock's numbers */
+#define NET_SOCK_DGRAM  2
+#define NET_SOCK_RAW    3
+#define NET_POLLIN      0x0001
+#define NET_POLLOUT     0x0004
+#define NET_POLLERR     0x0008
+#define NET_POLLHUP     0x0010
+#define NET_MSG_PEEK    0x2
+
 
 /* The display (SYS_DISPLAY_*): VGA's 640x480 in 16 colours (4 bits,
  * planar), or a linear mode in 8 (palette), 16 (5:6:5) or 32 (8:8:8) bits. */

@@ -60,6 +60,19 @@ bool GetExitCodeProcess(HANDLE h, uint32_t *code)
 
 const char *GetCommandLine(void) { return GetStartupInfo()->args; }
 
+/* The network (SYS_SOCKET), for WSOCK.DLL: a call that may wait lets go of
+ * the window system's lock meanwhile. -> the result, or -errno. */
+int NetCall(uint32_t op, struct sock_args *a)
+{
+    bool waits = op == SOP_CONNECT || op == SOP_ACCEPT || op == SOP_SEND || op == SOP_RECV || op == SOP_POLL;
+    if (waits)
+        k_before_wait();
+    int rc = (int)syscall3(SYS_SOCKET, op, (uint32_t)(uintptr_t)a, 0);
+    if (waits)
+        k_after_wait();
+    return rc;
+}
+
 uint32_t GetModuleFileName(void *module, char *buf, uint32_t size)
 {
     (void)module;                               /* the program's */

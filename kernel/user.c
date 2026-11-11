@@ -31,6 +31,7 @@
 #include "sched.h"
 #include "user.h"
 #include "random.h"
+#include "net.h"
 #include "v86.h"
 #include "vga.h"
 #include "vm.h"
@@ -954,6 +955,12 @@ static bool must_stop(struct process *p)
     return p->killed || p->state != P_RUNNING || current->killed;
 }
 
+bool user_thread_stopping(void)                     /* the network stack's waits */
+{
+    struct process *p = cur_proc();
+    return p && must_stop(p);
+}
+
 /* Block the calling thread on key until a wake, ms milliseconds, or the
  * end of the thread or its process. -> true if woken. */
 static bool futex_block(struct process *p, uint32_t key, uint32_t ms)
@@ -1318,6 +1325,7 @@ static void finish(int result)
     p->state = P_DEAD;
     p->result = result;
     p->killed = true;                               /* its other threads end too */
+    sock_process_end(p->pid);
     p->th[current->uth].done = true;
     wake_threads(p);
     ended[ended_next % 16].pid = p->pid;
@@ -1634,6 +1642,19 @@ void syscall_dispatch(struct regs *r)
         memcpy(&a, (const void *)(uintptr_t)r->ecx, sizeof a);
         int rc = vm_op(self, r->ebx, &a);
         memcpy((void *)(uintptr_t)r->ecx, &a, sizeof a);
+        r->eax = (uint32_t)rc;
+        break;
+    }
+    case SYS_SOCKET: {
+        struct sock_args a;
+        if (!user_writable(r->ecx, sizeof a)) {
+            r->eax = (uint32_t)-EFAULT;
+            break;
+        }
+        memcpy(&a, (const void *)(uintptr_t)r->ecx, sizeof a);
+        int rc = sock_syscall(self->pid, r->ebx, &a);
+        if (self->state == P_RUNNING)
+            memcpy((void *)(uintptr_t)r->ecx, &a, sizeof a);
         r->eax = (uint32_t)rc;
         break;
     }

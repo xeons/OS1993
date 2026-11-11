@@ -11,3 +11,5 @@ EXPORTS
     GetSaveFileName
     FindText
     ReplaceText
+    ConsoleWrite
+    RunConsole

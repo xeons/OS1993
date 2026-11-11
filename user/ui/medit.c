@@ -679,9 +679,13 @@ LRESULT medit_proc(HWND h, unsigned msg, WPARAM wp, LPARAM lp)
         moved(m);
         InvalidateRect(h, NULL);
         return 0;
-    case EM_REPLACESEL:
+    case EM_REPLACESEL: {               /* the program may change a read-only one (as in Win32) */
+        bool ro = w->style & ES_READONLY;
+        w->style &= ~(unsigned)ES_READONLY;
         replace(w, lp ? (const char *)lp : "", lp ? (int)strlen((const char *)lp) : 0);
+        if (ro) w->style |= ES_READONLY;
         return 0;
+    }
     case EM_SCROLLCARET:   show_caret(w); return 1;
     case EM_GETMODIFY:     return m->modified;
     case EM_SETMODIFY:     m->modified = wp != 0; return 0;

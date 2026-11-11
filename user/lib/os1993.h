@@ -205,6 +205,9 @@ int32_t  InterlockedCompareExchange(volatile int32_t *p, int32_t v, int32_t comp
 HANDLE   OpenProcess(uint32_t access, bool inherit, int pid);
 bool     GetExitCodeProcess(HANDLE process, uint32_t *code);   /* STILL_ACTIVE while it runs */
 const char *GetCommandLine(void);
+
+/* The network, for WSOCK.DLL (programs use its Winsock calls) */
+int      NetCall(uint32_t op, struct sock_args *a);    /* SOP_* -> result, or -errno */
 uint32_t GetModuleFileName(void *module, char *buf, uint32_t size);
 
 /* The display, for UI.DLL (programs use EnumDisplaySettings and
@@ -708,6 +711,19 @@ int     GetClassIcon(HWND hwnd);                    /* WNDCLASS.icon */
 
 /* Start a program ("CALC.BIN"; "COMMAND.COM" opens a DOS session).
  * Returns more than 32 on success, as in Windows. */
+/* A console window (SHELL.DLL), for programs that print: main runs on a
+ * second thread and what it writes to stdout shows in the window, which
+ * stays open after it ends. In main: return RunConsoleProgram("Ping",
+ * real_main, argc, argv); real_main must not use the window system. */
+void    ConsoleWrite(const char *s, size_t n);
+int     RunConsole(const char *title, int (*fn)(int, char **), int argc, char **argv);
+void    __crt_set_output(void (*fn)(const char *s, size_t n));      /* CRT.DLL */
+static inline int RunConsoleProgram(const char *title, int (*fn)(int, char **), int argc, char **argv)
+{
+    __crt_set_output(ConsoleWrite);         /* this program's C runtime's stdout */
+    return RunConsole(title, fn, argc, argv);
+}
+
 int     ShellExecute(HWND hwnd, const char *verb, const char *file, const char *params,
                      const char *dir, int show);
 int     ShellAbout(HWND hwnd, const char *app, const char *other);

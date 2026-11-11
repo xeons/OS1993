@@ -16,6 +16,7 @@
 #include "vbe.h"
 #include "display.h"
 #include "random.h"
+#include "net.h"
 #include "vm.h"
 
 const struct bootinfo *g_bootinfo;
@@ -68,6 +69,7 @@ void kernel_shutdown(uint8_t exit_code)
 {
     cpu_cli();
     pic_mask_all();
+    ne2000_stop();
     mouse_shutdown();                   /* or DOS's keyboard would jam */
     vm_restore_dos();                   /* the original DOS memory and screen */
     klog("VMM: returning to DOS (exit code %u)\n", exit_code);
@@ -163,6 +165,8 @@ void kmain(const struct bootinfo *bi)
     ok("VGA driver (text and 640x480x16 graphics)");
     mouse_init();
     ok(mouse_present() ? "PS/2 mouse" : "PS/2 mouse (none found)");
+    net_init();
+    ok(net_cfg.up ? "Network (NE2000, TCP/IP)" : "Network (no card: loopback only)");
 
     kprintf("\n");
     kprintf("  Arena           %6u KB  physical %p, mapped at %p\n",

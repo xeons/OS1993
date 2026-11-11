@@ -170,3 +170,4 @@ EXPORTS
     gmtime
     localtime
     strftime
+    __crt_set_output

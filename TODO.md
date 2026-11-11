@@ -105,6 +105,23 @@ README.md for what already works.
 - [ ] DOS sessions in a window on the desktop (render the VM's text screen).
 - [ ] Monochrome adapters get no graphics desktop.
 
+## Network
+
+- [ ] Only the NE2000 at 300h/IRQ 9; no other cards (3C509, WD8003 ...),
+      no settings in OS1993.INI (port, IRQ, a static address instead of
+      DHCP).
+- [ ] IP: no fragments, no options, one interface; no IPv6; no routing
+      table beyond the gateway; no multicast.
+- [ ] TCP: no out-of-order queue (the peer resends), no SACK, no window
+      scaling or timestamps, no fast retransmit, no keepalives, no Nagle or
+      delayed ACKs; 8 KB buffers; 32 sockets system-wide.
+- [ ] DNS: A records only, no cache, no reverse lookups; no hosts file.
+- [ ] PING's times are to the 55 ms timer (a high-resolution clock from the
+      PIT, read without disturbing DOS VMs that use it, would fix that).
+- [ ] DOS sessions have no network: a virtual packet driver (INT 60h,
+      sharing the card with the stack) or a Winsock VxD for DOS programs.
+- [ ] Netstat, tracert (TTL), a telnet client, an FTP client.
+
 ## File systems
 
 Files go through DOS today (FAT12/16, FAT32 where the DOS has it). Native

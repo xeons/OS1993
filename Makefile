@@ -22,6 +22,7 @@
 #   make qemu-vesa     the VBE display driver: higher resolutions and colour depths
 #   make qemu-crt      the C runtime (CRT.DLL, libcrt.a) and its protections
 #   make qemu-threads  threads, synchronization, virtual memory, heaps, processes, file calls
+#   make qemu-net      the NE2000, TCP/IP, WSOCK.DLL, PING and IPCONFIG
 #   make clean
 
 CC      := i686-elf-gcc
@@ -56,7 +57,7 @@ MKDEF       := python3 tools/mkdef.py
 # loader), _FORTIFY_SOURCE's checked copies, and stack-clash probes (a frame
 # bigger than a page touches each page, so it can't step over a thread's
 # guard page); see user/crt/include/crtdefs.h.
-USER_CFLAGS := $(filter-out -Ikernel/include,$(CFLAGS)) -Iuser/crt/include -Iuser/lib -Iuser/gfx -Iuser/ui -Iuser/shell \
+USER_CFLAGS := $(filter-out -Ikernel/include,$(CFLAGS)) -Iuser/crt/include -Iuser/lib -Iuser/gfx -Iuser/ui -Iuser/shell -Iuser/net \
                -Ikernel/include -fstack-protector-strong -fstack-clash-protection -D_FORTIFY_SOURCE=2 -MMD -MP
 MOD_LDFLAGS := -T user/lib/module.ld -nostdlib -ffreestanding \
                -Wl,--build-id=none -Wl,--no-warn-rwx-segments
@@ -65,6 +66,7 @@ GFX_BASE    := $(shell $(MKDEF) user/gfx/gfx.def base)
 UI_BASE     := $(shell $(MKDEF) user/ui/ui.def base)
 SHELL_BASE  := $(shell $(MKDEF) user/shell/shell.def base)
 CRT_BASE    := $(shell $(MKDEF) user/crt/crt.def base)
+WSOCK_BASE  := $(shell $(MKDEF) user/net/wsock.def base)
 
 # The C runtime, from one set of sources: CRT.DLL for programs to share,
 # libcrt.a to link into a module of its own (the system DLLs, CRTSTAT.BIN).
@@ -74,6 +76,8 @@ CRT_CODE  := $(patsubst %,$(U)/crt/%.o,$(CRT_SRC)) $(U)/crt/setjmp.o
 LIBCRT    := $(U)/libcrt.a
 SSP       := $(U)/crt/ssp.o
 CRT_OBJ   := $(U)/hdr/CRT.DLL.o $(CRT_CODE) $(SSP) $(U)/gen/crt_exports.o $(U)/gen/krnl_imports.o
+# Winsock: sockets over the VMM's TCP/IP stack
+WSOCK_OBJ := $(U)/hdr/WSOCK.DLL.o $(U)/net/wsock.o $(U)/gen/wsock_exports.o $(U)/gen/krnl_imports.o $(SSP) $(LIBCRT)
 
 # DLLs: header, code, export table, import libraries of what they call
 KRNL_OBJ  := $(U)/hdr/KERNEL.DLL.o $(U)/krnl/krnl.o $(U)/krnl/thread.o $(U)/krnl/heap.o \
@@ -83,30 +87,31 @@ UI_SRC    := wnd queue input frame paint display menu accel msgbox dialog button
              scroll trackbar combo tab updown kbd theme
 UI_OBJ    := $(U)/hdr/UI.DLL.o $(patsubst %,$(U)/ui/%.o,$(UI_SRC)) \
              $(U)/gen/ui_exports.o $(U)/gen/gfx_imports.o $(U)/gen/krnl_imports.o $(SSP) $(LIBCRT)
-SHELL_OBJ := $(U)/hdr/SHELL.DLL.o $(U)/shell/shell.o $(U)/shell/icons.o $(U)/shell/filedlg.o $(U)/shell/findrepl.o $(U)/gen/shell_exports.o \
+SHELL_OBJ := $(U)/hdr/SHELL.DLL.o $(U)/shell/shell.o $(U)/shell/icons.o $(U)/shell/filedlg.o $(U)/shell/findrepl.o \
+             $(U)/shell/console.o $(U)/gen/shell_exports.o \
              $(U)/gen/ui_imports.o $(U)/gen/krnl_imports.o $(SSP) $(LIBCRT)
 
 # Programs: user/apps/<name>.c, each a process of its own, sharing CRT.DLL.
 # CRTSTAT.BIN is CRTTEST.BIN with the C runtime linked in (libcrt.a).
-APPS      := SHELL DEMO CALC PAINT CLOCK NOTEPAD HANG CRTTEST THRTEST
+APPS      := SHELL DEMO CALC PAINT CLOCK NOTEPAD HANG CRTTEST THRTEST PING IPCONFIG NETTEST
 APP_LIBS  := $(U)/lib/crt0.o $(U)/gen/krnl_imports.o $(U)/gen/ui_imports.o \
-             $(U)/gen/shell_imports.o $(U)/gen/crt_imports.o $(SSP)
+             $(U)/gen/shell_imports.o $(U)/gen/crt_imports.o $(U)/gen/wsock_imports.o $(SSP)
 app_obj    = $(U)/hdr/$(1).BIN.o $(U)/apps/$(shell echo $(1) | tr A-Z a-z).o $(APP_LIBS)
 CRTSTAT_OBJ := $(U)/hdr/CRTSTAT.BIN.o $(U)/apps/crttest.o $(U)/lib/crt0.o $(U)/gen/krnl_imports.o \
                $(U)/gen/ui_imports.o $(U)/gen/shell_imports.o $(SSP) $(LIBCRT)
 
-USER_OBJ  := $(sort $(filter %.o,$(KRNL_OBJ) $(GFX_OBJ) $(UI_OBJ) $(SHELL_OBJ) $(CRT_OBJ) $(CRTSTAT_OBJ) \
+USER_OBJ  := $(sort $(filter %.o,$(KRNL_OBJ) $(GFX_OBJ) $(UI_OBJ) $(SHELL_OBJ) $(CRT_OBJ) $(WSOCK_OBJ) $(CRTSTAT_OBJ) \
                     $(foreach a,$(APPS),$(call app_obj,$(a)))))
-MODULES   := $(BUILD)/KERNEL.DLL $(BUILD)/GFX.DLL $(BUILD)/UI.DLL $(BUILD)/SHELL.DLL $(BUILD)/CRT.DLL \
+MODULES   := $(BUILD)/KERNEL.DLL $(BUILD)/GFX.DLL $(BUILD)/UI.DLL $(BUILD)/SHELL.DLL $(BUILD)/CRT.DLL $(BUILD)/WSOCK.DLL \
              $(patsubst %,$(BUILD)/%.BIN,$(APPS)) $(BUILD)/CRTSTAT.BIN
 MODULE_ELFS := $(patsubst $(BUILD)/%,$(U)/%.elf,$(MODULES))
 
-KERNEL_C   := $(wildcard kernel/*.c)
+KERNEL_C   := $(wildcard kernel/*.c kernel/net/*.c)
 KERNEL_ASM := $(wildcard kernel/*.asm)
 KERNEL_OBJ := $(patsubst kernel/%.asm,$(BUILD)/kernel/%.o,$(KERNEL_ASM)) \
               $(patsubst kernel/%.c,$(BUILD)/kernel/%.o,$(KERNEL_C))
 
-.PHONY: all run test check486 qemu qemu-test qemu-emm386 qemu-sessions qemu-vga qemu-wm qemu-absmouse qemu-menu qemu-controls qemu-msgbox qemu-shell qemu-files qemu-notepad qemu-tasklist qemu-vesa qemu-crt qemu-threads clean
+.PHONY: all run test check486 qemu qemu-test qemu-emm386 qemu-sessions qemu-vga qemu-wm qemu-absmouse qemu-menu qemu-controls qemu-msgbox qemu-shell qemu-files qemu-notepad qemu-tasklist qemu-vesa qemu-crt qemu-threads qemu-net clean
 
 all: $(BUILD)/OS1993.COM $(BUILD)/VMM.BIN $(MODULES)
 
@@ -120,6 +125,7 @@ $(BUILD)/vmm.elf: $(KERNEL_OBJ) kernel/linker.ld
 	$(CC) $(LDFLAGS) -o $@ $(KERNEL_OBJ)
 
 $(BUILD)/kernel/%.o: kernel/%.c | $(BUILD)/kernel
+	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 $(BUILD)/kernel/%.o: kernel/%.asm kernel/include/selectors.inc | $(BUILD)/kernel
@@ -145,6 +151,9 @@ $(U)/SHELL.DLL.elf: $(SHELL_OBJ) user/lib/module.ld
 
 $(U)/CRT.DLL.elf: $(CRT_OBJ) user/lib/module.ld
 	$(CC) $(MOD_LDFLAGS) -Wl,--defsym=MODBASE=$(CRT_BASE) -o $@ $(CRT_OBJ)
+
+$(U)/WSOCK.DLL.elf: $(WSOCK_OBJ) user/lib/module.ld
+	$(CC) $(MOD_LDFLAGS) -Wl,--defsym=MODBASE=$(WSOCK_BASE) -o $@ $(WSOCK_OBJ)
 
 $(U)/CRTSTAT.BIN.elf: $(CRTSTAT_OBJ) user/lib/module.ld
 	$(CC) $(MOD_LDFLAGS) -Wl,--defsym=MODBASE=0x00400000 -o $@ $(CRTSTAT_OBJ)
@@ -206,6 +215,11 @@ $(U)/gen/crt_exports.asm $(U)/gen/crt_imports.asm: user/crt/crt.def tools/mkdef.
 	$(MKDEF) $< exports $(U)/gen/crt_exports.asm
 	$(MKDEF) $< imports $(U)/gen/crt_imports.asm
 
+$(U)/gen/wsock_exports.asm $(U)/gen/wsock_imports.asm: user/net/wsock.def tools/mkdef.py
+	@mkdir -p $(dir $@)
+	$(MKDEF) $< exports $(U)/gen/wsock_exports.asm
+	$(MKDEF) $< imports $(U)/gen/wsock_imports.asm
+
 $(U)/gen/%.o: $(U)/gen/%.asm
 	$(NASM) -f elf32 -o $@ $<
 
@@ -234,7 +248,8 @@ test: all
 # -vga std: the ISA VGA with the Bochs VBE registers (display.c); its BIOS is
 # vgabios.bin, shipped as vgabios-isavga.bin (build/qemu-rom has the link).
 QEMU_ROM  := $(BUILD)/qemu-rom/vgabios.bin
-QEMU_ARGS := -M isapc,vmport=on -cpu 486 -m 16 -vga std -L $(BUILD)/qemu-rom -L /usr/share/qemu -drive file=$(BUILD)/freedos.img,format=raw,if=ide \
+QEMU_ARGS := -M isapc,vmport=on -cpu 486 -m 16 -vga std -L $(BUILD)/qemu-rom -L /usr/share/qemu \
+             -nic user,model=ne2k_isa,mac=52:54:00:12:34:56 -drive file=$(BUILD)/freedos.img,format=raw,if=ide \
              -serial file:$(BUILD)/qemu/SERIAL.LOG -device isa-debug-exit,iobase=0xf4,iosize=4
 QEMU_IMG  := $(BUILD)/freedos.img@@32256
 
@@ -306,6 +321,9 @@ qemu-crt: all $(QEMU_ROM)
 
 qemu-threads: all $(QEMU_ROM)
 	@tools/qemu-threads-test.py
+
+qemu-net: all $(QEMU_ROM)
+	@tools/qemu-net-test.py
 
 check486: $(BUILD)/vmm.elf $(MODULE_ELFS)
 	@for f in $^; do tools/check486.sh $(OBJDUMP) $$f || exit 1; done

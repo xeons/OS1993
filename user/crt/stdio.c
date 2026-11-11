@@ -52,6 +52,11 @@ FILE *__crt_stdio(int fd)
 
 static void set_win_errno(void) { errno = __crt_errno_from_win(GetLastError()); }
 
+/* A console window (SHELL.DLL's RunConsoleProgram) also gets stdout. */
+static void (*output_hook)(const char *s, size_t n);
+
+void __crt_set_output(void (*fn)(const char *s, size_t n)) { output_hook = fn; }
+
 /* ---- the buffer ---------------------------------------------------------------- */
 
 static void log_out(const uint8_t *s, size_t n)    /* one debug log line per call */
@@ -77,6 +82,8 @@ static int flush_write(FILE *f)
     if (!n)
         return 0;
     if (f->kind == K_LOG) {
+        if (output_hook)
+            output_hook((const char *)f->buf, n);
         if (f->buf[n - 1] == '\n')                  /* the log adds its own line end */
             n--;
         log_out(f->buf, n);

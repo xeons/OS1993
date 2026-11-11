@@ -27,6 +27,7 @@ are for later stages.
 | `make qemu-sessions` | types into two concurrent DOS sessions via QEMU's monitor |
 | `make qemu-absmouse` | absolute pointer through QEMU's VMware port: the cursor lands on the exact pixel, and clicks hit their control |
 | `make qemu-crt` | the C runtime: CRTTEST.BIN (CRT.DLL) and CRTSTAT.BIN (libcrt.a) pass its checks; a stack overrun, a heap overrun, a double free, a fortified memcpy, a broken Annex K constraint, `%n` and a failed assert each end the program with the reason logged; every process has its own canary |
+| `make qemu-net` | the network: the NE2000 and a DHCP lease, NETTEST.BIN's 26 checks (loopback UDP and TCP with a server thread, refused connections, ICMP port unreachable, timeouts, non-blocking sockets and select, 64 KB echoed by a server on the host), PING to the host, the loopback and nobody, IPCONFIG, and the host connecting in to a server in the guest |
 | `make qemu-threads` | threads: 67 checks (joins and exit codes, critical sections, events, semaphores, mutexes, timeouts, TLS and errno per thread, suspend/terminate, the 16-thread limit, malloc and printf from several threads, virtual memory, private heaps, a child process, the file calls); a stack overflow hits the guard page, a read-only page faults, the last thread's code ends the process, `exit` from a second thread ends them all |
 | `make qemu-vesa` | the VBE display driver: Display Properties switches to 1024×768 high colour, 800×600 in 256 colours and true colour, No and the 15-second timeout go back, a DOS session and back keeps the mode, OS1993.INI restores it next session, and 640×480×16 is VGA again |
 | `make qemu-tasklist` | Ctrl+Alt+Del: Close Program ends a program, works from a DOS session, and the VMM's screen ends a program that froze the GUI |
@@ -324,9 +325,10 @@ system DLLs.
 | `KERNEL.DLL` | `1000_0000` | the userland kernel library: wraps the INT 30h system calls (`user/krnl/`) |
 | `GFX.DLL` | `1010_0000` | the VGA display driver (`user/gfx/`)             |
 | `UI.DLL`  | `1020_0000` | windows, messages, painting, controls (`user/ui/`); imports KERNEL, GFX |
+| `WSOCK.DLL` | `1050_0000` | Winsock: sockets over the VMM's TCP/IP stack, `select`, a DNS resolver (`user/net/`) |
 | `CRT.DLL` | `1040_0000` | the C runtime (`user/crt/`); imports KERNEL. Also built as `libcrt.a` |
 | `SHELL.DLL` | `1030_0000` | the shell API: `ShellExecute`, `ShellAbout`, `Shell_NotifyIcon`, `GetOpenFileName`/`GetSaveFileName`, `FindText`/`ReplaceText`, stock icons (`user/shell/`) |
-| `*.BIN`   | `0040_0000` | programs (`user/apps/`): SHELL, CALC, PAINT, CLOCK, NOTEPAD, DEMO, CRTTEST (and CRTSTAT) |
+| `*.BIN`   | `0040_0000` | programs (`user/apps/`): SHELL, CALC, PAINT, CLOCK, NOTEPAD, DEMO, PING, IPCONFIG; tests CRTTEST (and CRTSTAT), THRTEST, NETTEST |
 
 Programs include one header, `user/lib/os1993.h` (the `windows.h` of
 OS1993), and call KERNEL.DLL (`CreateProcess`, `GetTickCount`, `Sleep`,
@@ -390,6 +392,50 @@ It is hardened, by default and in every ring-3 module:
   format-string hole. `setjmp` stores its stack and code pointers XORed
   with the canary. `qsort` is a heapsort: no recursion, n log n whatever
   the input.
+
+## The network
+
+`kernel/net/` is a TCP/IP stack in the VMM, for one Ethernet card and the
+loopback, as Windows for Workgroups and Win95 had theirs in VxDs.
+
+- **The card** (`ne2000.c`): an NE2000 (DP8390) at port 300h, IRQ 9 --
+  the ISA card of 1993, and QEMU's (`-nic user,model=ne2k_isa`, which
+  `make qemu` and the tests use: QEMU answers DHCP and is the gateway,
+  10.0.2.2, which reaches the host). Its 16 KB of memory holds one transmit
+  buffer and a receive ring, moved through its data port a word at a time.
+  Without a card only the loopback works.
+- **The stack** (`net.c`, `socket.c`, `tcp.c`): Ethernet, ARP (a cache of
+  16, a frame waiting while it asks), IPv4 (no fragments: sent with Don't
+  Fragment, dropped when they come), ICMP (echo replies, unreachables to
+  the sockets they're about, port unreachable for UDP nobody listens to),
+  UDP, and TCP: the full state machine, the MSS option, 8 KB windows each
+  way, retransmission from Jacobson's estimate (Karn's rule, backing off up
+  to a minute, 8 tries), slow start and congestion avoidance, zero-window
+  probes, TIME_WAIT (2 s), listen queues, and closing gracefully after the
+  owner has let go (unread data resets, as on BSD). A **DHCP client**
+  configures the card at boot and renews at half the lease.
+- **How it runs.** The card's interrupt only copies frames into pool
+  buffers; a kernel thread, woken by it and by each timer tick, takes them
+  up the stack and runs the timers. Everything runs with interrupts off, so
+  system calls (which may block, with timeouts, until the stack wakes the
+  socket) see consistent state. Packets to 127.0.0.0/8 or our own address
+  go round through the same queue. Sockets belong to a process and close
+  when it ends; 32 in all.
+- **WSOCK.DLL** (`user/net/winsock.h`): Winsock -- `socket`, `bind`,
+  `connect`, `listen`, `accept`, `send`/`recv`, `sendto`/`recvfrom`,
+  `shutdown`, `closesocket`, `setsockopt`/`getsockopt` (`SO_RCVTIMEO`,
+  `SO_SNDTIMEO`, `SO_REUSEADDR`, `SO_BROADCAST`, `SO_ERROR` ...),
+  `ioctlsocket` (`FIONBIO`, `FIONREAD`), `select`, `WSAPoll`,
+  `getsockname`/`getpeername`, `inet_*`, `gethostbyname` and
+  `getaddrinfo` (numbers, `localhost`, or a DNS query to the server DHCP
+  gave), `WSAGetLastError` (and `errno`). Raw ICMP sockets get every ICMP
+  packet, IP header and all. KERNEL.DLL's `NetCall` makes the system call,
+  letting go of the window system's lock while it may wait.
+- **PING** and **IPCONFIG** run in a **console window**: SHELL.DLL's
+  `RunConsoleProgram` runs `main` on a second thread and shows its
+  `stdout` in a read-only edit control (the CRT hands each line to it), the
+  first thread moving the text in on a timer; the window stays when the
+  program ends. Start them from Run: `ping -n 3 10.0.2.2`, `ipconfig`.
 
 ## The window system across processes
 
@@ -679,12 +725,14 @@ kernel/vm.c sched.c switch.asm           VMs, address spaces, focus; threads
 kernel/vmtest.c                          multi-VM self-test
 kernel/dosmgr.c                          one DOS shared by all VMs
 kernel/random.c                          random numbers (ChaCha20 from interrupt timing)
+kernel/net/                              the NE2000, Ethernet/ARP/IP/ICMP/DHCP, sockets and UDP, TCP
 kernel/vga.c gfx.c                       VGA state (VDD), planar drawing
 kernel/display.c vbe.c                   display modes: the VBE adapter, the VBE BIOS probe
 kernel/user.c                            ring-3 loader, INT 30h system calls
 kernel/mouse.c                           PS/2 mouse (IRQ 12)
 user/lib/os1993.h                        the public API; crt0, the module header and linker script
 user/crt/                                the C runtime: CRT.DLL and libcrt.a; include/ has its headers
+user/net/                                WSOCK.DLL (winsock.h)
 user/krnl/                               KERNEL.DLL (system call wrappers)
 user/gfx/                                GFX.DLL (drawing: planar VGA, linear 8/16/32 bits)
 user/ui/                                 UI.DLL (windows, messages, controls)
@@ -737,7 +785,8 @@ tools/                   check486.sh, check-test.sh
    boxes, tabs and up-downs, and code shared between processes, and higher resolutions and colour depths
    (the VBE display driver, Display Properties), and a hardened C runtime
    (CRT.DLL and libcrt.a), threads with Win32's synchronization, virtual
-   memory and heaps. Next: a network driver, TCP/IP, sockets and PING.
+   memory and heaps, and networking (an NE2000 driver, TCP/IP in the VMM,
+   Winsock, PING and IPCONFIG in console windows).
 7. **Win16-style API layer.** 16-bit protected-mode apps in ring 3 with LDTs,
    built with Open Watcom.
 8. **Coexisting with EMM386** through VCPI/GEMMIS, and acting as a DPMI host.

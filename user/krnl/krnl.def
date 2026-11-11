@@ -110,3 +110,4 @@ EXPORTS
     InterlockedExchange
     InterlockedExchangeAdd
     InterlockedCompareExchange
+    NetCall

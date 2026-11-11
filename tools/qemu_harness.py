@@ -93,8 +93,9 @@ class Checker:
 
 
 class Machine:
-    def __init__(self, variant="normal", mode="autorun", vmport=False):
+    def __init__(self, variant="normal", mode="autorun", vmport=False, hostfwd=()):
         self.variant, self.mode, self.vmport = variant, mode, vmport
+        self.hostfwd = hostfwd                      # e.g. ("tcp:127.0.0.1:5555-:7",)
 
     def __enter__(self):
         os.makedirs(QDIR, exist_ok=True)
@@ -111,6 +112,8 @@ class Machine:
             "qemu-system-i386", "-M", "isapc,vmport=on" if self.vmport else "isapc,vmport=off",
             "-cpu", "486", "-m", "16", "-vga", "std", "-L", rom, "-L", "/usr/share/qemu",
             "-drive", f"file={IMG},format=raw,if=ide", "-serial", "file:SERIAL.LOG",
+            # an NE2000 on QEMU's user-mode network: DHCP, gateway 10.0.2.2 (the host)
+            "-nic", "user,model=ne2k_isa,mac=52:54:00:12:34:56" + "".join(",hostfwd=" + f for f in self.hostfwd),
             "-device", "isa-debug-exit,iobase=0xf4,iosize=4",
             "-display", "none", "-monitor", "unix:monitor.sock,server,nowait",
             "-qmp", "unix:qmp.sock,server,nowait"])

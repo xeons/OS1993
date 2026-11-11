@@ -13,6 +13,8 @@
 #include "vm.h"
 #include "user.h"
 
+void net_tick(void);                    /* net.c */
+
 #define BDA_TICKS     0x46C
 #define BDA_MIDNIGHT  0x470
 #define TICKS_PER_DAY 0x1800B0
@@ -25,6 +27,7 @@ static void timer_irq(struct regs *r)
     ticks++;
     sched_tick();
     user_tick();
+    net_tick();
     if (vm_timer_tick())
         return;                 /* shared with every VM (vm.c) */
     uint32_t t = LOWMEM32(BDA_TICKS) + 1;

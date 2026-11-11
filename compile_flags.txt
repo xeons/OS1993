@@ -8,3 +8,4 @@
 -Iuser/ui
 -Iuser/krnl
 -Iuser/shell
+-Iuser/net

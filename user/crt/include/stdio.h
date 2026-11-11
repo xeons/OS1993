@@ -80,6 +80,9 @@ int     snprintf_s(char *restrict s, rsize_t n, const char *restrict fmt, ...) _
 int     vsprintf_s(char *restrict s, rsize_t n, const char *restrict fmt, va_list ap) __crt_printf(3, 0);
 int     vsnprintf_s(char *restrict s, rsize_t n, const char *restrict fmt, va_list ap) __crt_printf(3, 0);
 
+/* OS1993: stdout and stderr also go to fn, a line at a time (a console window) */
+void    __crt_set_output(void (*fn)(const char *s, size_t n));
+
 /* _FORTIFY_SOURCE */
 int     __sprintf_chk(char *s, int flag, size_t slen, const char *fmt, ...);
 int     __snprintf_chk(char *s, size_t n, int flag, size_t slen, const char *fmt, ...);
