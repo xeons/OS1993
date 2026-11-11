@@ -1,21 +1,44 @@
 #!/bin/sh
 # Build a data disk for the VMM's own IDE driver and file systems:
 #   partition 1: FAT32, about 48 MB      partition 2: FAT16, about 15 MB
-#   partition 3: exFAT, 32 MB            partition 4: ext2, 32 MB (1 KB blocks)
+#   partition 3: exFAT, 32 MB            partition 4: extended, with two logical drives:
+#     ext2, 32 MB (1 KB blocks)  and  ext2, 32 MB (8 KB blocks)
 # with a few files (long names among them) written by mtools, by
 # tools/exfat.py on the exFAT one, and by debugfs on ext2.
 # usage: mkdata.sh OUT.img
+#        mkdata.sh --big OUT.img   a 5 GB exFAT disk with 4 KB sectors and no
+#                                  partition table, a 4.5 GB file on it (sparse)
 set -e
+if [ "$1" = --big ]; then
+    out=$2
+    rm -f "$out.tmp"
+    truncate -s 5G "$out.tmp"
+    mkfs.exfat -q -L BIGEX -s 4096 -c 32K "$out.tmp" >/dev/null 2>&1 || mkfs.exfat -L BIGEX -s 4096 -c 32K "$out.tmp" >/dev/null
+    python3 -I - "$out.tmp" "$(dirname "$0")" <<'PY'
+import sys
+sys.path.insert(0, sys.argv[2])
+from exfat import ExFat
+v = ExFat(sys.argv[1], 0)
+size = 4 * 1024**3 + 512 * 1024**2
+v.write_sparse("Huge file.bin", size, {0: b"start of the huge file", 4 * 1024**3 + 16: b"beyond 4 GB"})
+v.write("small.txt", b"a small file on a big disk\r\n")
+v.close()
+PY
+    mv "$out.tmp" "$out"
+    exit 0
+fi
 out=$1
 tmp=$out.tmp
 rm -f "$tmp"
-truncate -s 128M "$tmp"
+truncate -s 168M "$tmp"
 sfdisk -q "$tmp" <<PART
 label: dos
 2048,98304,c
 100352,30720,6
 131072,65536,7
-196608,65536,83
+196608,137216,5
+198656,65536,83
+266240,65536,83
 PART
 mkfs.fat -F 32 -n DATA32 -i 32323232 --offset 2048 "$tmp" 49152 >/dev/null
 mkfs.fat -F 16 -n DATA16 -i 16161616 --offset 100352 "$tmp" 15360 >/dev/null
@@ -73,6 +96,18 @@ symlink link-to-hello "Hello ext2.txt"
 CMDS
 debugfs -w -f "$d2/cmds" "$e2" >/dev/null 2>&1
 rm -rf "$d2"
-dd if="$e2" of="$tmp" bs=512 seek=196608 conv=notrunc status=none
+dd if="$e2" of="$tmp" bs=512 seek=198656 conv=notrunc status=none
 rm -f "$e2"
+e8=$tmp.e8
+rm -f "$e8"
+truncate -s 32M "$e8"
+mke2fs -q -F -t ext2 -b 8192 -L DATAE8 "$e8" 2>/dev/null
+d8=$(mktemp -d)
+printf 'ext2 with 8 KB blocks.\n' > "$d8/hello"
+python3 -c "import sys; sys.stdout.buffer.write(bytes((i * 7 + i // 251) & 255 for i in range(300000)))" > "$d8/big"
+printf 'write %s/hello hello8k.txt\nwrite %s/big big.bin\n' "$d8" "$d8" > "$d8/cmds"
+debugfs -w -f "$d8/cmds" "$e8" >/dev/null 2>&1
+rm -rf "$d8"
+dd if="$e8" of="$tmp" bs=512 seek=266240 conv=notrunc status=none
+rm -f "$e8"
 mv "$tmp" "$out"

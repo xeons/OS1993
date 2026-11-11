@@ -32,8 +32,8 @@ class ExFat:
         self.bps = 512
         bs = self.sectors(0, 1)
         assert bs[3:11] == b"EXFAT   ", "not exFAT"
+        self.bps = 1 << bs[108]                         # the volume's sector size
         (self.fat_off, self.fat_len, self.heap_off, self.nclus, self.root) = struct.unpack_from("<IIIII", bs, 80)
-        self.bps = 1 << bs[108]
         self.cbytes = self.bps << bs[109]
         self.bitmap = self.upcase_first = None
         self.up = {}
@@ -224,6 +224,61 @@ class ExFat:
         self._add_set(d, name, attr, first if data else 0, len(data), True)
         if not data:                                    # nothing allocated after all
             self.bm[(first - 2) // 8] &= ~(1 << ((first - 2) % 8))
+
+    def alloc_run(self, n):
+        """n free clusters in a row, marked in the bitmap (fast, for big files)."""
+        run = 0
+        for c in range(2, self.nclus + 2):
+            byte = self.bm[(c - 2) // 8]
+            if byte == 0xFF and (c - 2) % 8 == 0:
+                run = 0
+                continue
+            used = byte >> ((c - 2) % 8) & 1
+            run = 0 if used else run + 1
+            if run == n:
+                start = c - n + 1
+                for k in range(start, start + n):
+                    self.bm[(k - 2) // 8] |= 1 << ((k - 2) % 8)
+                return start
+        raise OSError("disk full")
+
+    def write_sparse(self, path, size, pieces):
+        """A contiguous file of size bytes, valid to its end; only pieces
+        ({offset: bytes}) are written (a sparse image reads zeros elsewhere)."""
+        d, name = self._dir_of(path)
+        n = (size + self.cbytes - 1) // self.cbytes
+        first = self.alloc_run(n)
+        for off, data in pieces.items():
+            self.f.seek(self.clus_pos(first) + off)
+            self.f.write(data)
+        self._add_set(d, name, 0x20, first, size, True)
+
+    def read_at(self, path, off, n):
+        e = self.lookup(path)
+        if e.contig:
+            self.f.seek(self.clus_pos(e.first) + off)
+            return self.f.read(n)
+        chain = self.chain(e.first, False, e.size)
+        out = b""
+        while n:
+            c = chain[off // self.cbytes]
+            k = min(n, self.cbytes - off % self.cbytes)
+            self.f.seek(self.clus_pos(c) + off % self.cbytes)
+            out += self.f.read(k)
+            off += k
+            n -= k
+        return out
+
+    def entry_raw(self, path):
+        """The File entry (32 bytes) of path, for its timestamps."""
+        e = self.lookup(path)
+        parts = [p for p in path.replace("\\", "/").split("/") if p]
+        d = self.lookup("/".join(parts[:-1])) if len(parts) > 1 else None
+        first, contig, length = (self.root, False, 0) if d is None else (d.first, d.contig, d.size)
+        for idx, t, ent in self.raw_entries(first, contig, length):
+            if idx == e.idx:
+                return ent
+        return None
 
     def mkdir(self, path):
         d, name = self._dir_of(path)

@@ -225,14 +225,30 @@ static void emulate(struct vm *vm, struct regs *r)
     case 0xCD: {                                /* INT n */
         uint8_t n = *lin(r->cs, ip);
         uint16_t next = (uint16_t)(ip + 1);
+        if (n == 0x21 && (r->eax & 0xFF00) == 0x7100) {
+            int how = lfn_int21(vm, r);         /* a long-name call (lfn.c) */
+            if (how == LFN_DONE) {
+                r->eip = next;
+                return;
+            }
+            if (how == LFN_REWRITE) {           /* as an INT to its routine, which calls DOS */
+                uint16_t seg, off = lfn_stub(&seg);
+                push16(r, (uint16_t)vm_flags(vm, r));
+                push16(r, (uint16_t)r->cs);
+                push16(r, next);
+                r->cs = seg;
+                r->eip = off;
+                return;
+            }
+        }
         if (n == 0x2F && (r->eax & 0xFF00) == 0x1100 && redir_int2f(vm, r)) {
             r->eip = next;                      /* the redirector answered (redir.c) */
             return;
         }
-        if (n == 0x13 && (r->edx & 0x80) && ata_bios_owned((uint8_t)r->edx)) {
-            r->eax = (r->eax & 0xFFFF00FFu) | 0xAA00;   /* the VMM's disk: "not ready" */
-            r->eflags |= EFLAGS_CF;
-            r->eip = next;
+        struct disk *d;
+        if (n == 0x13 && (r->edx & 0x80) && (d = ata_bios_disk((uint8_t)r->edx))) {
+            r->eip = next;                      /* the VMM's disk: it does the call (int13.c) */
+            int13_emulate(d, r);
             return;
         }
         switch (dosmgr_int(vm, r, n, next)) {

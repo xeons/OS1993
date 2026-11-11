@@ -124,52 +124,50 @@ README.md for what already works.
 
 ## File systems
 
-The VMM has its own IDE driver and FAT12/16/32 (README: Disks and file
-systems); DOS reaches its volumes through the redirector.
+The VMM has its own IDE driver, FAT12/16/32, exFAT and ext2 (README: Disks
+and file systems); DOS reaches their volumes through the redirector.
 
 - [x] Native disk access in the VMM: an IDE/ATA driver, MBR and extended
-      partitions, a block cache; the channels away from the boot disk are
-      the VMM's alone (V86 ports hidden, INT 13h refused).
-- [ ] INT 13h done by the VMM for DOS (32-bit disk access, as WDCTRL), so a
-      disk sharing a channel with the boot disk -- or the boot disk's other
-      partitions -- can be the VMM's too. Interrupt-driven transfers.
-- [ ] LBA48 (disks over 128 GB); sector sizes other than 512.
-- [x] DOS sees them as drive letters through a network redirector
+      partitions, superfloppies, a write-behind block cache.
+- [x] INT 13h done by the VMM for DOS (32-bit disk access), so every IDE
+      channel without an ATAPI device is the VMM's, the boot disk's too.
+      Interrupt-driven transfers. LBA48.
+- [x] DOS sees the volumes as drive letters through a network redirector
       (INT 2Fh AH=11h); volumes DOS had mounted keep their letters and go
       back to DOS when OS1993 ends.
-- [ ] The redirector's limits: DOS programs see only the 8.3 aliases (an
-      LFN API, INT 21h AX=71xxh, as Win95 gave them); share modes and
-      locks are accepted, not enforced; findfirst state in the DTA holds a
-      16-bit entry index.
+- [x] Long names for DOS programs (INT 21h AX=71xxh); share modes and
+      byte-range locks enforced, between DOS and OS1993 programs; searches
+      kept by the VMM.
 - [x] FAT12, FAT16 and FAT32 natively (FSInfo, VFAT long names, NT case
-      bits).
-- [ ] FAT: write-behind (now every call writes through when it returns);
-      a dirty-volume bit; a free-cluster bitmap instead of walking the FAT.
+      bits, the clean-unmount bit, a free-cluster bitmap).
 - [x] A volume ops table (`kernel/fs/fsimpl.h`), so file systems plug in beside FAT.
 - [x] exFAT (allocation bitmap, up-case table, checksummed entry sets,
-      contiguous files with FAT chains when they must).
-- [ ] exFAT: files over 4 GB (64-bit sizes through the API); the
-      VolumeDirty flag and PercentInUse; TexFAT's second FAT and bitmap;
-      sector sizes other than 512; names outside Latin-1 (the up-case
-      table beyond 256; UTF-16 names show as '_'); DOS aliases are made
-      from the name hash and can collide (one of the two is then out of
-      DOS's reach); timestamps' 10 ms and UTC offset fields.
-- [x] ext2 (block groups, indirect blocks, UTF-8 names, permissions as
-      the read-only attribute, symbolic links read as their target).
-- [ ] ext2: block sizes over 4 KB; files over 4 GB (large_file sizes are
-      read, writes stop at 4 GB); hard links and symbolic links can't be
-      made; owners and permissions beyond the write bit; extended
-      attributes are kept but not shown; times as UTC with a time zone;
-      lost+found isn't used (e2fsck's job).
+      contiguous files with FAT chains when they must, files over 4 GB,
+      sectors to 4 KB, VolumeDirty and PercentInUse, 10 ms and UTC offset
+      fields, numbered DOS aliases).
+- [x] ext2 (block groups, indirect blocks, blocks to 64 KB, files over
+      4 GB, UTF-8 names, permissions as the read-only attribute, hard and
+      symbolic links, UTC times through the time zone, numbered DOS
+      aliases).
+- [x] 64-bit file sizes and positions through the API (SetFilePointerEx,
+      GetFileSizeEx, size_high); the time zone (SetTimeZoneInformation,
+      OS1993.INI).
 - [ ] ext3: journal replay so a volume that wasn't unmounted can be read
       (now: mounted read-only as it is), then journalled writes.
 - [ ] ext4: extents, 64-bit block numbers, flex_bg, htree directories,
       CRC32C metadata checksums -- read-only first (now: not mounted).
 - [ ] btrfs, read-only (CoW B-trees, chunk tree, checksums, zlib/LZO/zstd).
-- [ ] 64-bit offsets everywhere without libgcc's division; caches that fit
-      in 16 MB.
 - [ ] Long names in DOS's own drives for OS1993 programs (the VMM taking
-      over C: too, as Win95 did).
+      over C: too, as Win95 did, now that it drives the disk; DOS's open
+      files on C: are the obstacle).
+- [ ] Daylight saving time (TIME_ZONE_INFORMATION's other half).
+- Not planned: TexFAT (exFAT with two FATs; only Windows CE uses it, and
+  desktop Windows doesn't mount it); ATAPI and 4 KB-sector drives (none
+  speak ATA PIO with 512-byte sectors); Unix owners, permissions and
+  extended attributes on ext2 (no Win32-style call would show them);
+  filling lost+found (e2fsck's job); names outside Latin-1 (the system's
+  character set: such characters show as '_', and the alias still opens
+  the file).
 
 ## DOS virtual machines
 

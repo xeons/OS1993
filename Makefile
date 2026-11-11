@@ -331,8 +331,12 @@ qemu-threads: all $(QEMU_ROM)
 qemu-net: all $(QEMU_ROM)
 	@tools/qemu-net-test.py
 
-qemu-fat: all $(QEMU_ROM)
+$(BUILD)/LFNTEST.COM: test/dos/lfntest.asm
+	nasm -f bin -o $@ $<
+
+qemu-fat: all $(QEMU_ROM) $(BUILD)/LFNTEST.COM
 	@tools/qemu-fat-test.py
+	@tools/qemu-fat-test.py --primary-slave
 
 check486: $(BUILD)/vmm.elf $(MODULE_ELFS)
 	@for f in $^; do tools/check486.sh $(OBJDUMP) $$f || exit 1; done

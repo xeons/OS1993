@@ -64,6 +64,7 @@ void files_close_all(struct proc_files *pf)
 {
     for (int i = 0; i < FILE_MAX; i++)
         if (pf->nf[i]) {
+            fs_share_close(pf->nf[i], (uintptr_t)&pf->nf[i]);
             fs_close(pf->nf[i]);
             pf->nf[i] = NULL;
         }
@@ -228,6 +229,11 @@ static int open_file(struct proc_files *pf, struct file_args *a)
             pf->nf[slot] = NULL;
             return rc;
         }
+        if ((rc = fs_share_open(pf->nf[slot], (uintptr_t)&pf->nf[slot], (a->a & GENERIC_READ) || !wr, wr, 4)) < 0) {
+            fs_close(pf->nf[slot]);                     /* a DOS program said deny */
+            pf->nf[slot] = NULL;
+            return rc;
+        }
         pf->pos[slot] = 0;
         pf->wr[slot] = wr;
         return HANDLE_BASE + slot;
@@ -268,7 +274,10 @@ static int transfer(struct proc_files *pf, struct file_args *a, bool write)
             return -ERROR_ACCESS_DENIED;
         if (!a->len)
             return 0;
-        int rc = write ? fs_write(pf->nf[s], pf->pos[s], (const void *)(uintptr_t)ubuf, a->len)
+        int rc = fs_lock_check(pf->nf[s], (uintptr_t)&pf->nf[s], pf->pos[s], a->len);
+        if (rc < 0)
+            return rc;
+        rc = write ? fs_write(pf->nf[s], pf->pos[s], (const void *)(uintptr_t)ubuf, a->len)
                        : fs_read(pf->nf[s], pf->pos[s], (void *)(uintptr_t)ubuf, a->len);
         if (rc > 0)
             pf->pos[s] += (uint32_t)rc;
@@ -341,7 +350,8 @@ static int put_entry(const struct fs_entry *e, struct file_args *a)
     struct find_data fd;
     memset(&fd, 0, sizeof fd);
     fd.attrib = e->attr;
-    fd.size = e->size;
+    fd.size = (uint32_t)e->size;
+    fd.size_high = (uint32_t)(e->size >> 32);
     fd.time = e->time;
     fd.date = e->date;
     copy_str(fd.name, e->name, sizeof fd.name);
@@ -361,7 +371,8 @@ static int native_op(struct proc_files *pf, uint32_t op, struct file_args *a, bo
     *handled = true;
     switch (op) {
     case FOP_CLOSE: case FOP_SEEK: case FOP_SIZE: case FOP_TRUNCATE: case FOP_FLUSH:
-    case FOP_GETTIME: case FOP_SETTIME: {
+    case FOP_GETTIME: case FOP_SETTIME: case FOP_LOCK: case FOP_UNLOCK: case FOP_SEEK64:
+    case FOP_SIZE64: {
         if ((s = slot_of(pf, a->handle)) < 0 || !pf->nf[s]) {
             *handled = false;
             return 0;
@@ -369,22 +380,45 @@ static int native_op(struct proc_files *pf, uint32_t op, struct file_args *a, bo
         struct fnode *n = pf->nf[s];
         switch (op) {
         case FOP_CLOSE:
+            fs_share_close(n, (uintptr_t)&pf->nf[s]);
             fs_close(n);
             pf->nf[s] = NULL;
             return 0;
-        case FOP_SEEK: {
+        case FOP_LOCK:
+        case FOP_UNLOCK:
+            return fs_lock_range(n, (uintptr_t)&pf->nf[s], (uint64_t)a->c << 32 | a->a,
+                                 (uint64_t)a->d << 32 | a->b, op == FOP_UNLOCK);
+        case FOP_SEEK:
+        case FOP_SEEK64: {
             int64_t base = a->b == FILE_BEGIN ? 0 : a->b == FILE_CURRENT ? (int64_t)pf->pos[s]
                          : a->b == FILE_END ? (int64_t)fs_size(n) : -1;
             if (base < 0)
                 return -ERROR_INVALID_PARAMETER;
-            int64_t to = base + (int32_t)a->a;
-            if (to < 0 || to > 0x7FFFFFFF)
-                return -ERROR_INVALID_PARAMETER;
-            pf->pos[s] = (uint32_t)to;
-            return (int)to;
+            int64_t dist = op == FOP_SEEK64 ? (int64_t)((uint64_t)a->c << 32 | a->a) : (int32_t)a->a;
+            int64_t to = base + dist;
+            if (to < 0)
+                return -ERROR_NEGATIVE_SEEK;
+            if (op == FOP_SEEK) {
+                if (to > 0x7FFFFFFF)
+                    return -ERROR_INVALID_PARAMETER;    /* SetFilePointerEx for that */
+                pf->pos[s] = (uint64_t)to;
+                return (int)to;
+            }
+            if (!user_writable((uint32_t)(uintptr_t)a->buf, 8))
+                return -ERROR_NOACCESS;
+            pf->pos[s] = (uint64_t)to;
+            memcpy(a->buf, &pf->pos[s], 8);
+            return 0;
         }
         case FOP_SIZE:
-            return (int)fs_size(n);
+            return fs_size(n) > 0x7FFFFFFF ? -ERROR_INVALID_PARAMETER : (int)fs_size(n);
+        case FOP_SIZE64: {
+            uint64_t sz = fs_size(n);
+            if (!user_writable((uint32_t)(uintptr_t)a->buf, 8))
+                return -ERROR_NOACCESS;
+            memcpy(a->buf, &sz, 8);
+            return 0;
+        }
         case FOP_TRUNCATE:
             return pf->wr[s] ? fs_set_size(n, pf->pos[s]) : -ERROR_ACCESS_DENIED;
         case FOP_FLUSH:
@@ -440,13 +474,15 @@ static int native_op(struct proc_files *pf, uint32_t op, struct file_args *a, bo
             return 0;
         }
     case FOP_DELETE: case FOP_MKDIR: case FOP_RMDIR: case FOP_RENAME: case FOP_ATTRIB:
-    case FOP_SETCWD: case FOP_FIND_FIRST: case FOP_SETATTR:
+    case FOP_SETCWD: case FOP_FIND_FIRST: case FOP_SETATTR: case FOP_LINK: case FOP_SYMLINK:
         if (!a->path || !user_string((uint32_t)(uintptr_t)a->path, path, sizeof path) ||
             !resolve(pf, path, path)) {
             *handled = false;                           /* DOS's path reports it */
             return 0;
         }
         if (!(v = native(path, &rest))) {
+            if (op == FOP_LINK || op == FOP_SYMLINK)
+                return -ERROR_NOT_SUPPORTED;            /* DOS's drives (FAT) have no links */
             if (op != FOP_RENAME) {
                 *handled = false;
                 return 0;
@@ -483,6 +519,17 @@ static int native_op(struct proc_files *pf, uint32_t op, struct file_args *a, bo
         if (native(path2, &rest2) != v)
             return -ERROR_NOT_SAME_DEVICE;
         return fs_rename(v, rest, rest2);
+    case FOP_LINK:
+        if (!a->path2 || !user_string((uint32_t)(uintptr_t)a->path2, path2, sizeof path2) ||
+            !resolve(pf, path2, path2))
+            return -ERROR_INVALID_NAME;
+        if (native(path2, &rest2) != v)
+            return -ERROR_NOT_SAME_DEVICE;
+        return fs_link(v, rest, rest2);
+    case FOP_SYMLINK:                                   /* the target is kept as given */
+        if (!a->path2 || !user_string((uint32_t)(uintptr_t)a->path2, path2, sizeof path2))
+            return -ERROR_INVALID_NAME;
+        return fs_symlink(v, rest, path2);
     case FOP_ATTRIB:
         if ((rc = fs_stat(v, rest, &e)) < 0)
             return rc;
@@ -549,16 +596,26 @@ int file_op(struct proc_files *pf, uint32_t op, struct file_args *a)
         r.ebx = (uint32_t)pf->dos[s];
         pf->dos[s] = -1;
         return dos(&r);
-    case FOP_SEEK: {
+    case FOP_SEEK:
+    case FOP_SEEK64: {
         uint32_t pos;
         if ((s = slot_of(pf, a->handle)) < 0)
             return -ERROR_INVALID_HANDLE;
         if (a->b > FILE_END)
             return -ERROR_INVALID_PARAMETER;
+        if (op == FOP_SEEK64 && (int32_t)a->c != ((int32_t)a->a >> 31))
+            return -ERROR_INVALID_PARAMETER;            /* DOS's files stop at 4 GB */
         rc = seek(pf->dos[s], (int32_t)a->a, (int)a->b, &pos);
-        return rc < 0 ? rc : (int)pos;
+        if (rc < 0 || op == FOP_SEEK)
+            return rc < 0 ? rc : (int)pos;
+        uint64_t p64 = pos;
+        if (!user_writable((uint32_t)(uintptr_t)a->buf, 8))
+            return -ERROR_NOACCESS;
+        memcpy(a->buf, &p64, 8);
+        return 0;
     }
-    case FOP_SIZE: {
+    case FOP_SIZE:
+    case FOP_SIZE64: {
         uint32_t cur, end;
         if ((s = slot_of(pf, a->handle)) < 0)
             return -ERROR_INVALID_HANDLE;
@@ -566,7 +623,13 @@ int file_op(struct proc_files *pf, uint32_t op, struct file_args *a)
             (rc = seek(pf->dos[s], 0, FILE_END, &end)) < 0)
             return rc;
         seek(pf->dos[s], (int32_t)cur, FILE_BEGIN, NULL);
-        return (int)end;
+        if (op == FOP_SIZE)
+            return (int)end;
+        uint64_t e64 = end;
+        if (!user_writable((uint32_t)(uintptr_t)a->buf, 8))
+            return -ERROR_NOACCESS;
+        memcpy(a->buf, &e64, 8);
+        return 0;
     }
     case FOP_DELETE:
     case FOP_MKDIR:
@@ -655,6 +718,13 @@ int file_op(struct proc_files *pf, uint32_t op, struct file_args *a)
         }
         return 0;
     }
+    case FOP_LOCK:
+    case FOP_UNLOCK:                                    /* INT 21h AH=5Ch (SHARE, if loaded) */
+        if ((s = slot_of(pf, a->handle)) < 0)
+            return -ERROR_INVALID_HANDLE;
+        r = (struct v86_regs){ .eax = 0x5C00u | (op == FOP_UNLOCK), .ebx = (uint32_t)pf->dos[s],
+                               .ecx = a->a >> 16, .edx = a->a & 0xFFFF, .esi = a->b >> 16, .edi = a->b & 0xFFFF };
+        return dos(&r);
     case FOP_SETATTR:
         if ((rc = user_path(pf, a->path, 0, path)) < 0)
             return rc;

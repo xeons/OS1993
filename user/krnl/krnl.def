@@ -57,6 +57,14 @@ EXPORTS
     GetModuleFileName
     SetEndOfFile
     FlushFileBuffers
+    LockFile
+    UnlockFile
+    SetFilePointerEx
+    GetFileSizeEx
+    CreateHardLink
+    CreateSymbolicLink
+    GetTimeZoneInformation
+    SetTimeZoneInformation
     SetFileAttributes
     GetFullPathName
     GetDiskFreeSpace

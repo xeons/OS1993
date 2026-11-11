@@ -19,7 +19,7 @@ struct fs_find;
 struct proc_files {
     int16_t dos[FILE_MAX];              /* DOS handles, -1 free */
     struct fnode *nf[FILE_MAX];         /* ... or a file on the VMM's own disks */
-    uint32_t pos[FILE_MAX];             /* ... and its file pointer */
+    uint64_t pos[FILE_MAX];             /* ... and its file pointer */
     bool    wr[FILE_MAX];               /* ... opened for writing */
     struct { bool used; uint8_t dta[43]; struct fs_find *nat; } find[FIND_MAX];
     char    cwd[PATH_MAX];              /* "C:\OS1993" */

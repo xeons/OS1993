@@ -1476,10 +1476,18 @@ static void read_time(struct systime *t)
 
 void rtc_dos_time(uint16_t *date, uint16_t *time)
 {
+    rtc_dos_time_odd(date, time, NULL);
+}
+
+/* ... and *odd: the second DOS's two-second times leave out (0 or 1). */
+void rtc_dos_time_odd(uint16_t *date, uint16_t *time, uint8_t *odd)
+{
     struct systime t;
     read_time(&t);
     *date = (uint16_t)((t.year - 1980) << 9 | t.month << 5 | t.day);
     *time = (uint16_t)(t.hour << 11 | t.minute << 5 | t.second / 2);
+    if (odd)
+        *odd = (uint8_t)(t.second & 1);
 }
 
 /* ---- INT 30h ------------------------------------------------------------------ */
@@ -1667,6 +1675,11 @@ void syscall_dispatch(struct regs *r)
         r->eax = (uint32_t)rc;
         break;
     }
+    case SYS_TIMEZONE:
+        if (r->ebx == 1)
+            fs_set_timezone((int32_t)r->ecx);
+        r->eax = (uint32_t)fs_timezone();
+        break;
     case SYS_MEMINFO: {
         struct mem_info mi = { pmm_total_pages(), pmm_free_pages(),
                                (PAGE_ALIGN_UP(self->heap_end) - USER_HEAP) / PAGE_SIZE +

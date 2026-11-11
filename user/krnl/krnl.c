@@ -98,6 +98,22 @@ bool AcquireLock(int n)                     { return sys_lock(n) == 0; }
 bool ReleaseLock(int n)                     { return sys_unlock(n) == 0; }
 void GetLocalTime(SYSTEMTIME *t)            { sys_time(t); }
 
+uint32_t GetTimeZoneInformation(TIME_ZONE_INFORMATION *tz)
+{
+    memset(tz, 0, sizeof *tz);
+    tz->Bias = sys_timezone(0, 0);
+    return 0;                                           /* TIME_ZONE_ID_UNKNOWN: no daylight saving */
+}
+
+bool SetTimeZoneInformation(const TIME_ZONE_INFORMATION *tz)
+{
+    if (tz->Bias < -14 * 60 || tz->Bias > 14 * 60) {
+        k_error(ERROR_INVALID_PARAMETER);
+        return false;
+    }
+    return sys_timezone(1, tz->Bias) == tz->Bias;
+}
+
 /* A DLL that holds a lock across calls (UI.DLL's window manager lock) lets
  * go of it whenever its process is about to sleep. */
 void SetWaitHooks(void (*before)(void), void (*after)(void))
@@ -284,6 +300,54 @@ static bool handle_op(uint32_t op, HANDLE h)
 
 bool SetEndOfFile(HANDLE h)      { return handle_op(FOP_TRUNCATE, h); }
 bool FlushFileBuffers(HANDLE h)  { return handle_op(FOP_FLUSH, h); }
+
+static bool lock_op(uint32_t op, HANDLE h, uint32_t off_lo, uint32_t off_hi, uint32_t len_lo, uint32_t len_hi)
+{
+    struct file_args a = { .handle = (uint32_t)h, .a = off_lo, .c = off_hi, .b = len_lo, .d = len_hi };
+    return file_call(op, &a) >= 0;
+}
+
+bool LockFile(HANDLE h, uint32_t off_lo, uint32_t off_hi, uint32_t len_lo, uint32_t len_hi)
+{
+    return lock_op(FOP_LOCK, h, off_lo, off_hi, len_lo, len_hi);
+}
+
+bool UnlockFile(HANDLE h, uint32_t off_lo, uint32_t off_hi, uint32_t len_lo, uint32_t len_hi)
+{
+    return lock_op(FOP_UNLOCK, h, off_lo, off_hi, len_lo, len_hi);
+}
+
+bool CreateHardLink(const char *path, const char *existing, void *security)
+{
+    (void)security;
+    struct file_args a = { .path = existing, .path2 = path };
+    return file_call(FOP_LINK, &a) >= 0;
+}
+
+bool CreateSymbolicLink(const char *link, const char *target, uint32_t flags)
+{
+    (void)flags;                                        /* a file or a directory: the same here */
+    struct file_args a = { .path = link, .path2 = target };
+    return file_call(FOP_SYMLINK, &a) >= 0;
+}
+
+bool SetFilePointerEx(HANDLE h, int64_t distance, int64_t *new_pos, int method)
+{
+    int64_t pos = 0;
+    struct file_args a = { .handle = (uint32_t)h, .a = (uint32_t)distance, .c = (uint32_t)((uint64_t)distance >> 32),
+                           .b = (uint32_t)method, .buf = &pos };
+    if (file_call(FOP_SEEK64, &a) < 0)
+        return false;
+    if (new_pos)
+        *new_pos = pos;
+    return true;
+}
+
+bool GetFileSizeEx(HANDLE h, int64_t *size)
+{
+    struct file_args a = { .handle = (uint32_t)h, .buf = size };
+    return file_call(FOP_SIZE64, &a) >= 0;
+}
 
 bool SetFileAttributes(const char *path, uint32_t attributes)
 {

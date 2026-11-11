@@ -14,6 +14,8 @@
 #include "user.h"
 
 void net_tick(void);                    /* net.c */
+void ata_tick(void);                    /* ata.c */
+void cache_tick(void);                  /* cache.c */
 
 #define BDA_TICKS     0x46C
 #define BDA_MIDNIGHT  0x470
@@ -28,6 +30,8 @@ static void timer_irq(struct regs *r)
     sched_tick();
     user_tick();
     net_tick();
+    ata_tick();
+    cache_tick();
     if (vm_timer_tick())
         return;                 /* shared with every VM (vm.c) */
     uint32_t t = LOWMEM32(BDA_TICKS) + 1;

@@ -54,6 +54,7 @@
 #define RO_KNOWN      (RO_SPARSE | RO_LARGE)
 #define FT_REG        1
 #define FT_DIR        2
+#define FT_SYMLINK    7
 
 #define NODE_MAX  32
 #define VOLS      4
@@ -71,7 +72,7 @@ struct evol {
     struct vol h;
     struct disk *disk;
     uint32_t start;
-    uint32_t bsize, spb, ppb;           /* block bytes, sectors per block, pointers per block */
+    uint32_t bsize, spb, ppb, bshift;   /* block bytes (1 << bshift), sectors, pointers per block */
     uint32_t nblocks, ninodes, first_data, bpg, ipg, ngroups;
     uint32_t inode_size, first_ino;
     uint16_t extra_isize;
@@ -110,12 +111,17 @@ static uint32_t le32(const uint8_t *p) { return p[0] | p[1] << 8 | p[2] << 16 | 
 static void put16(uint8_t *p, uint32_t v) { p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); }
 static void put32(uint8_t *p, uint32_t v) { put16(p, v); put16(p + 2, v >> 16); }
 
+/* ext2 keeps UTC; the RTC and DOS keep local time. */
 static uint32_t now_unix(void)
 {
     uint16_t d, t;
-    rtc_dos_time(&d, &t);
-    return fs_dos_to_unix(d, t);
+    uint8_t odd;
+    rtc_dos_time_odd(&d, &t, &odd);
+    return fs_dos_to_unix(d, t) + odd + (uint32_t)(fs_timezone() * 60);
 }
+
+static uint32_t local_to_unix(uint16_t d, uint16_t t) { return fs_dos_to_unix(d, t) + (uint32_t)(fs_timezone() * 60); }
+static void unix_to_local(uint32_t u, uint16_t *d, uint16_t *t) { fs_unix_to_dos(u - (uint32_t)(fs_timezone() * 60), d, t); }
 
 /* ---- blocks ------------------------------------------------------------------------- */
 
@@ -206,8 +212,7 @@ static int done(struct evol *v, int rc)
         rc = mrc;
     if (v->changed) {
         v->changed = false;
-        if (cache_sync() < 0 && rc >= 0)
-            rc = -ERROR_GEN_FAILURE;
+        /* write-behind: the cache writes it out (cache.c) */
     }
     fs_unlock();
     return rc;
@@ -359,7 +364,32 @@ static int inode_write(struct evol *v, uint32_t ino, const uint8_t raw[128])
 }
 
 static uint16_t i_mode(const uint8_t *r)   { return le16(r); }
-static uint32_t i_size(const uint8_t *r)   { return le32(r + 108) && (i_mode(r) & S_IFMT) == S_IFREG ? 0xFFFFFFFFu : le32(r + 4); }
+static uint64_t i_size(const uint8_t *r)
+{
+    uint64_t s = le32(r + 4);
+    if ((i_mode(r) & S_IFMT) == S_IFREG)
+        s |= (uint64_t)le32(r + 108) << 32;             /* large_file: i_size_high */
+    return s;
+}
+
+static void set_isize(struct evol *v, uint8_t *r, uint64_t s)
+{
+    put32(r + 4, (uint32_t)s);
+    if ((i_mode(r) & S_IFMT) == S_IFREG) {
+        put32(r + 108, (uint32_t)(s >> 32));
+        if (s >= 0x80000000u) {                         /* a file of 2 GB or more: say so */
+            struct buf *b = bread(v->disk, v->start + 2);
+            if (b) {
+                if (!(le32(b->data + 100) & RO_LARGE)) {
+                    put32(b->data + 100, le32(b->data + 100) | RO_LARGE);
+                    bdirty(b);
+                    v->changed = true;
+                }
+                brelse(b);
+            }
+        }
+    }
+}
 static uint16_t i_links(const uint8_t *r)  { return le16(r + 26); }
 
 /* A new inode (zeroed, its whole size) near group g0. */
@@ -426,8 +456,18 @@ static int free_inode(struct evol *v, uint32_t ino, bool dir)
 
 /* Block lb of the file; 0 for a hole. With alloc, holes are filled (zeroed
  * indirect blocks, data blocks left for the caller to fill). */
+static int bmap2(struct evol *v, uint8_t *raw, uint32_t lb, bool alloc, uint32_t *goal, uint32_t *out, bool *fresh);
+
 static int bmap(struct evol *v, uint8_t *raw, uint32_t lb, bool alloc, uint32_t *goal, uint32_t *out)
 {
+    bool fresh;
+    return bmap2(v, raw, lb, alloc, goal, out, &fresh);
+}
+
+/* fresh: the data block was allocated just now (its old bytes are still there). */
+static int bmap2(struct evol *v, uint8_t *raw, uint32_t lb, bool alloc, uint32_t *goal, uint32_t *out, bool *fresh)
+{
+    *fresh = false;
     uint32_t ppb = v->ppb, depth, idx[4], slot;
     if (lb < 12) {
         depth = 0;
@@ -463,6 +503,8 @@ static int bmap(struct evol *v, uint8_t *raw, uint32_t lb, bool alloc, uint32_t 
         *goal = b + 1;
         if (depth)
             zero_block(v, b);
+        else
+            *fresh = true;
         put32(raw + 40 + slot * 4, b);
         put32(raw + 28, le32(raw + 28) + v->spb);       /* i_blocks, in sectors */
     }
@@ -480,6 +522,8 @@ static int bmap(struct evol *v, uint8_t *raw, uint32_t lb, bool alloc, uint32_t 
             *goal = next + 1;
             if (d + 1 < depth)
                 zero_block(v, next);
+            else
+                *fresh = true;
             if (wr32(v, b, idx[d] * 4, next) < 0)
                 return -ERROR_GEN_FAILURE;
             put32(raw + 28, le32(raw + 28) + v->spb);
@@ -548,19 +592,24 @@ static void truncate_blocks(struct evol *v, uint8_t *raw, uint32_t keep)
 
 /* ---- file data ----------------------------------------------------------------------------- */
 
-static int data_io(struct evol *v, uint8_t *raw, uint32_t *goal, uint32_t pos, uint8_t *buf, uint32_t len,
+static int data_io(struct evol *v, uint8_t *raw, uint32_t *goal, uint64_t pos, uint8_t *buf, uint32_t len,
                    bool write, bool *raw_changed)
 {
     uint32_t done_n = 0;
     while (done_n < len) {
-        uint32_t lb = pos / v->bsize, in = pos % v->bsize, pb;
+        if ((pos >> v->bshift) > 0xFFFFFFFFu)
+            return done_n ? (int)done_n : -ERROR_FILE_TOO_LARGE;
+        uint32_t lb = (uint32_t)(pos >> v->bshift), in = (uint32_t)pos & (v->bsize - 1), pb;
         uint32_t blocks_before = le32(raw + 28);
-        int rc = bmap(v, raw, lb, write, goal, &pb);
+        bool fresh;
+        int rc = bmap2(v, raw, lb, write, goal, &pb, &fresh);
         if (le32(raw + 28) != blocks_before)
             *raw_changed = true;
         if (rc < 0)
             return done_n ? (int)done_n : rc;
         uint32_t chunk = v->bsize - in < len - done_n ? v->bsize - in : len - done_n;
+        if (fresh && chunk != v->bsize)
+            zero_block(v, pb);                          /* no old bytes around a partial write */
         if (!pb) {                                      /* a hole */
             memset(buf + done_n, 0, chunk);
         } else if (in % SECTOR == 0 && chunk % SECTOR == 0 && buf) {
@@ -571,7 +620,7 @@ static int data_io(struct evol *v, uint8_t *raw, uint32_t *goal, uint32_t pos, u
                 cache_forget(v->disk, lba, n);
                 v->changed = true;
             } else {
-                cache_sync();
+                cache_flush_range(v->disk, lba, n);
                 if (ata_read(v->disk, lba, n, buf + done_n) < 0)
                     return done_n ? (int)done_n : -ERROR_GEN_FAILURE;
             }
@@ -711,6 +760,23 @@ static int dir_next(struct evol *v, uint8_t *draw, uint32_t *off, struct dent *e
     return 0;
 }
 
+/* DOS's alias for a record: numbered past the earlier records sharing it. */
+static void alias_of(struct evol *v, uint8_t *draw, const struct dent *e, uint8_t fcb[11], char *alias)
+{
+    if (!fs_make_alias(e->name, fs_hash16(e->raw), fcb, alias))
+        return;
+    static struct dent o;
+    uint32_t off = 0;
+    int n = 1;
+    while (dir_next(v, draw, &off, &o) > 0 && o.off < e->off) {
+        uint8_t f2[11];
+        char a2[13];
+        n += fs_make_alias(o.name, fs_hash16(o.raw), f2, a2) && !memcmp(f2, fcb, 11);
+    }
+    if (n > 1 && n <= 9)
+        fs_alias_number(fcb, alias, n);
+}
+
 static int dir_find(struct evol *v, uint32_t dino, const char *name, struct dent *e)
 {
     uint8_t draw[128];
@@ -721,10 +787,13 @@ static int dir_find(struct evol *v, uint32_t dino, const char *name, struct dent
     char want[256];
     if (to_utf8(name, want) < 0)
         return -ERROR_FILE_NOT_FOUND;
+    uint8_t base[11];
+    int want_n = 0;
+    bool numbered = fs_alias_parse(name, base, &want_n);
     /* the exact bytes first, then any case (in Latin-1), then an alias */
     for (int pass = 0; pass < 3; pass++) {
         uint32_t off = 0;
-        int rc;
+        int rc, seen = 0;
         while ((rc = dir_next(v, draw, &off, e)) > 0) {
             if (pass == 0 && !strcmp(e->raw, want))
                 return 0;
@@ -733,8 +802,10 @@ static int dir_find(struct evol *v, uint32_t dino, const char *name, struct dent
             if (pass == 2) {
                 uint8_t fcb[11];
                 char alias[13];
-                fs_make_alias(e->name, fs_hash16(e->raw), fcb, alias);
-                if (fs_name_eq(alias, name))
+                bool hashed = fs_make_alias(e->name, fs_hash16(e->raw), fcb, alias);
+                if (!hashed && fs_name_eq(alias, name))
+                    return 0;
+                if (numbered && hashed && !memcmp(fcb, base, 11) && ++seen == want_n)
                     return 0;
             }
         }
@@ -943,10 +1014,14 @@ static uint8_t attr_of(const uint8_t *raw, const char *name)
     return a;
 }
 
-static void fill_entry(const struct dent *d, const uint8_t *raw, struct fs_entry *e)
+/* draw: the directory, to number the alias (NULL: as it comes) */
+static void fill_entry(struct evol *v, uint8_t *draw, const struct dent *d, const uint8_t *raw, struct fs_entry *e)
 {
     memcpy(e->name, d->name, strlen(d->name) + 1);
-    fs_make_alias(d->name, fs_hash16(d->raw), e->fcb_name, e->short_name);
+    if (draw)
+        alias_of(v, draw, d, e->fcb_name, e->short_name);
+    else
+        fs_make_alias(d->name, fs_hash16(d->raw), e->fcb_name, e->short_name);
     if (is_dots(d->name)) {
         memset(e->fcb_name, ' ', 11);
         memcpy(e->fcb_name, d->name, strlen(d->name));
@@ -954,10 +1029,10 @@ static void fill_entry(const struct dent *d, const uint8_t *raw, struct fs_entry
     }
     e->attr = attr_of(raw, d->name);
     e->size = (e->attr & A_DIR) ? 0 : i_size(raw);
-    fs_unix_to_dos(le32(raw + 16), &e->date, &e->time);
-    fs_unix_to_dos(le32(raw + 12), &e->cdate, &e->ctime);
+    unix_to_local(le32(raw + 16), &e->date, &e->time);
+    unix_to_local(le32(raw + 12), &e->cdate, &e->ctime);
     uint16_t t;
-    fs_unix_to_dos(le32(raw + 8), &e->adate, &t);
+    unix_to_local(le32(raw + 8), &e->adate, &t);
     e->cluster = d->ino;
     e->lfn = strcmp(e->name, e->short_name) != 0;
 }
@@ -986,13 +1061,14 @@ struct vol *ext2_mount(struct partition *p)
         return NULL;
     }
     uint32_t log = le32(sb + 24);
-    if (log > 2) {
+    if (log > 6) {
         klog("FS: ext2 at %u: %u-byte blocks: not supported\n", p->start, 1024u << log);
         return NULL;
     }
     struct evol *v = &vols[nvols];
     *v = (struct evol){ .disk = p->disk, .start = p->start };
     v->bsize = 1024u << log;
+    v->bshift = 10 + log;
     v->spb = v->bsize / SECTOR;
     v->ppb = v->bsize / 4;
     v->ninodes = le32(sb + 0);
@@ -1035,6 +1111,8 @@ struct vol *ext2_mount(struct partition *p)
     if (inode_read(v, ROOT_INO, root) < 0 || (i_mode(root) & S_IFMT) != S_IFDIR)
         return NULL;
     v->h.ops = &ext2_ops;
+    v->h.disk = p->disk;
+    v->h.start = p->start;
     v->h.type = (compat & COMPAT_JOURNAL) ? "ext3" : "ext2";
     if (!v->ro) {
         set_state(v, false);                            /* "not clean" while it is mounted */
@@ -1096,30 +1174,28 @@ static int node_update(struct enode *n)
     return inode_write(n->v, n->ino, n->raw);
 }
 
-static int set_size(struct enode *n, uint32_t size)
+static int set_size(struct enode *n, uint64_t size)
 {
     struct evol *v = n->v;
-    uint32_t cur = le32(n->raw + 4);
-    if (size > cur) {                                   /* zeros to the new end */
-        bool ch = false;
-        int rc = data_io(v, n->raw, &n->goal, cur, NULL, size - cur, true, &ch);
-        if (rc < 0)
-            return rc;
-        put32(n->raw + 4, cur + (uint32_t)rc);
+    uint64_t cur = i_size(n->raw);
+    if (size > cur) {                                   /* longer: a hole (the last block's tail is zero) */
+        set_isize(v, n->raw, size);
         n->dirty = true;
-        return cur + (uint32_t)rc == size ? 0 : -ERROR_DISK_FULL;
+        return 0;
     }
     if (size == cur)
         return 0;
-    truncate_blocks(v, n->raw, (size + v->bsize - 1) / v->bsize);
-    if (size % v->bsize) {                              /* zero the rest of the last block */
+    uint64_t keep = (size + v->bsize - 1) >> v->bshift;
+    truncate_blocks(v, n->raw, keep > 0xFFFFFFFFu ? 0xFFFFFFFFu : (uint32_t)keep);
+    uint32_t tail = (uint32_t)size & (v->bsize - 1);
+    if (tail) {                                         /* zero the rest of the last block */
         uint32_t goal = 0, pb;
-        if (bmap(v, n->raw, size / v->bsize, false, &goal, &pb) == 0 && pb) {
+        if (bmap(v, n->raw, (uint32_t)(size >> v->bshift), false, &goal, &pb) == 0 && pb) {
             bool ch = false;
-            data_io(v, n->raw, &goal, size, NULL, v->bsize - size % v->bsize, true, &ch);
+            data_io(v, n->raw, &goal, size, NULL, v->bsize - tail, true, &ch);
         }
     }
-    put32(n->raw + 4, size);
+    set_isize(v, n->raw, size);
     n->dirty = true;
     return 0;
 }
@@ -1209,21 +1285,21 @@ static int ex2_open(struct vol *vv, const char *path, uint32_t disp, bool write,
 static bool symlink_fast(const struct evol *v, const uint8_t *raw)
 {
     uint32_t blocks = le32(raw + 28);
-    return (i_mode(raw) & S_IFMT) == S_IFLNK && le32(raw + 4) < 60 &&
+    return (i_mode(raw) & S_IFMT) == S_IFLNK && i_size(raw) < 60 &&
            (blocks == 0 || (le32(raw + 104) && blocks == v->spb));
 }
 
-static int ex2_read(struct fnode *nn, uint32_t pos, void *buf, uint32_t len)
+static int ex2_read(struct fnode *nn, uint64_t pos, void *buf, uint32_t len)
 {
     struct enode *n = EN(nn);
     struct evol *v = n->v;
     fs_lock();
-    uint32_t size = i_size(n->raw);
+    uint64_t size = i_size(n->raw);
     uint16_t type = i_mode(n->raw) & S_IFMT;
     if (pos >= size || (type != S_IFREG && type != S_IFLNK))
         return done(v, 0);
     if (len > size - pos)
-        len = size - pos;
+        len = (uint32_t)(size - pos);
     if (symlink_fast(v, n->raw)) {                         /* the target is in the block pointers */
         memcpy(buf, n->raw + 40 + pos, len);
         return done(v, (int)len);
@@ -1232,7 +1308,7 @@ static int ex2_read(struct fnode *nn, uint32_t pos, void *buf, uint32_t len)
     return done(v, data_io(v, n->raw, &n->goal, pos, buf, len, false, &ch));
 }
 
-static int ex2_write(struct fnode *nn, uint32_t pos, const void *buf, uint32_t len)
+static int ex2_write(struct fnode *nn, uint64_t pos, const void *buf, uint32_t len)
 {
     struct enode *n = EN(nn);
     struct evol *v = n->v;
@@ -1243,22 +1319,20 @@ static int ex2_write(struct fnode *nn, uint32_t pos, const void *buf, uint32_t l
         return done(v, -ERROR_ACCESS_DENIED);
     if (len == 0)
         return done(v, 0);
-    if (pos > le32(n->raw + 4)) {
+    if (pos > i_size(n->raw)) {
         int rc = set_size(n, pos);
         if (rc < 0) {
             node_update(n);
             return done(v, rc);
         }
     }
-    if ((uint64_t)pos + len > 0xFFFFFFFFu)
-        len = 0xFFFFFFFFu - pos;
     bool ch = false;
     int rc = data_io(v, n->raw, &n->goal, pos, (uint8_t *)buf, len, true, &ch);
     if (ch)
         n->dirty = true;
     if (rc > 0) {
-        if (pos + (uint32_t)rc > le32(n->raw + 4))
-            put32(n->raw + 4, pos + (uint32_t)rc);
+        if (pos + (uint32_t)rc > i_size(n->raw))
+            set_isize(v, n->raw, pos + (uint32_t)rc);
         stamp(n->raw);
         n->dirty = true;
     }
@@ -1268,7 +1342,7 @@ static int ex2_write(struct fnode *nn, uint32_t pos, const void *buf, uint32_t l
     return done(v, rc > 0 && urc < 0 ? urc : rc);
 }
 
-static int ex2_set_size(struct fnode *nn, uint32_t size)
+static int ex2_set_size(struct fnode *nn, uint64_t size)
 {
     struct enode *n = EN(nn);
     fs_lock();
@@ -1281,13 +1355,13 @@ static int ex2_set_size(struct fnode *nn, uint32_t size)
     return done(n->v, rc < 0 ? rc : urc);
 }
 
-static uint32_t ex2_size(const struct fnode *n) { return i_size(CEN(n)->raw); }
+static uint64_t ex2_size(const struct fnode *n) { return i_size(CEN(n)->raw); }
 static uint8_t ex2_attr(const struct fnode *n)  { return attr_of(CEN(n)->raw, NULL); }
 static void ex2_name_of(const struct fnode *n, uint8_t fcb[11]) { memcpy(fcb, CEN(n)->fcb, 11); }
 
 static void ex2_get_time(const struct fnode *n, uint16_t *date, uint16_t *time)
 {
-    fs_unix_to_dos(le32(CEN(n)->raw + 16), date, time);
+    unix_to_local(le32(CEN(n)->raw + 16), date, time);
 }
 
 static int ex2_set_time(struct fnode *nn, uint16_t date, uint16_t time)
@@ -1296,7 +1370,7 @@ static int ex2_set_time(struct fnode *nn, uint16_t date, uint16_t time)
     fs_lock();
     if (n->v->ro)
         return done(n->v, -ERROR_WRITE_PROTECT);
-    put32(n->raw + 16, fs_dos_to_unix(date, time));
+    put32(n->raw + 16, local_to_unix(date, time));
     n->dirty = true;
     return done(n->v, node_update(n));
 }
@@ -1305,8 +1379,12 @@ static int ex2_flush(struct fnode *nn)
 {
     struct enode *n = EN(nn);
     fs_lock();
-    n->v->changed = true;
-    return done(n->v, node_update(n));
+    fs_lock();                                          /* done() lets go of one */
+    int rc = done(n->v, node_update(n));
+    if (cache_sync() < 0 && rc >= 0)                    /* to the disk, now */
+        rc = -ERROR_GEN_FAILURE;
+    fs_unlock();
+    return rc;
 }
 
 static void ex2_dup(struct fnode *n)
@@ -1351,9 +1429,9 @@ static int ex2_stat(struct vol *vv, const char *path, struct fs_entry *fe)
     uint32_t dino;
     static struct dent e;
     int rc = lookup(v, path, &dino, &e);
-    uint8_t raw[128];
-    if (rc == 0 && (rc = inode_read(v, e.ino, raw)) == 0)
-        fill_entry(&e, raw, fe);
+    uint8_t raw[128], draw[128];
+    if (rc == 0 && (rc = inode_read(v, e.ino, raw)) == 0 && (rc = inode_read(v, dino, draw)) == 0)
+        fill_entry(v, draw, &e, raw, fe);
     return done(v, rc);
 }
 
@@ -1621,11 +1699,12 @@ static int ex2_short_path(struct vol *vv, const char *path, char *out, uint32_t 
         }
         memcpy(comp, s, len);
         comp[len] = '\0';
-        if ((rc = dir_find(v, d, comp, &e)) < 0)
+        uint8_t ddraw[128];
+        if ((rc = dir_find(v, d, comp, &e)) < 0 || (rc = inode_read(v, d, ddraw)) < 0)
             break;
         uint8_t fcb[11];
         char alias[13];
-        fs_make_alias(e.name, fs_hash16(e.raw), fcb, alias);
+        alias_of(v, ddraw, &e, fcb, alias);
         uint32_t al = (uint32_t)strlen(alias);
         if (n + al + 2 > size) {
             rc = -ERROR_FILENAME_EXCED_RANGE;
@@ -1663,8 +1742,18 @@ static int find_more(struct fs_find *f, struct fs_entry *out)
         uint8_t raw[128];
         if (inode_read(v, e.ino, raw) < 0)
             continue;
+        uint8_t fcb[11];
+        char alias[13];
+        bool again = false;                             /* an earlier record may share its alias */
+        if (fs_make_alias(e.name, fs_hash16(e.raw), fcb, alias)) {
+            uint16_t h = fs_hash16(e.raw) & 1023;
+            again = f->seen[h / 32] & (1u << (h % 32));
+            f->seen[h / 32] |= 1u << (h % 32);
+        }
         struct fs_entry fe;
-        fill_entry(&e, raw, &fe);
+        uint32_t keep = off;                            /* alias_of walks the directory too */
+        fill_entry(v, again ? draw : NULL, &e, raw, &fe);
+        off = keep;
         if (f->dos) {
             if (f->attr == 0x08 || (fe.attr & (A_HID | A_SYS | A_DIR) & ~f->attr) || !fs_fcb_match(f->fcb, fe.fcb_name))
                 continue;
@@ -1775,6 +1864,109 @@ static void ex2_sync(struct vol *vv)
     done(v, 0);
 }
 
+static int ex2_link(struct vol *vv, const char *existing, const char *path)
+{
+    struct evol *v = EV(vv);
+    fs_lock();
+    if (v->ro)
+        return done(v, -ERROR_WRITE_PROTECT);
+    uint32_t sdir, tdir;
+    const char *tname;
+    static struct dent se, te;
+    int rc = lookup(v, existing, &sdir, &se);
+    if (rc < 0)
+        return done(v, rc);
+    uint8_t raw[128];
+    if (inode_read(v, se.ino, raw) < 0)
+        return done(v, -ERROR_GEN_FAILURE);
+    if ((i_mode(raw) & S_IFMT) == S_IFDIR)
+        return done(v, -ERROR_ACCESS_DENIED);           /* directories have one name */
+    if (i_links(raw) >= 65000)
+        return done(v, -ERROR_TOO_MANY_LINKS);
+    if ((rc = walk(v, path, &tdir, &tname)) < 0)
+        return done(v, rc);
+    if (!*tname || is_dots(tname))
+        return done(v, -ERROR_ACCESS_DENIED);
+    if (dir_find(v, tdir, tname, &te) == 0)
+        return done(v, -ERROR_ALREADY_EXISTS);
+    char clean[FS_NAME_MAX + 1];
+    if ((rc = fs_clean_name(tname, clean)) < 0)
+        return done(v, rc);
+    uint8_t type = (i_mode(raw) & S_IFMT) == S_IFLNK ? FT_SYMLINK : FT_REG;
+    if ((rc = dir_add(v, tdir, clean, se.ino, type)) < 0)
+        return done(v, rc);
+    for (int i = 0; i < NODE_MAX; i++)                  /* an open file's copy of the inode too */
+        if (nodes[i].refs && nodes[i].v == v && nodes[i].ino == se.ino) {
+            put16(nodes[i].raw + 26, i_links(nodes[i].raw) + 1);
+            nodes[i].dirty = true;
+            node_update(&nodes[i]);
+            return done(v, 0);
+        }
+    put16(raw + 26, i_links(raw) + 1);
+    put32(raw + 12, now_unix());
+    return done(v, inode_write(v, se.ino, raw));
+}
+
+static int ex2_symlink(struct vol *vv, const char *path, const char *target)
+{
+    struct evol *v = EV(vv);
+    fs_lock();
+    if (v->ro)
+        return done(v, -ERROR_WRITE_PROTECT);
+    uint32_t dino;
+    const char *name;
+    static struct dent e;
+    int rc = walk(v, path, &dino, &name);
+    if (rc == 0 && (!*name || is_dots(name)))
+        rc = -ERROR_ACCESS_DENIED;
+    if (rc < 0)
+        return done(v, rc);
+    if (dir_find(v, dino, name, &e) == 0)
+        return done(v, -ERROR_ALREADY_EXISTS);
+    char clean[FS_NAME_MAX + 1], utarget[256];
+    int tl;
+    if ((rc = fs_clean_name(name, clean)) < 0)
+        return done(v, rc);
+    char unix_target[FS_NAME_MAX + 1];                  /* backslashes are Linux's slashes */
+    size_t k;
+    for (k = 0; target[k] && k < FS_NAME_MAX; k++)
+        unix_target[k] = target[k] == '\\' ? '/' : target[k];
+    unix_target[k] = '\0';
+    if (!k || (tl = to_utf8(unix_target, utarget)) < 0 || (uint32_t)tl >= v->bsize)
+        return done(v, -ERROR_INVALID_PARAMETER);
+    uint32_t ino;
+    if ((rc = alloc_inode(v, (dino - 1) / v->ipg, false, &ino)) < 0)
+        return done(v, rc);
+    uint8_t raw[128];
+    memset(raw, 0, sizeof raw);
+    put16(raw, S_IFLNK | 0777);
+    put16(raw + 26, 1);
+    uint32_t now = now_unix();
+    put32(raw + 8, now);
+    put32(raw + 12, now);
+    put32(raw + 16, now);
+    put32(raw + 4, (uint32_t)tl);
+    if (tl < 60) {                                      /* fast: in the block pointers */
+        memcpy(raw + 40, utarget, (size_t)tl);
+    } else {                                            /* slow: a block of its own */
+        uint32_t goal = v->first_data + ((ino - 1) / v->ipg) * v->bpg, pb;
+        if ((rc = bmap(v, raw, 0, true, &goal, &pb)) < 0) {
+            free_inode(v, ino, false);
+            return done(v, rc);
+        }
+        zero_block(v, pb);
+        bool ch = false;
+        data_io(v, raw, &goal, 0, (uint8_t *)utarget, (uint32_t)tl, true, &ch);
+    }
+    if ((rc = inode_write(v, ino, raw)) < 0 || (rc = dir_add(v, dino, clean, ino, FT_SYMLINK)) < 0) {
+        if (tl >= 60)
+            truncate_blocks(v, raw, 0);
+        free_inode(v, ino, false);
+        return done(v, rc);
+    }
+    return done(v, 0);
+}
+
 static const struct fs_ops ext2_ops = {
     .open = ex2_open, .read = ex2_read, .write = ex2_write, .set_size = ex2_set_size,
     .size = ex2_size, .get_time = ex2_get_time, .set_time = ex2_set_time, .attr = ex2_attr,
@@ -1782,5 +1974,5 @@ static const struct fs_ops ext2_ops = {
     .stat = ex2_stat, .set_attr = ex2_set_attr, .del = ex2_delete, .mkdir = ex2_mkdir,
     .rmdir = ex2_rmdir, .rename = ex2_rename, .short_path = ex2_short_path,
     .find_first = ex2_find_first, .find_dos = ex2_find_dos, .find_next = ex2_find_next,
-    .space = ex2_space, .sync = ex2_sync,
+    .space = ex2_space, .sync = ex2_sync, .link = ex2_link, .symlink = ex2_symlink,
 };

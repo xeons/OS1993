@@ -24,9 +24,11 @@
  * Offsets below are DOS 4+'s, as the FreeDOS kernel keeps them.
  */
 #include "kernel.h"
+#include "disk.h"
 #include "fs.h"
 #include "interrupts.h"
 #include "io.h"
+#include "mm.h"
 #include "user.h"
 #include "v86.h"
 #include "vm.h"
@@ -70,12 +72,57 @@
 
 static struct {
     bool     on;
-    uint32_t sda, cds;                  /* linear addresses */
+    uint32_t sda, cds, lol;             /* linear addresses */
     uint8_t  lastdrive;
     struct { bool used; uint8_t saved[CDS_SIZE]; bool taken; } drive[26];
 } rd;
 
 static struct { struct fnode *n; struct vm *vm; } rfiles[RFILE_MAX];
+
+/* Searches in progress, for DOS's find first/next and the LFN calls: the
+ * DTA keeps only a slot and a stamp. DOS never says when a search is
+ * abandoned, so the least recently used goes when they run out. */
+#define SEARCHES 48
+static struct search { bool used; struct vm *vm; uint32_t stamp, last; struct fs_find f; } *searches;
+static uint32_t search_clock;
+
+int redir_search_new(struct vm *vm, uint32_t *stamp)
+{
+    if (!searches && !(searches = kzalloc(SEARCHES * sizeof *searches)))
+        return -1;
+    int pick = 0;
+    for (int i = 0; i < SEARCHES; i++) {
+        if (!searches[i].used) {
+            pick = i;
+            break;
+        }
+        if (searches[i].last < searches[pick].last)
+            pick = i;
+    }
+    searches[pick].used = true;
+    searches[pick].vm = vm;
+    searches[pick].stamp = ++search_clock;
+    searches[pick].last = search_clock;
+    *stamp = searches[pick].stamp;
+    return pick;
+}
+
+struct fs_find *redir_search(int slot, uint32_t stamp)
+{
+    if (!searches || slot < 0 || slot >= SEARCHES || !searches[slot].used || searches[slot].stamp != stamp)
+        return NULL;
+    searches[slot].last = ++search_clock;
+    return &searches[slot].f;
+}
+
+void redir_search_free(int slot)
+{
+    if (searches && slot >= 0 && slot < SEARCHES)
+        searches[slot].used = false;
+}
+
+static uintptr_t owner_of(int id) { return (uintptr_t)&rfiles[id]; }
+static struct fnode *sft_node(uint32_t sft, int *id);
 
 static uint8_t *at(uint32_t lin)                 { return (uint8_t *)(uintptr_t)lin; }
 static uint32_t far_lin(uint16_t seg, uint16_t off) { return ((uint32_t)seg << 4) + off; }
@@ -122,6 +169,48 @@ static void take(int d, struct vol *v, bool was_dos)
     fs_set_letter(v, (char)('A' + d));
 }
 
+/* DOS's boot sector of drive d (0 = A:), through DOS: 0, or -1. */
+static int dos_boot_sector(int d, uint8_t *out)
+{
+    uint8_t *x = v86_ptr(v86_buf_seg(), v86_buf_off());
+    uint16_t data = (uint16_t)(v86_buf_off() + 16);
+    memset(x, 0, 16);
+    x[4] = 1;                                           /* sector 0, one of them */
+    x[6] = (uint8_t)data;
+    x[7] = (uint8_t)(data >> 8);
+    x[8] = (uint8_t)v86_buf_seg();
+    x[9] = (uint8_t)(v86_buf_seg() >> 8);
+    struct v86_regs r = { .eax = 0x7305, .ecx = 0xFFFF, .edx = (uint32_t)d + 1, .esi = 0,
+                          .ebx = v86_buf_off(), .ds = v86_buf_seg() };
+    if (v86_int(0x21, &r) != 0 || (r.flags & EFLAGS_CF)) {
+        r = (struct v86_regs){ .eax = (uint32_t)d, .ecx = 0xFFFF, .ebx = v86_buf_off(), .ds = v86_buf_seg() };
+        if (v86_int(0x25, &r) != 0 || (r.flags & EFLAGS_CF))  /* DOS 4's absolute read */
+            return -1;
+    }
+    memcpy(out, v86_ptr(v86_buf_seg(), data), 512);
+    return 0;
+}
+
+/* Has DOS a file open on drive d (0 = A:)? Then the drive stays DOS's. */
+static bool dos_files_open(uint32_t lol, int d)
+{
+    uint32_t sft = far_ptr(lol + 0x04);
+    for (int tables = 0; tables < 32 && sft && (sft & 0xFFFFF) != 0xFFFFF; tables++) {
+        uint16_t n = rd16(sft + 4);
+        for (uint16_t i = 0; i < n && i < 255; i++) {
+            uint32_t e = sft + 6 + (uint32_t)i * 0x3B;
+            uint16_t flags = rd16(e + SFT_FLAGS);
+            if (rd16(e + SFT_COUNT) && !(flags & (0x80 | SF_NET)) && (flags & 0x1F) == d)
+                return true;
+        }
+        uint32_t next = far_ptr(sft);
+        if (next == sft)
+            break;
+        sft = next;
+    }
+    return false;
+}
+
 void redir_init(void)
 {
     int nv = fs_volume_count();
@@ -131,8 +220,10 @@ void redir_init(void)
     if (v86_int(0x21, &r) != 0)
         return;
     uint32_t lol = far_lin(r.es, (uint16_t)r.ebx);
+    rd.lol = lol;
     rd.cds = far_ptr(lol + 0x16);
     rd.lastdrive = *at(lol + 0x21);
+    int boot = *at(lol + 0x43) - 1;                     /* DOS's boot drive (0 = A:) */
     r = (struct v86_regs){ .eax = 0x5D06 };
     if (v86_int(0x21, &r) != 0 || (r.flags & EFLAGS_CF) || rd.cds == far_lin(0xFFFF, 0xFFFF))
         return;
@@ -140,19 +231,33 @@ void redir_init(void)
     if (rd.lastdrive > 26)
         rd.lastdrive = 26;
 
-    /* the volumes DOS mounted itself: by serial number */
+    /* The volumes DOS mounted itself: the same boot sector (or serial
+     * number). Its boot drive, and a drive with files open, stay DOS's:
+     * the VMM lets go of those volumes and DOS reaches them by INT 13h. */
     bool flushed = false;
+    static uint8_t dbs[512], vbs[512];
     for (int d = 2; d < rd.lastdrive; d++) {
         uint16_t flags = rd16(cds_of(d) + CDS_FLAGS);
         if (!(flags & CDS_PHYSICAL) || (flags & (CDS_NETWORK | 0x3000)))
             continue;
+        bool have_bs = dos_boot_sector(d, dbs) == 0;
         uint32_t serial = dos_serial(d);
-        if (!serial)
-            continue;
-        for (int i = 0; i < nv; i++) {
+        for (int i = 0; i < fs_volume_count(); i++) {
             struct vol *v = fs_volume_at(i);
-            if (fs_letter(v) || fs_serial(v) != serial)
+            if (fs_letter(v))
                 continue;
+            bool same;
+            if (have_bs && fs_boot_sector(v, vbs) == 0)
+                same = memcmp(dbs, vbs, 512) == 0;
+            else
+                same = serial && fs_serial(v) == serial;
+            if (!same)
+                continue;
+            if (d == boot || dos_files_open(lol, d)) {
+                klog("REDIR: %c: stays DOS's (%s)\n", 'A' + d, d == boot ? "its boot drive" : "files open");
+                fs_drop_volume(v);
+                break;
+            }
             if (!flushed) {
                 struct v86_regs f = { .eax = 0x0D00 };  /* write and drop DOS's buffers */
                 v86_int(0x21, &f);
@@ -160,10 +265,11 @@ void redir_init(void)
             }
             take(d, v, true);
             klog("REDIR: %c: is the VMM's now (%s, serial %04X-%04X)\n", 'A' + d, fs_type_name(v),
-                 serial >> 16, serial & 0xFFFF);
+                 fs_serial(v) >> 16, fs_serial(v) & 0xFFFF);
             break;
         }
     }
+    nv = fs_volume_count();
     /* the rest: free letters */
     for (int i = 0; i < nv; i++) {
         struct vol *v = fs_volume_at(i);
@@ -209,9 +315,57 @@ void redir_vm_end(struct vm *vm)
 {
     for (int i = 0; i < RFILE_MAX; i++)
         if (rfiles[i].n && rfiles[i].vm == vm) {
+            fs_share_close(rfiles[i].n, owner_of(i));
             fs_close(rfiles[i].n);
             rfiles[i].n = NULL;
         }
+    for (int i = 0; searches && i < SEARCHES; i++)
+        if (searches[i].vm == vm)
+            searches[i].used = false;
+    lfn_vm_end(vm);
+}
+
+/* ---- for lfn.c ------------------------------------------------------------------ */
+
+int redir_current_drive(void) { return rd.on ? *at(rd.sda + 0x16) : -1; }
+
+int redir_cds_path(int d, char *out)
+{
+    if (!rd.on || d < 0 || d >= rd.lastdrive)
+        return -1;
+    const char *p = (const char *)at(cds_of(d));
+    int n = 0;
+    while (n < 66 && p[n]) {
+        out[n] = p[n];
+        n++;
+    }
+    out[n] = '\0';
+    return n;
+}
+
+/* The caller's DOS handle -> our open file (one of DOS's SFTs on our drive). */
+int redir_handle_node(uint16_t handle, struct fnode **n)
+{
+    if (!rd.on)
+        return -ERROR_INVALID_HANDLE;
+    uint32_t psp = (uint32_t)rd16(rd.sda + 0x10) << 4;
+    if (handle >= rd16(psp + 0x32))
+        return -ERROR_INVALID_HANDLE;
+    uint8_t idx = *at(far_ptr(psp + 0x34) + handle);
+    if (idx == 0xFF)
+        return -ERROR_INVALID_HANDLE;
+    uint32_t sft = far_ptr(rd.lol + 0x04);
+    for (int tables = 0; tables < 32 && sft && (sft & 0xFFFFF) != 0xFFFFF; tables++) {
+        uint16_t count = rd16(sft + 4);
+        if (idx < count) {
+            int id;
+            *n = sft_node(sft + 6 + (uint32_t)idx * 0x3B, &id);
+            return *n ? 0 : -ERROR_INVALID_HANDLE;
+        }
+        idx = (uint8_t)(idx - count);
+        sft = far_ptr(sft);
+    }
+    return -ERROR_INVALID_HANDLE;
 }
 
 /* ---- the calls -------------------------------------------------------------- */
@@ -242,6 +396,7 @@ static void fail(struct regs *r, int rc)
 }
 
 static void set16(uint32_t *reg, uint32_t v) { *reg = (*reg & 0xFFFF0000u) | (v & 0xFFFF); }
+static uint32_t dos_size(uint64_t s)         { return s > 0xFFFFFFFFu ? 0xFFFFFFFFu : (uint32_t)s; }
 
 /* "X:\DIR\FILE" -> the volume and "DIR\FILE" */
 static struct vol *path_vol(uint32_t fn, const char **rest)
@@ -292,7 +447,7 @@ static void fill_sft(uint32_t sft, struct fnode *n, int id, char letter)
     wr16(sft + SFT_ID, (uint16_t)(id + 1));
     wr16(sft + SFT_TIME, time);
     wr16(sft + SFT_DATE, date);
-    wr32(sft + SFT_SIZE, fs_size(n));
+    wr32(sft + SFT_SIZE, dos_size(fs_size(n)));
     wr32(sft + SFT_POS, 0);
     wr16(sft + 0x19, 0xFFFF);
     wr16(sft + 0x1B, 0xFFFF);
@@ -339,17 +494,17 @@ static void put_found(const struct fs_entry *e)
     wr16(d + 0x16, e->time);
     wr16(d + 0x18, e->date);
     wr16(d + 0x1A, (uint16_t)e->cluster);
-    wr32(d + 0x1C, e->size);
+    wr32(d + 0x1C, dos_size(e->size));
 }
 
-static void save_search(uint32_t blk, const struct fs_find *f, char letter)
+static void save_search(uint32_t blk, const struct fs_find *f, char letter, int slot, uint32_t stamp)
 {
     *at(blk) = (uint8_t)(0x80 | (letter - 'A'));
     memcpy(at(blk + 1), f->fcb, 11);
     *at(blk + 0x0C) = f->attr;
-    wr16(blk + 0x0D, (uint16_t)f->next);
-    wr32(blk + 0x0F, f->dir);
-    wr16(blk + 0x13, (uint16_t)f->dirlen);
+    wr16(blk + 0x0D, (uint16_t)slot);
+    wr32(blk + 0x0F, stamp);
+    wr16(blk + 0x13, 0);
 }
 
 static int find_first(uint32_t fn, struct fs_find *f, struct fs_entry *e, struct vol **vp)
@@ -380,12 +535,14 @@ static int rw(struct regs *r, uint32_t sft, bool write)
         return -ERROR_INVALID_HANDLE;
     uint32_t pos = rd32(sft + SFT_POS), len = r->ecx & 0xFFFF;
     uint8_t *buf = at(far_ptr(rd.sda + SDA_DTA));
-    int rc;
+    int rc = fs_lock_check(n, owner_of(id), pos, len);
+    if (rc < 0)
+        return rc;
     if (write) {
         rc = len ? fs_write(n, pos, buf, len) : fs_set_size(n, pos);
         if (rc == -ERROR_DISK_FULL)
             rc = 0;                                     /* DOS: fewer bytes, no error */
-        wr32(sft + SFT_SIZE, fs_size(n));
+        wr32(sft + SFT_SIZE, dos_size(fs_size(n)));
         wr16(sft + SFT_FLAGS, rd16(sft + SFT_FLAGS) & ~SF_CLEAN);
         if (!len && rc == 0)
             rc = 0;
@@ -407,11 +564,12 @@ static int open_call(struct vm *vm, struct regs *r, uint8_t al, uint16_t arg)
     if (!v)
         return -ERROR_PATH_NOT_FOUND;
     uint32_t disp;
-    bool write;
-    uint8_t attr = 0;
+    bool write, read = true;
+    uint8_t attr = 0, mode = 2;                         /* access 0 read, 1 write, 2 both; share in bits 4-6 */
     uint16_t status = 0;
     if (al == 0x16) {                                   /* open: the mode */
         disp = OPEN_EXISTING;
+        mode = (uint8_t)arg;
         write = (arg & 3) != 0;
     } else if (al == 0x17) {                            /* create: the attributes */
         disp = (arg & 0x100) ? CREATE_NEW : CREATE_ALWAYS;
@@ -420,7 +578,8 @@ static int open_call(struct vm *vm, struct regs *r, uint8_t al, uint16_t arg)
     } else {                                            /* 2Eh: extended open */
         uint16_t action = rd16(rd.sda + SDA_XACTION);
         attr = *at(rd.sda + SDA_XATTR);
-        write = (rd16(rd.sda + SDA_XMODE) & 3) != 0;
+        mode = (uint8_t)rd16(rd.sda + SDA_XMODE);
+        write = (mode & 3) != 0;
         struct fs_entry e;
         bool exists = fs_stat(v, rest, &e) == 0;
         if (exists) {
@@ -444,6 +603,12 @@ static int open_call(struct vm *vm, struct regs *r, uint8_t al, uint16_t arg)
         fs_close(n);
         return -ERROR_TOO_MANY_OPEN_FILES;
     }
+    read = (mode & 3) != 1;
+    if ((rc = fs_share_open(n, owner_of(id), read, (mode & 3) != 0, (mode >> 4) & 7)) < 0) {
+        rfiles[id].n = NULL;
+        fs_close(n);
+        return rc;
+    }
     fill_sft(sft, n, id, fs_letter(v));
     set16(&r->ecx, status);
     return 0;
@@ -456,6 +621,7 @@ static void close_sft(uint32_t sft, struct fnode *n, int id, bool last)
         wr16(sft + SFT_FLAGS, rd16(sft + SFT_FLAGS) & ~SF_DATESET);
     }
     if (last) {
+        fs_share_close(n, owner_of(id));
         fs_close(n);
         rfiles[id].n = NULL;
     } else {
@@ -473,6 +639,17 @@ bool redir_int2f(struct vm *vm, struct regs *r)
     const char *rest = "", *rest2 = "";
     struct vol *v;
     int rc = 0;
+
+    if (al == 0x20) {                                   /* flush all (INT 21h AH=0Dh): ours too */
+        bool was = read_eflags() & 0x200;
+        cpu_sti();
+        fs_lock();
+        cache_sync();
+        fs_unlock();
+        if (!was)
+            cpu_cli();
+        return false;                                   /* ... and on down the chain */
+    }
 
     /* whose call is it? */
     switch (al) {
@@ -548,8 +725,24 @@ bool redir_int2f(struct vm *vm, struct regs *r)
     case 0x09:
         rc = rw(r, es_di, al == 0x09);
         break;
-    case 0x0A:                                          /* lock/unlock: no sharing here */
+    case 0x0A: {                                        /* lock (BL 0) or unlock (BL 1) */
+        int id;
+        struct fnode *n = sft_node(es_di, &id);
+        if (!n) {
+            rc = -ERROR_INVALID_HANDLE;
+            break;
+        }
+        uint32_t blk = far_lin((uint16_t)r->v86_ds, (uint16_t)r->edx);
+        rc = fs_lock_range(n, owner_of(id), rd32(blk), rd32(blk + 4), (r->ebx & 0xFF) == 1);
+        if (rc < 0) {                                   /* "error AL, AH zeroed" */
+            r->eax = (r->eax & 0xFFFF0000u) | (uint16_t)dos_error(rc);
+            r->eflags |= EFLAGS_CF;
+            if (!was_on)
+                cpu_cli();
+            return true;
+        }
         break;
+    }
     case 0x0C: {                                        /* disk space */
         uint32_t spc, bps, freec, total;
         v = fs_volume(*(char *)at(es_di));
@@ -577,8 +770,8 @@ bool redir_int2f(struct vm *vm, struct regs *r)
         if ((rc = fs_stat(v, rest, &e)) < 0)
             break;
         set16(&r->eax, e.attr);
-        set16(&r->ebx, e.size >> 16);
-        set16(&r->edi, e.size);
+        set16(&r->ebx, dos_size(e.size) >> 16);
+        set16(&r->edi, dos_size(e.size));
         set16(&r->ecx, e.time);
         set16(&r->edx, e.date);
         break;
@@ -607,28 +800,32 @@ bool redir_int2f(struct vm *vm, struct regs *r)
         uint32_t blk = far_ptr(rd.sda + SDA_DTA);
         rc = find_first(rd.sda + SDA_FN1, &f, &e, &v);
         if (rc == 0) {
-            save_search(blk, &f, fs_letter(v));
+            uint32_t stamp;
+            int slot = redir_search_new(vm, &stamp);
+            if (slot < 0) {
+                rc = -ERROR_NOT_ENOUGH_MEMORY;
+                break;
+            }
+            *redir_search(slot, stamp) = f;
+            save_search(blk, &f, fs_letter(v), slot, stamp);
             put_found(&e);
         }
         set16(&r->ecx, 0);
         break;
     }
     case 0x1C: {                                        /* find next */
-        struct fs_find f;
         struct fs_entry e;
-        memset(&f, 0, sizeof f);
-        f.v = fs_volume((char)('A' + (*at(es_di) & 0x1F)));
-        f.dos = true;
-        memcpy(f.fcb, at(es_di + 1), 11);
-        f.attr = *at(es_di + 0x0C);
-        f.next = rd16(es_di + 0x0D);
-        f.dir = rd32(es_di + 0x0F);
-        f.dirlen = rd16(es_di + 0x13);
-        rc = fs_find_next(&f, &e);
-        if (rc == 0) {
-            save_search(es_di, &f, fs_letter(f.v));
-            put_found(&e);
+        int slot = rd16(es_di + 0x0D);
+        struct fs_find *f = redir_search(slot, rd32(es_di + 0x0F));
+        if (!f) {
+            rc = -ERROR_NO_MORE_FILES;                  /* ended, or pushed out by others */
+            break;
         }
+        rc = fs_find_next(f, &e);
+        if (rc == 0)
+            put_found(&e);
+        else
+            redir_search_free(slot);
         set16(&r->ecx, 0);
         break;
     }
@@ -640,7 +837,7 @@ bool redir_int2f(struct vm *vm, struct regs *r)
             break;
         }
         int32_t off = (int32_t)((r->ecx & 0xFFFF) << 16 | (r->edx & 0xFFFF));
-        int64_t pos = (int64_t)fs_size(n) + off;
+        int64_t pos = (int64_t)dos_size(fs_size(n)) + off;
         if (pos < 0)
             pos = 0;
         wr32(es_di + SFT_POS, (uint32_t)pos);

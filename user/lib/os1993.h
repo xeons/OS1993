@@ -84,6 +84,20 @@ void     SetLastError(uint32_t error);
 
 bool     SetEndOfFile(HANDLE h);                        /* the file ends at its pointer */
 bool     FlushFileBuffers(HANDLE h);
+bool     LockFile(HANDLE h, uint32_t off_lo, uint32_t off_hi, uint32_t len_lo, uint32_t len_hi);
+bool     UnlockFile(HANDLE h, uint32_t off_lo, uint32_t off_hi, uint32_t len_lo, uint32_t len_hi);
+bool     SetFilePointerEx(HANDLE h, int64_t distance, int64_t *new_pos, int method);  /* past 2 GB */
+bool     GetFileSizeEx(HANDLE h, int64_t *size);
+/* Links: on ext2 volumes (elsewhere ERROR_NOT_SUPPORTED). A symbolic link
+ * reads as the text of its target. */
+bool     CreateHardLink(const char *path, const char *existing, void *security);
+#define  SYMBOLIC_LINK_FLAG_DIRECTORY 1
+bool     CreateSymbolicLink(const char *link, const char *target, uint32_t flags);
+/* The time zone (the clock keeps local time): UTC = local time + Bias minutes.
+ * The shell sets it from OS1993.INI ([timezone] tzbias=). */
+typedef struct { int32_t Bias; char StandardName[32]; } TIME_ZONE_INFORMATION;
+uint32_t GetTimeZoneInformation(TIME_ZONE_INFORMATION *tz);
+bool     SetTimeZoneInformation(const TIME_ZONE_INFORMATION *tz);
 bool     SetFileAttributes(const char *path, uint32_t attributes);
 uint32_t GetFullPathName(const char *path, uint32_t size, char *buf, char **file_part);
 bool     GetDiskFreeSpace(const char *root, uint32_t *sectors_per_cluster, uint32_t *bytes_per_sector,

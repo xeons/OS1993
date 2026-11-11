@@ -225,6 +225,7 @@ struct mem_info {
 };
 /* ---- sockets (SYS_SOCKET; WSOCK.DLL wraps them as Winsock) ---------------- */
 #define SYS_SOCKET      38              /* EBX = SOP_*, ECX = struct sock_args * -> result, or -errno */
+#define SYS_TIMEZONE    39              /* EBX = 1: set ECX = bias (minutes, UTC = local + bias); -> the bias */
 
 enum { SOP_SOCKET, SOP_BIND, SOP_CONNECT, SOP_LISTEN, SOP_ACCEPT, SOP_SEND, SOP_RECV,
        SOP_SHUTDOWN, SOP_CLOSE, SOP_SETOPT, SOP_GETOPT, SOP_NAME, SOP_POLL, SOP_CONFIG };
@@ -299,7 +300,12 @@ enum { FOP_OPEN, FOP_READ, FOP_WRITE, FOP_CLOSE, FOP_SEEK, FOP_SIZE, FOP_DELETE,
        FOP_FULLPATH,                    /* path -> buf (len): the full path; -> its length */
        FOP_DISKFREE,                    /* path (a drive, or 0: the current one) -> buf: struct disk_free */
        FOP_GETTIME,                     /* handle -> buf (uint32_t): DOS time << 16 | DOS date */
-       FOP_SETTIME };                   /* handle, a: DOS time << 16 | DOS date */
+       FOP_SETTIME,                     /* handle, a: DOS time << 16 | DOS date */
+       FOP_LOCK, FOP_UNLOCK,            /* handle, a|c<<32: offset, b|d<<32: length (LockFile/UnlockFile) */
+       FOP_SEEK64,                      /* handle, a|c<<32: offset, b: method -> buf (uint64_t): the position */
+       FOP_SIZE64,                      /* handle -> buf (uint64_t) */
+       FOP_LINK,                        /* path2: a new name for the file at path (a hard link) */
+       FOP_SYMLINK };                   /* path: a symbolic link, path2: what it points to (as given) */
 
 struct disk_free {
     uint32_t sectors_per_cluster, bytes_per_sector, free_clusters, total_clusters;
@@ -311,6 +317,7 @@ struct file_args {
     void       *buf;                    /* READ, WRITE, GETCWD, FIND_* (struct find_data) */
     uint32_t    len;
     uint32_t    a, b;                   /* OPEN: access, creation; SEEK: offset, method */
+    uint32_t    c, d;                   /* SEEK64: offset high; LOCK: offset high, length high */
 };
 
 struct find_data {                      /* a directory entry (FIND_FIRST/NEXT) */
@@ -319,6 +326,7 @@ struct find_data {                      /* a directory entry (FIND_FIRST/NEXT) *
     uint16_t time, date;                /* DOS format */
     char     name[260];                 /* the long name (on DOS's drives, the 8.3 one) */
     char     short_name[14];            /* the 8.3 alias, "" if the name is one */
+    uint32_t size_high;                 /* files of 4 GB and more (exFAT, ext2) */
 };
 
 #define GENERIC_READ        0x80000000u
@@ -350,6 +358,13 @@ struct find_data {                      /* a directory entry (FIND_FIRST/NEXT) *
 #define ERROR_WRITE_PROTECT       19
 #define ERROR_GEN_FAILURE         31
 #define ERROR_SHARING_VIOLATION   32
+#define ERROR_LOCK_VIOLATION      33
+#define ERROR_SHARING_BUFFER_EXCEEDED 36
+#define ERROR_NOT_SUPPORTED       50
+#define ERROR_NEGATIVE_SEEK       131
+#define ERROR_FILE_TOO_LARGE      223
+#define ERROR_TOO_MANY_LINKS      1142
+#define ERROR_ALREADY_EXISTS      183
 #define ERROR_HANDLE_DISK_FULL    39
 #define ERROR_CANNOT_MAKE         82
 #define ERROR_DISK_FULL           112

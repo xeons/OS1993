@@ -15,9 +15,9 @@
  * Whole clusters move straight between the disk and the caller; partial
  * ones go through the cache.
  *
- * Every public call takes the lock and, if it changed anything, ends with
- * the FAT32 FSInfo sector and cache_sync(): between calls the disk is
- * consistent, and what a call wrote is on the disk when it returns.
+ * Every public call takes the lock and, if it changed anything, ends by
+ * updating the FAT32 FSInfo sector in the cache; the cache writes behind
+ * (cache.c), and FlushFileBuffers or DOS's commit write everything now.
  *
  * The root of a volume is directory cluster 0 throughout (as ".." says),
  * whether it is FAT12/16's fixed root or FAT32's root cluster chain.
@@ -25,6 +25,7 @@
 #include "kernel.h"
 #include "disk.h"
 #include "fsimpl.h"
+#include "mm.h"
 #include "io.h"
 #include "sched.h"
 #include "user.h"
@@ -56,6 +57,8 @@ struct fvol {
     bool     free_known;
     uint32_t fsinfo;                    /* absolute LBA, 0: none */
     bool     fsinfo_dirty, changed;
+    bool     marked_dirty;              /* the FAT's "not cleanly unmounted" bit is set */
+    uint32_t *map;                      /* a bit per cluster, set if used (NULL: walk the FAT) */
 };
 
 struct fnod {
@@ -184,12 +187,64 @@ static int fat_set(struct fvol *v, uint32_t c, uint32_t val)
             brelse(b);
         }
     }
+    if (v->map) {
+        if (val)
+            v->map[c / 32] |= 1u << (c % 32);
+        else
+            v->map[c / 32] &= ~(1u << (c % 32));
+    }
     v->changed = true;
     return 0;
 }
 
+/* The free-cluster map, from one pass over the FAT (which also counts). */
+static void build_map(struct fvol *v)
+{
+    if (v->map || v->nclus > 2u * 1024 * 1024)
+        return;                                         /* over 256 KB of map: walk the FAT instead */
+    uint32_t *m = kzalloc(((v->nclus + 2) / 32 + 1) * 4);
+    if (!m)
+        return;
+    uint32_t used = 0, x;
+    for (uint32_t c = 2; c <= v->nclus + 1; c++) {
+        if (v->type != 12 && c % (SECTOR / (v->type / 8)) == 0 && c + SECTOR / (v->type / 8) <= v->nclus + 1) {
+            /* a whole FAT sector at a time */
+            struct buf *b = bread(v->disk, v->fat_lba + v->active * v->fat_secs + c * (v->type / 8) / SECTOR);
+            if (!b) {
+                kfree(m);
+                return;
+            }
+            uint32_t per = SECTOR / (v->type / 8);
+            for (uint32_t k = 0; k < per; k++) {
+                uint32_t e = v->type == 16 ? le16(b->data + k * 2) : le32(b->data + k * 4) & 0x0FFFFFFF;
+                if (e) {
+                    m[(c + k) / 32] |= 1u << ((c + k) % 32);
+                    used++;
+                }
+            }
+            brelse(b);
+            c += per - 1;
+            continue;
+        }
+        if (fat_get(v, c, &x) < 0) {
+            kfree(m);
+            return;
+        }
+        if (x) {
+            m[c / 32] |= 1u << (c % 32);
+            used++;
+        }
+    }
+    v->map = m;
+    v->free = v->nclus - used;
+    v->free_known = true;
+}
+
 static int count_free(struct fvol *v)
 {
+    build_map(v);
+    if (v->map)
+        return 0;
     uint32_t n = 0, x;
     for (uint32_t c = 2; c <= v->nclus + 1; c++) {
         if (fat_get(v, c, &x) < 0)
@@ -206,12 +261,23 @@ static int alloc_clus(struct fvol *v, uint32_t prev, uint32_t *out)
 {
     if (v->free_known && v->free == 0)
         return -ERROR_DISK_FULL;
+    build_map(v);
     uint32_t c = clus_ok(v, v->next_free) ? v->next_free : 2, x;
     for (uint32_t n = 0; n < v->nclus; n++, c = c >= v->nclus + 1 ? 2 : c + 1) {
-        if (fat_get(v, c, &x) < 0)
-            return -ERROR_GEN_FAILURE;
-        if (x != 0)
-            continue;
+        if (v->map) {
+            if (v->map[c / 32] == 0xFFFFFFFFu && c % 32 == 0 && c + 32 <= v->nclus + 1) {
+                c += 31;                                /* 32 used at once */
+                n += 31;
+                continue;
+            }
+            if (v->map[c / 32] & (1u << (c % 32)))
+                continue;
+        } else {
+            if (fat_get(v, c, &x) < 0)
+                return -ERROR_GEN_FAILURE;
+            if (x != 0)
+                continue;
+        }
         if (fat_set(v, c, EOC) < 0 || (prev && fat_set(v, prev, c) < 0))
             return -ERROR_GEN_FAILURE;
         v->next_free = c + 1;
@@ -713,15 +779,39 @@ static int dir_remove(struct fvol *v, uint32_t dir, const struct dent *e)
 static void stamp(uint8_t *ent, bool created)
 {
     uint16_t date, time;
-    rtc_dos_time(&date, &time);
+    uint8_t odd;
+    rtc_dos_time_odd(&date, &time, &odd);
     put16(ent + 22, time);
     put16(ent + 24, date);
     put16(ent + 18, date);
     if (created) {
-        ent[13] = 0;
+        ent[13] = (uint8_t)(odd * 100);                 /* creation time, 10 ms: the odd second */
         put16(ent + 14, time);
         put16(ent + 16, date);
     }
+}
+
+/* FAT[1]'s "cleanly unmounted" bit (FAT16 bit 15, FAT32 bit 27): off from
+ * the first change until OS1993 ends, so a check knows to look. */
+static void set_clean(struct fvol *v, bool clean)
+{
+    if (v->type == 12)
+        return;
+    for (uint32_t copy = 0; copy < v->nfats; copy++) {
+        if (!v->mirror && copy != v->active)
+            continue;
+        uint8_t *p;
+        struct buf *b;
+        if (fat_byte(v, copy, v->type == 16 ? 2 : 4, &p, &b) < 0)
+            return;
+        if (v->type == 16)
+            put16(p, clean ? (le16(p) | 0x8000) : (le16(p) & ~0x8000u));
+        else
+            put32(p, clean ? (le32(p) | 0x08000000u) : (le32(p) & ~0x08000000u));
+        bdirty(b);
+        brelse(b);
+    }
+    v->marked_dirty = !clean;
 }
 
 /* The end of a public call: what changed goes to the disk. */
@@ -740,9 +830,9 @@ static int done(struct fvol *v, int rc)
         v->fsinfo_dirty = false;
     }
     if (v && v->changed) {
-        v->changed = false;
-        if (cache_sync() < 0 && rc >= 0)
-            rc = -ERROR_GEN_FAILURE;
+        if (!v->marked_dirty)
+            set_clean(v, false);
+        v->changed = false;                             /* write-behind: the cache writes it out */
     }
     fs_unlock();
     return rc;
@@ -847,6 +937,8 @@ struct vol *fat_mount(struct partition *p)
         n--;
     v->h.label[n] = '\0';
     v->h.ops = &fat_ops;
+    v->h.disk = p->disk;
+    v->h.start = p->start;
     v->h.type = v->type == 12 ? "FAT12" : v->type == 16 ? "FAT16" : "FAT32";
     nvols++;
     klog("FS: FAT%d on disk %d at %u: %u clusters of %u bytes, serial %04X-%04X, label \"%s\"\n",
@@ -966,7 +1058,7 @@ static int node_io(struct fnod *n, uint32_t pos, uint8_t *buf, uint32_t len, boo
                     return done_n ? (int)done_n : -ERROR_GEN_FAILURE;
                 cache_forget(v->disk, lba, v->spc);
             } else {
-                cache_sync();                           /* nothing of it may be newer in the cache */
+                cache_flush_range(v->disk, lba, v->spc);    /* nothing of it may be newer in the cache */
                 if (ata_read(v->disk, lba, v->spc, buf + done_n) < 0)
                     return done_n ? (int)done_n : -ERROR_GEN_FAILURE;
             }
@@ -1098,24 +1190,28 @@ static int fat_open(struct vol *vv, const char *path, uint32_t disp, bool write,
     return done(v, 0);
 }
 
-static int fat_read(struct fnode *nn, uint32_t pos, void *buf, uint32_t len)
+static int fat_read(struct fnode *nn, uint64_t pos64, void *buf, uint32_t len)
 {
     struct fnod *n = FN(nn);
     fs_lock();
-    if (pos >= n->size)
+    if (pos64 >= n->size)
         return done(n->v, 0);
+    uint32_t pos = (uint32_t)pos64;
     if (len > n->size - pos)
         len = n->size - pos;
     return done(n->v, node_io(n, pos, buf, len, false));
 }
 
-static int fat_write(struct fnode *nn, uint32_t pos, const void *buf, uint32_t len)
+static int fat_write(struct fnode *nn, uint64_t pos64, const void *buf, uint32_t len)
 {
     struct fnod *n = FN(nn);
     fs_lock();
     struct fvol *v = n->v;
     if (len == 0)
         return done(v, 0);
+    if (pos64 >= 0xFFFFFFFFu)
+        return done(v, -ERROR_FILE_TOO_LARGE);          /* FAT's files end at 4 GB - 1 */
+    uint32_t pos = (uint32_t)pos64;
     if (pos > n->size) {                                /* the gap reads as zeros */
         int rc = set_size(n, pos);
         if (rc < 0) {
@@ -1139,11 +1235,13 @@ static int fat_write(struct fnode *nn, uint32_t pos, const void *buf, uint32_t l
     return done(v, rc > 0 && urc < 0 ? urc : rc);
 }
 
-static int fat_set_size(struct fnode *nn, uint32_t size)
+static int fat_set_size(struct fnode *nn, uint64_t size64)
 {
     struct fnod *n = FN(nn);
     fs_lock();
-    int rc = set_size(n, size);
+    if (size64 > 0xFFFFFFFFu)
+        return done(n->v, -ERROR_FILE_TOO_LARGE);
+    int rc = set_size(n, (uint32_t)size64);
     if (rc == 0) {
         rtc_dos_time(&n->date, &n->time);
         n->attr |= A_ARC;
@@ -1152,7 +1250,7 @@ static int fat_set_size(struct fnode *nn, uint32_t size)
     return done(n->v, rc < 0 ? rc : urc);
 }
 
-static uint32_t fat_size(const struct fnode *n)  { return CFN(n)->size; }
+static uint64_t fat_size(const struct fnode *n)  { return CFN(n)->size; }
 static uint8_t fat_attr(const struct fnode *n)    { return CFN(n)->attr; }
 static void fat_name_of(const struct fnode *nn, uint8_t fcb[11])
 {
@@ -1183,8 +1281,12 @@ static int fat_flush(struct fnode *nn)
 {
     struct fnod *n = FN(nn);
     fs_lock();
-    n->v->changed = true;
-    return done(n->v, node_update(n));
+    fs_lock();                                          /* done() lets go of one */
+    int rc = done(n->v, node_update(n));
+    if (cache_sync() < 0 && rc >= 0)                    /* to the disk, now */
+        rc = -ERROR_GEN_FAILURE;
+    fs_unlock();
+    return rc;
 }
 
 static void fat_dup(struct fnode *n)
@@ -1594,7 +1696,12 @@ static void fat_sync(struct vol *vv)
             node_update(&nodes[i]);
     v->changed = true;
     v->fsinfo_dirty |= v->fsinfo != 0;
+    if (v->marked_dirty) {
+        set_clean(v, true);
+        v->marked_dirty = true;                         /* done() mustn't set it again */
+    }
     done(v, 0);
+    v->marked_dirty = false;
 }
 
 static const struct fs_ops fat_ops = {

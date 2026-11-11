@@ -1,6 +1,7 @@
 /*
  * fstest.c -- tests of the VMM's own disks: FAT32 (D:), FAT16 (E:),
- * exFAT (F:) and ext2 (G:) on the secondary IDE master, reached directly through
+ * exFAT (F:), ext2 (G:, 1 KB blocks; H:, 8 KB) on one disk, and a 5 GB
+ * exFAT disk with 4 KB sectors (I:), reached directly through
  * KERNEL.DLL's file calls, long names and all.
  *
  * tools/qemu-fat-test.py builds the disk (tools/mkdata.sh), lets a DOS
@@ -133,6 +134,9 @@ static void test_dos_results(void)
     CHECK(n == (int)sizeof big && !memcmp(buf, big, sizeof big), "DOS's COPY D:\\BIG.BIN E:\\BIG2.BIN: the same bytes");
     CHECK(text_is("E:\\DOSDIR\\RENAMED.TXT", "made by DOS\r\n"), "DOS made a folder, a file, and renamed it");
     CHECK(GetFileAttributes("D:\\GONE.TXT") == INVALID_FILE_ATTRIBUTES, "DOS deleted D:\\GONE.TXT");
+    CHECK(text_is("D:\\Written by a DOS program with LFN.txt", "hello lfn\r\n"),
+          "a DOS program made a long name (INT 21h AX=716Ch)");
+    CHECK(GetFileAttributes("D:\\A DOS long dir") == INVALID_FILE_ATTRIBUTES, "... and removed its long-named folder");
     CHECK(text_is("D:\\Sub Folder\\FROMDOS.TXT", "DOS wrote this\r\n"), "DOS wrote into a long-named folder (by its alias)");
     if (!text_is("D:\\Sub Folder\\FROMDOS.TXT", "DOS wrote this\r\n")) {
         char t[64];
@@ -183,6 +187,16 @@ static void test_writing(void)
     CHECK(SetEndOfFile(h) && GetFileSize(h) == 5000, "SetEndOfFile: 5000 bytes");
     CloseHandle(h);
     CHECK(DeleteFile("D:\\gap.bin") && GetFileAttributes("D:\\gap.bin") == INVALID_FILE_ATTRIBUTES, "DeleteFile");
+
+    /* locks between two handles */
+    HANDLE l1 = CreateFile("D:\\HELLO.TXT", GENERIC_READ | GENERIC_WRITE, OPEN_EXISTING);
+    HANDLE l2 = CreateFile("D:\\HELLO.TXT", GENERIC_READ, OPEN_EXISTING);
+    char lb[8];
+    CHECK(LockFile(l1, 0, 0, 5, 0), "LockFile: the first five bytes");
+    CHECK(!ReadFile(l2, lb, 4, &got) && GetLastError() == ERROR_LOCK_VIOLATION, "... another handle can't read them");
+    CHECK(UnlockFile(l1, 0, 0, 5, 0) && ReadFile(l2, lb, 4, &got) && got == 4, "UnlockFile: now it can");
+    CloseHandle(l1);
+    CloseHandle(l2);
 
     /* folders, moving, renaming */
     CHECK(CreateDirectory("D:\\My Stuff"), "CreateDirectory D:\\My Stuff");
@@ -414,6 +428,110 @@ static void test_ext2(void)
     CHECK(spit("G:\\FROMGUI.TXT", "ext2, written by an OS1993 program.\r\n", 37), "ext2: leave G:\\FROMGUI.TXT");
 }
 
+/* Two long names whose aliases would be the same ("SA1E68~1.TXT"): the
+ * second becomes ~2, and each alias opens its own file. */
+static void test_alias_clash(const char *drive, const char *a, const char *b)
+{
+    char pa[MAX_PATH], pb[MAX_PATH], pat[MAX_PATH], what[80];
+    snprintf(pa, sizeof pa, "%s\\%s", drive, a);
+    snprintf(pb, sizeof pb, "%s\\%s", drive, b);
+    snprintf(pat, sizeof pat, "%s\\Same start *", drive);
+    spit(pa, "first", 5);
+    spit(pb, "second", 6);
+    char sa[14] = "", sb[14] = "";
+    WIN32_FIND_DATA fd;
+    HANDLE f = FindFirstFile(pat, &fd);
+    if (f != INVALID_HANDLE_VALUE) {
+        do {
+            if (!strcmp(fd.name, a)) strcpy(sa, fd.short_name);
+            if (!strcmp(fd.name, b)) strcpy(sb, fd.short_name);
+        } while (FindNextFile(f, &fd));
+        FindClose(f);
+    }
+    snprintf(what, sizeof what, "%s two names, one alias: ~1 and ~2 (%s, %s)", drive, sa, sb);
+    size_t la = strlen(sa), lb = strlen(sb);
+    CHECK(la == 12 && lb == 12 && !strncmp(sa, sb, 6) && sa[7] == '1' && sb[7] == '2' && !strcmp(sa + 8, sb + 8), what);
+    snprintf(pa, sizeof pa, "%s\\%s", drive, sa);
+    snprintf(pb, sizeof pb, "%s\\%s", drive, sb);
+    snprintf(what, sizeof what, "%s ... each alias opens its own file", drive);
+    CHECK(text_is(pa, "first") && text_is(pb, "second"), what);
+}
+
+static void test_big(void)
+{
+    /* I: exFAT with 4 KB sectors, a 4.5 GB file tools/exfat.py made */
+    int64_t size = 0, at = 0;
+    HANDLE h = CreateFile("I:\\Huge file.bin", GENERIC_READ | GENERIC_WRITE, OPEN_EXISTING);
+    CHECK(h != INVALID_HANDLE_VALUE && GetFileSizeEx(h, &size) && size == 4608LL * 1024 * 1024,
+          "exFAT, 4 KB sectors: a 4.5 GB file (GetFileSizeEx)");
+    char b[32] = "";
+    uint32_t got = 0, put = 0;
+    CHECK(ReadFile(h, b, 22, &got) && got == 22 && !memcmp(b, "start of the huge file", 22), "... its first bytes");
+    CHECK(SetFilePointerEx(h, 4LL * 1024 * 1024 * 1024 + 16, &at, FILE_BEGIN) && at == 4LL * 1024 * 1024 * 1024 + 16 &&
+          ReadFile(h, b, 11, &got) && got == 11 && !memcmp(b, "beyond 4 GB", 11), "... and bytes past 4 GB (SetFilePointerEx)");
+    SetFilePointerEx(h, 4LL * 1024 * 1024 * 1024 + 1024, NULL, FILE_BEGIN);
+    CHECK(WriteFile(h, "written past 4 GB", 17, &put) && put == 17, "... write past 4 GB");
+    SetFilePointerEx(h, -17, NULL, FILE_CURRENT);
+    CHECK(ReadFile(h, b, 17, &got) && got == 17 && !memcmp(b, "written past 4 GB", 17), "... and read it back");
+    CHECK(SetFilePointer(h, 0, FILE_END) == INVALID_SET_FILE_POINTER, "SetFilePointer (32-bit) refuses a position past 2 GB");
+    CloseHandle(h);
+    WIN32_FIND_DATA fd;
+    h = FindFirstFile("I:\\Huge*", &fd);
+    CHECK(h != INVALID_HANDLE_VALUE && fd.size_high == 1 && fd.size == 512u * 1024 * 1024, "FindFirstFile: the size's high part");
+    FindClose(h);
+    CHECK(text_is("I:\\small.txt", "a small file on a big disk\r\n"), "... and a small file beside it");
+
+    /* H: ext2 with 8 KB blocks */
+    CHECK(text_is("H:\\hello8k.txt", "ext2 with 8 KB blocks.\n"), "ext2, 8 KB blocks: read");
+    int n = slurp("H:\\big.bin", buf, sizeof buf);
+    CHECK(n == (int)sizeof big && !memcmp(buf, big, sizeof big), "... 300000 bytes through an indirect block");
+    for (uint32_t i = 0; i < 200000; i++)
+        buf[i] = (uint8_t)(i * 3 + 1);
+    static uint8_t back[200000];
+    CHECK(spit("H:\\written.bin", buf, 200000) && slurp("H:\\written.bin", back, sizeof back) == 200000 &&
+          !memcmp(back, buf, 200000), "... write 200000 bytes and read them back");
+
+    /* G: ext2, a sparse file past 4 GB (triple indirect blocks) */
+    h = CreateFile("G:\\sparse.bin", GENERIC_READ | GENERIC_WRITE, CREATE_ALWAYS);
+    CHECK(SetFilePointerEx(h, 5LL * 1024 * 1024 * 1024, NULL, FILE_BEGIN) && WriteFile(h, "tail", 4, &put) && put == 4 &&
+          GetFileSizeEx(h, &size) && size == 5LL * 1024 * 1024 * 1024 + 4, "ext2: a sparse file of 5 GB");
+    SetFilePointerEx(h, 1LL * 1024 * 1024 * 1024, NULL, FILE_BEGIN);
+    memset(b, 0x55, sizeof b);
+    CHECK(ReadFile(h, b, 8, &got) && got == 8 && !b[0] && !b[7], "... its hole reads as zeros");
+    SetFilePointerEx(h, -4, NULL, FILE_END);
+    CHECK(ReadFile(h, b, 4, &got) && got == 4 && !memcmp(b, "tail", 4), "... and its end is there");
+    CloseHandle(h);
+
+    /* the time zone: UTC = local + bias */
+    TIME_ZONE_INFORMATION tz = { -60, "" };
+    CHECK(SetTimeZoneInformation(&tz), "SetTimeZoneInformation (UTC+1)");
+    TIME_ZONE_INFORMATION back_tz;
+    GetTimeZoneInformation(&back_tz);
+    CHECK(back_tz.Bias == -60, "GetTimeZoneInformation");
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    char when[64];
+    snprintf(when, sizeof when, "%04u-%02u-%02u %02u:%02u:%02u", st.year, st.month, st.day, st.hour, st.minute, st.second);
+    CHECK(spit("G:\\tz.txt", when, (uint32_t)strlen(when)) && spit("F:\\tz.txt", when, (uint32_t)strlen(when)),
+          "files written in UTC+1 on ext2 and exFAT");
+}
+
+static void test_links(void)
+{
+    CHECK(!CreateHardLink("D:\\hard.txt", "D:\\HELLO.TXT", NULL) && GetLastError() == ERROR_NOT_SUPPORTED,
+          "CreateHardLink on FAT: not supported");
+    CHECK(CreateHardLink("G:\\Long Directory Name\\linked.txt", "G:\\README.TXT", NULL) &&
+          text_is("G:\\Long Directory Name\\linked.txt", "ext2 here.\r\n"), "ext2: CreateHardLink, another name for a file");
+    CHECK(CreateHardLink("G:\\hard.txt", "G:\\README.TXT", NULL) && DeleteFile("G:\\hard.txt") &&
+          text_is("G:\\README.TXT", "ext2 here.\r\n"), "ext2: ... deleting one name leaves the file");
+    CHECK(!CreateHardLink("G:\\x", "G:\\Long Directory Name", NULL), "ext2: ... not for a folder");
+    CHECK(CreateSymbolicLink("G:\\sym-short", "Hello ext2.txt", 0) && text_is("G:\\sym-short", "Hello ext2.txt"),
+          "ext2: CreateSymbolicLink (short: kept in the inode)");
+    const char *far = "Long Directory Name/A file in a directory with a long name.txt";
+    CHECK(CreateSymbolicLink("G:\\sym-long", "Long Directory Name\\A file in a directory with a long name.txt", 0) &&
+          text_is("G:\\sym-long", far), "ext2: ... a long one (a block of its own; \\ becomes /)");
+}
+
 int main(void)
 {
     test_reading();
@@ -421,6 +539,10 @@ int main(void)
     test_writing();
     test_exfat();
     test_ext2();
+    test_alias_clash("F:", "Same start 11.txt", "Same start 50.txt");
+    test_alias_clash("G:", "Same start 11.txt", "Same start 30.txt");
+    test_links();
+    test_big();
     printf("FS: %d of %d checks passed\n", checks - failures, checks);
     return failures ? 1 : 0;
 }

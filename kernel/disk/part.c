@@ -1,7 +1,8 @@
 /*
  * part.c -- partitions: the MBR's four entries and the chain of logical
  * drives in an extended partition. A disk with no partition table but a
- * boot sector at LBA 0 (a "superfloppy") is one partition.
+ * file system from its first sector (a "superfloppy": a FAT or exFAT boot
+ * sector, or an ext2 superblock) is one partition.
  */
 #include "kernel.h"
 #include "disk.h"
@@ -66,9 +67,24 @@ void part_scan(void)
         uint8_t mbr[SECTOR];
         memcpy(mbr, b->data, SECTOR);
         brelse(b);
-        if (mbr[510] != 0x55 || mbr[511] != 0xAA)
+        bool signed_mbr = mbr[510] == 0x55 && mbr[511] == 0xAA;
+        if (!signed_mbr || (mbr[446 + 4] | mbr[462 + 4] | mbr[478 + 4] | mbr[494 + 4]) == 0) {
+            struct buf *s = bread(d, 2);                /* no table: an ext2 superblock? */
+            bool ext2 = s && s->data[56] == 0x53 && s->data[57] == 0xEF;
+            brelse(s);
+            if (ext2) {
+                add(d, 0, 0, d->sectors);
+                continue;
+            }
+        }
+        if (!signed_mbr)
             continue;
-        if (boot_sector(mbr)) {
+        bool whole = boot_sector(mbr) || !memcmp(mbr + 3, "EXFAT   ", 8);
+        if (whole && memcmp(mbr + 3, "EXFAT   ", 8) == 0) {
+            add(d, 0, 0, d->sectors);
+            continue;
+        }
+        if (whole) {
             /* A real table's boot flags are 00 or 80 and some type is set;
              * in a boot sector those bytes are code. */
             bool table = false;

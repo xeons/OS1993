@@ -63,13 +63,13 @@ struct xvol {
     uint32_t start;
     uint32_t fat_lba, heap_lba;         /* absolute */
     uint32_t nclus;                     /* clusters 2 .. nclus + 1 */
-    uint32_t spc, cbytes, epc;
+    uint32_t spc, cbytes, epc, cshift;  /* cbytes = 1 << cshift */
     uint32_t root;
     uint32_t *bm;                       /* the bitmap's clusters */
     uint32_t bm_n;
     uint16_t upcase[256];
     uint32_t free, next_free;
-    bool     changed;
+    bool     changed, marked_dirty;
 };
 
 struct dref {                           /* where a directory's entries are */
@@ -91,10 +91,12 @@ struct xent {                           /* an entry set, read */
     uint8_t  raw[SET_MAX * 32];
     uint8_t  attr;
     uint8_t  flags;
-    uint32_t first, size, vdl;
+    uint32_t first;
+    uint64_t size, vdl;
     char     name[FS_NAME_MAX + 1];
     char     alias[13];
     uint8_t  fcb[11];
+    bool     hashed;                    /* the alias is made from the name hash */
 };
 
 struct xnode {
@@ -103,10 +105,12 @@ struct xnode {
     struct xvol *v;
     struct dref parent;
     uint32_t idx;
-    uint32_t first, size, vdl, nalloc;
+    uint32_t first, nalloc;
+    uint64_t size, vdl;
     bool     contig;
     uint8_t  attr;
     uint16_t date, time;
+    uint8_t  odd;                       /* the 10 ms field: 100 for an odd second */
     uint8_t  fcb[11];
     bool     dirty;
     uint32_t c_idx, c_clus;
@@ -122,15 +126,37 @@ static uint32_t le32(const uint8_t *p) { return p[0] | p[1] << 8 | p[2] << 16 | 
 static void put16(uint8_t *p, uint32_t v) { p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); }
 static void put32(uint8_t *p, uint32_t v) { put16(p, v); put16(p + 2, v >> 16); }
 
+static uint64_t le64(const uint8_t *p) { return le32(p) | (uint64_t)le32(p + 4) << 32; }
+static uint32_t clusters(const struct xvol *v, uint64_t bytes) { return (uint32_t)((bytes + v->cbytes - 1) >> v->cshift); }
+
 static uint32_t clus_lba(const struct xvol *v, uint32_t c) { return v->heap_lba + (c - 2) * v->spc; }
 static bool clus_ok(const struct xvol *v, uint32_t c)      { return c >= 2 && c - 2 < v->nclus; }
 
+/* The boot sector's VolumeDirty flag (and, when clean, PercentInUse);
+ * both are outside the boot region's checksum. */
+static void set_clean(struct xvol *v, bool clean)
+{
+    struct buf *b = bread(v->disk, v->start);
+    if (!b)
+        return;
+    uint16_t flags = le16(b->data + 106);
+    put16(b->data + 106, clean ? (flags & ~2u) : (flags | 2));
+    if (clean) {
+        uint32_t used = v->nclus - v->free;
+        b->data[112] = (uint8_t)(used <= 0x28F5C28 ? used * 100 / v->nclus : used / (v->nclus / 100));
+    }
+    bdirty(b);
+    brelse(b);
+    v->marked_dirty = !clean;
+}
+
 static int done(struct xvol *v, int rc)
 {
+    if (v->changed && !v->marked_dirty)
+        set_clean(v, false);
     if (v->changed) {
         v->changed = false;
-        if (cache_sync() < 0 && rc >= 0)
-            rc = -ERROR_GEN_FAILURE;
+        /* write-behind: the cache writes it out (cache.c) */
     }
     fs_unlock();
     return rc;
@@ -406,8 +432,8 @@ static bool decode(struct xent *e)
     e->flags = s[1];
     int len = s[3];
     e->first = le32(s + 20);
-    e->vdl = le32(s + 12) ? 0xFFFFFFFFu : le32(s + 8);
-    e->size = le32(s + 28) ? 0xFFFFFFFFu : le32(s + 24);
+    e->vdl = le64(s + 8);
+    e->size = le64(s + 24);
     int n = 0;
     for (int i = 2; i < e->count && n < len; i++) {
         const uint8_t *nm = e->raw + i * 32;
@@ -421,7 +447,7 @@ static bool decode(struct xent *e)
     e->name[n] = '\0';
     if (!n)
         return false;
-    fs_make_alias(e->name, le16(s + 4), e->fcb, e->alias);
+    e->hashed = fs_make_alias(e->name, le16(s + 4), e->fcb, e->alias);
     return true;
 }
 
@@ -475,17 +501,43 @@ static int dir_next(struct dcur *dc, uint32_t *idx, struct xent *e, char *label)
     }
 }
 
+/* A hashed alias that another entry before it shares gets the next number. */
+static void number(struct xvol *v, const struct dref *d, struct xent *e)
+{
+    if (!e->hashed)
+        return;
+    struct dcur dc;
+    dcur_init(&dc, v, d);
+    static struct xent o;
+    uint32_t idx = 0;
+    int n = 1;
+    while (dir_next(&dc, &idx, &o, NULL) > 0 && o.idx < e->idx)
+        n += o.hashed && !memcmp(o.fcb, e->fcb, 11);
+    if (n > 1 && n <= 9)
+        fs_alias_number(e->fcb, e->alias, n);
+}
+
 static int dir_find(struct xvol *v, const struct dref *d, const char *name, struct xent *e)
 {
     struct dcur dc;
     dcur_init(&dc, v, d);
     uint32_t idx = 0;
+    uint8_t base[11];
+    int want = 0, seen = 0;
+    bool numbered = fs_alias_parse(name, base, &want);
     for (;;) {
         int rc = dir_next(&dc, &idx, e, NULL);
         if (rc <= 0)
             return rc < 0 ? rc : -ERROR_FILE_NOT_FOUND;
-        if (fs_name_eq(name, e->name) || fs_name_eq(name, e->alias))
+        if (fs_name_eq(name, e->name) || (!e->hashed && fs_name_eq(name, e->alias))) {
+            number(v, d, e);
             return 0;
+        }
+        if (numbered && e->hashed && !memcmp(e->fcb, base, 11) && ++seen == want) {
+            if (want > 1)
+                fs_alias_number(e->fcb, e->alias, want);
+            return 0;
+        }
     }
 }
 
@@ -493,7 +545,7 @@ static struct dref child_dref(const struct xvol *v, const struct xent *e)
 {
     struct dref d = { e->first, (e->flags & F_NOCHAIN) != 0, 0 };
     if (d.contig)
-        d.nclus = (e->size + v->cbytes - 1) / v->cbytes;
+        d.nclus = clusters(v, e->size);
     return d;
 }
 
@@ -609,19 +661,43 @@ static int dir_grow(struct xvol *v, struct xdir *x)
     return set_write(v, &x->parent, x->pidx, pe.raw, pe.count);
 }
 
+/* The UTC offset byte: valid, in 15 minutes east of UTC; 0 if the time
+ * zone isn't known (the time is local, offset unknown). */
+static uint8_t utc_offset(void)
+{
+    return fs_timezone_known() ? (uint8_t)(0x80 | ((-fs_timezone() / 15) & 0x7F)) : 0;
+}
+
+/* A timestamp as our local time: if it carries a UTC offset other than
+ * ours, it is moved by the difference. */
+static void local_time(uint32_t ts, uint8_t off, uint16_t *date, uint16_t *time)
+{
+    *date = (uint16_t)(ts >> 16);
+    *time = (uint16_t)ts;
+    if (!(off & 0x80) || !fs_timezone_known())
+        return;
+    int32_t theirs = (int8_t)(uint8_t)(off << 1) / 2 * 15;     /* minutes east of UTC */
+    int32_t ours = -fs_timezone();
+    if (theirs == ours)
+        return;
+    uint32_t u = fs_dos_to_unix(*date, *time) + (uint32_t)((ours - theirs) * 60);
+    fs_unix_to_dos(u, date, time);
+}
+
 static void stamp_now(uint8_t *f, bool created)
 {
     uint16_t date, time;
-    rtc_dos_time(&date, &time);
+    uint8_t odd;
+    rtc_dos_time_odd(&date, &time, &odd);
     uint32_t ts = (uint32_t)date << 16 | time;
     put32(f + 12, ts);
     put32(f + 16, ts);
-    f[21] = 0;
-    f[23] = f[24] = 0;
+    f[21] = (uint8_t)(odd * 100);                       /* 10 ms units: the odd second */
+    f[23] = f[24] = utc_offset();
     if (created) {
         put32(f + 8, ts);
-        f[20] = 0;
-        f[22] = 0;
+        f[20] = (uint8_t)(odd * 100);
+        f[22] = utc_offset();
     }
 }
 
@@ -708,12 +784,10 @@ static void fill_entry(const struct xent *x, struct fs_entry *e)
     memcpy(e->fcb_name, x->fcb, 11);
     e->attr = x->attr & 0x37;
     e->size = (x->attr & A_DIR) ? 0 : x->size;
-    uint32_t m = le32(x->raw + 12), c = le32(x->raw + 8), a = le32(x->raw + 16);
-    e->time = (uint16_t)m;
-    e->date = (uint16_t)(m >> 16);
-    e->ctime = (uint16_t)c;
-    e->cdate = (uint16_t)(c >> 16);
-    e->adate = (uint16_t)(a >> 16);
+    uint16_t at;
+    local_time(le32(x->raw + 12), x->raw[23], &e->date, &e->time);
+    local_time(le32(x->raw + 8), x->raw[22], &e->cdate, &e->ctime);
+    local_time(le32(x->raw + 16), x->raw[24], &e->adate, &at);
     e->cluster = x->first;
     e->lfn = !fs_name_eq(x->name, x->alias) || strcmp(x->name, x->alias) != 0;
 }
@@ -759,19 +833,22 @@ struct vol *exfat_mount(struct partition *p)
     brelse(b);
     if (memcmp(bs + 3, "EXFAT   ", 8) != 0 || bs[510] != 0x55 || bs[511] != 0xAA)
         return NULL;
-    if (bs[108] != 9 || bs[109] > 25 || bs[110] != 1) {
-        klog("FS: exFAT at %u: %u-byte sectors or %d FATs: not supported\n", p->start, 1u << bs[108], bs[110]);
+    if (bs[108] < 9 || bs[108] > 12 || bs[108] + bs[109] > 25 || bs[110] != 1) {
+        klog("FS: exFAT at %u: %u-byte sectors or %d FATs (TexFAT): not supported\n", p->start,
+             1u << bs[108], bs[110]);
         return NULL;
     }
+    uint32_t k = 1u << (bs[108] - 9);                   /* the volume's sectors, in the disk's */
     struct xvol *v = &vols[nvols];
     *v = (struct xvol){ .disk = p->disk, .start = p->start };
-    v->fat_lba = p->start + le32(bs + 80);
-    v->heap_lba = p->start + le32(bs + 88);
+    v->fat_lba = p->start + le32(bs + 80) * k;
+    v->heap_lba = p->start + le32(bs + 88) * k;
     v->nclus = le32(bs + 92);
     v->root = le32(bs + 96);
     v->h.serial = le32(bs + 100);
-    v->spc = 1u << bs[109];
-    v->cbytes = v->spc * SECTOR;
+    v->spc = (1u << bs[109]) * k;
+    v->cshift = bs[108] + bs[109];
+    v->cbytes = 1u << v->cshift;
     v->epc = v->cbytes / 32;
     if (v->heap_lba - p->start + (uint64_t)v->nclus * v->spc > p->count || !clus_ok(v, v->root))
         return NULL;
@@ -842,6 +919,8 @@ struct vol *exfat_mount(struct partition *p)
     v->free = v->nclus - used;
     v->next_free = 2;
     v->h.ops = &exfat_ops;
+    v->h.disk = p->disk;
+    v->h.start = p->start;
     v->h.type = "exFAT";
     nvols++;
     klog("FS: exFAT on disk %d at %u: %u clusters of %u bytes, %u free, serial %04X-%04X, label \"%s\"\n",
@@ -867,16 +946,22 @@ static struct xnode *node_get(struct xvol *v, const struct dref *parent, const s
     }
     if (!fr)
         return NULL;
-    uint32_t m = le32(e->raw + 12);
     *fr = (struct xnode){ .h.v = &v->h, .refs = 1, .v = v, .parent = *parent, .idx = e->idx,
                           .first = e->first, .size = e->size, .vdl = e->vdl,
-                          .contig = (e->flags & F_NOCHAIN) != 0, .attr = e->attr,
-                          .date = (uint16_t)(m >> 16), .time = (uint16_t)m };
-    fr->nalloc = clus_ok(v, fr->first) ? (fr->size + v->cbytes - 1) / v->cbytes : 0;
+                          .contig = (e->flags & F_NOCHAIN) != 0, .attr = e->attr };
+    local_time(le32(e->raw + 12), e->raw[23], &fr->date, &fr->time);
+    fr->nalloc = clus_ok(v, fr->first) ? clusters(v, fr->size) : 0;
     if (!fr->nalloc)
         fr->first = 0;
     memcpy(fr->fcb, e->fcb, 11);
     return fr;
+}
+
+static void touch(struct xnode *n)
+{
+    uint8_t odd;
+    rtc_dos_time_odd(&n->date, &n->time, &odd);
+    n->odd = (uint8_t)(odd * 100);
 }
 
 static bool node_open(struct xvol *v, const struct dref *parent, uint32_t idx)
@@ -900,13 +985,14 @@ static int node_update(struct xnode *n)
     uint32_t ts = (uint32_t)n->date << 16 | n->time;
     put32(f + 12, ts);
     put32(f + 16, ts);
-    f[21] = 0;
+    f[21] = n->odd;
+    f[23] = f[24] = utc_offset();
     s[1] = (uint8_t)(F_ALLOC | (n->contig && n->first ? F_NOCHAIN : 0));
-    put32(s + 8, n->vdl);
-    put32(s + 12, 0);
+    put32(s + 8, (uint32_t)n->vdl);
+    put32(s + 12, (uint32_t)(n->vdl >> 32));
     put32(s + 20, n->first);
-    put32(s + 24, n->size);
-    put32(s + 28, 0);
+    put32(s + 24, (uint32_t)n->size);
+    put32(s + 28, (uint32_t)(n->size >> 32));
     n->dirty = false;
     return set_write(n->v, &n->parent, n->idx, e.raw, e.count);
 }
@@ -955,19 +1041,19 @@ static int node_clus(struct xnode *n, uint32_t ci, bool alloc, uint32_t *out)
 }
 
 /* Bytes between the file and buf (NULL when writing: zeros). */
-static int node_io(struct xnode *n, uint32_t pos, uint8_t *buf, uint32_t len, bool write)
+static int node_io(struct xnode *n, uint64_t pos, uint8_t *buf, uint32_t len, bool write)
 {
     struct xvol *v = n->v;
     uint32_t done_n = 0;
     while (done_n < len) {
         uint32_t c;
-        int rc = node_clus(n, pos / v->cbytes, write, &c);
+        int rc = node_clus(n, (uint32_t)(pos >> v->cshift), write, &c);
         if (rc) {
             if (done_n)
                 break;
             return rc < 0 ? rc : 0;
         }
-        uint32_t in = pos % v->cbytes;
+        uint32_t in = (uint32_t)pos & (v->cbytes - 1);
         uint32_t chunk = v->cbytes - in < len - done_n ? v->cbytes - in : len - done_n;
         if (in % SECTOR == 0 && chunk >= SECTOR && buf) {      /* whole sectors: no cache */
             uint32_t secs = chunk / SECTOR, lba = clus_lba(v, c) + in / SECTOR;
@@ -979,7 +1065,7 @@ static int node_io(struct xnode *n, uint32_t pos, uint8_t *buf, uint32_t len, bo
                     return done_n ? (int)done_n : -ERROR_GEN_FAILURE;
                 cache_forget(v->disk, lba, secs);
             } else {
-                cache_sync();
+                cache_flush_range(v->disk, lba, secs);
                 if (ata_read(v->disk, lba, secs, buf + done_n) < 0)
                     return done_n ? (int)done_n : -ERROR_GEN_FAILURE;
             }
@@ -1008,29 +1094,42 @@ static int node_io(struct xnode *n, uint32_t pos, uint8_t *buf, uint32_t len, bo
 }
 
 /* Make the file valid (written) up to `to`: zeros from the valid length. */
-static int validate(struct xnode *n, uint32_t to)
+static int validate(struct xnode *n, uint64_t to)
 {
-    if (to <= n->vdl)
-        return 0;
-    uint32_t from = n->vdl;
-    int rc = node_io(n, from, NULL, to - from, true);
-    if (rc < 0)
-        return rc;
-    n->vdl = from + (uint32_t)rc;
-    if (n->vdl > n->size)
-        n->size = n->vdl;
-    n->dirty = true;
-    return n->vdl == to ? 0 : -ERROR_DISK_FULL;
+    while (n->vdl < to) {
+        uint64_t left = to - n->vdl;
+        uint32_t step = left > 0x10000000u ? 0x10000000u : (uint32_t)left;
+        int rc = node_io(n, n->vdl, NULL, step, true);
+        if (rc < 0)
+            return rc;
+        n->vdl += (uint32_t)rc;
+        if (n->vdl > n->size)
+            n->size = n->vdl;
+        n->dirty = true;
+        if ((uint32_t)rc != step)
+            return -ERROR_DISK_FULL;
+    }
+    return 0;
 }
 
-static int set_size(struct xnode *n, uint32_t size)
+static int set_size(struct xnode *n, uint64_t size)
 {
     struct xvol *v = n->v;
-    if (size > n->size)
-        return validate(n, size);
+    if (size > n->size) {                               /* longer: allocated, not written (past the valid length) */
+        uint32_t want = clusters(v, size);
+        while (n->nalloc < want) {
+            uint32_t c;
+            int rc = node_clus(n, n->nalloc, true, &c);
+            if (rc)
+                return rc < 0 ? rc : -ERROR_GEN_FAILURE;
+        }
+        n->size = size;
+        n->dirty = true;
+        return 0;
+    }
     if (size == n->size)
         return 0;
-    uint32_t keep = (size + v->cbytes - 1) / v->cbytes;
+    uint32_t keep = clusters(v, size);
     if (keep < n->nalloc) {
         if (n->contig) {
             if (free_clusters(v, n->first + keep, true, n->nalloc - keep) < 0)
@@ -1117,7 +1216,7 @@ static int ex_open(struct vol *vv, const char *path, uint32_t disp, bool write, 
             return done(v, rc);
         }
         n->attr = (uint8_t)((n->attr & ~(A_RO | A_HID | A_SYS)) | A_ARC | (attr & (A_HID | A_SYS)));
-        rtc_dos_time(&n->date, &n->time);
+        touch(n);
         n->dirty = true;
         node_update(n);
     }
@@ -1127,15 +1226,15 @@ static int ex_open(struct vol *vv, const char *path, uint32_t disp, bool write, 
     return done(v, 0);
 }
 
-static int ex_read(struct fnode *nn, uint32_t pos, void *buf, uint32_t len)
+static int ex_read(struct fnode *nn, uint64_t pos, void *buf, uint32_t len)
 {
     struct xnode *n = XN(nn);
     fs_lock();
     if (pos >= n->size)
         return done(n->v, 0);
     if (len > n->size - pos)
-        len = n->size - pos;
-    uint32_t real = pos < n->vdl ? (n->vdl - pos < len ? n->vdl - pos : len) : 0;
+        len = (uint32_t)(n->size - pos);
+    uint32_t real = pos < n->vdl ? (n->vdl - pos < len ? (uint32_t)(n->vdl - pos) : len) : 0;
     int rc = real ? node_io(n, pos, buf, real, false) : 0;
     if (rc < 0)
         return done(n->v, rc);
@@ -1144,7 +1243,7 @@ static int ex_read(struct fnode *nn, uint32_t pos, void *buf, uint32_t len)
     return done(n->v, rc);
 }
 
-static int ex_write(struct fnode *nn, uint32_t pos, const void *buf, uint32_t len)
+static int ex_write(struct fnode *nn, uint64_t pos, const void *buf, uint32_t len)
 {
     struct xnode *n = XN(nn);
     struct xvol *v = n->v;
@@ -1156,16 +1255,14 @@ static int ex_write(struct fnode *nn, uint32_t pos, const void *buf, uint32_t le
         node_update(n);
         return done(v, rc);
     }
-    if ((uint64_t)pos + len > 0xFFFFFFFFu)
-        len = 0xFFFFFFFFu - pos;
     rc = node_io(n, pos, (uint8_t *)buf, len, true);
     if (rc > 0) {
-        uint32_t end = pos + (uint32_t)rc;
+        uint64_t end = pos + (uint32_t)rc;
         if (end > n->size)
             n->size = end;
         if (end > n->vdl)
             n->vdl = end;
-        rtc_dos_time(&n->date, &n->time);
+        touch(n);
         n->attr |= A_ARC;
         n->dirty = true;
     }
@@ -1175,20 +1272,20 @@ static int ex_write(struct fnode *nn, uint32_t pos, const void *buf, uint32_t le
     return done(v, rc > 0 && urc < 0 ? urc : rc);
 }
 
-static int ex_set_size(struct fnode *nn, uint32_t size)
+static int ex_set_size(struct fnode *nn, uint64_t size)
 {
     struct xnode *n = XN(nn);
     fs_lock();
     int rc = set_size(n, size);
     if (rc == 0) {
-        rtc_dos_time(&n->date, &n->time);
+        touch(n);
         n->attr |= A_ARC;
     }
     int urc = node_update(n);
     return done(n->v, rc < 0 ? rc : urc);
 }
 
-static uint32_t ex_size(const struct fnode *n)  { return CXN(n)->size; }
+static uint64_t ex_size(const struct fnode *n)  { return CXN(n)->size; }
 static uint8_t ex_attr(const struct fnode *n)   { return CXN(n)->attr & 0x37; }
 static void ex_name_of(const struct fnode *n, uint8_t fcb[11]) { memcpy(fcb, CXN(n)->fcb, 11); }
 
@@ -1204,6 +1301,7 @@ static int ex_set_time(struct fnode *nn, uint16_t date, uint16_t time)
     fs_lock();
     n->date = date;
     n->time = time;
+    n->odd = 0;
     n->dirty = true;
     return done(n->v, node_update(n));
 }
@@ -1212,8 +1310,12 @@ static int ex_flush(struct fnode *nn)
 {
     struct xnode *n = XN(nn);
     fs_lock();
-    n->v->changed = true;
-    return done(n->v, node_update(n));
+    fs_lock();                                          /* done() lets go of one */
+    int rc = done(n->v, node_update(n));
+    if (cache_sync() < 0 && rc >= 0)                    /* to the disk, now */
+        rc = -ERROR_GEN_FAILURE;
+    fs_unlock();
+    return rc;
 }
 
 static void ex_dup(struct fnode *n)
@@ -1295,7 +1397,7 @@ static int ex_delete(struct vol *vv, const char *path)
         return done(v, -ERROR_ACCESS_DENIED);
     if (node_open(v, &dir.d, e.idx))
         return done(v, -ERROR_SHARING_VIOLATION);
-    uint32_t n = clus_ok(v, e.first) ? (e.size + v->cbytes - 1) / v->cbytes : 0;
+    uint32_t n = clus_ok(v, e.first) ? clusters(v, e.size) : 0;
     if ((rc = set_remove(v, &dir.d, &e)) == 0 && n)
         rc = free_clusters(v, e.first, e.flags & F_NOCHAIN, n);
     return done(v, rc);
@@ -1358,7 +1460,7 @@ static int ex_rmdir(struct vol *vv, const char *path)
     struct dref d = child_dref(v, &e);
     if (!dir_empty(v, &d))
         return done(v, -ERROR_DIR_NOT_EMPTY);
-    uint32_t n = (e.size + v->cbytes - 1) / v->cbytes;
+    uint32_t n = clusters(v, e.size);
     if ((rc = set_remove(v, &dir.d, &e)) == 0 && clus_ok(v, e.first))
         rc = free_clusters(v, e.first, d.contig, n);
     return done(v, rc);
@@ -1506,6 +1608,12 @@ static int find_more(struct fs_find *f, struct fs_entry *out)
         f->next = idx + 2;
         if (rc <= 0)
             return rc < 0 ? rc : -ERROR_NO_MORE_FILES;
+        bool again = false;                             /* an earlier entry may share its alias */
+        if (e.hashed) {
+            uint16_t h = le16(e.raw + 32 + 4) & 1023;
+            again = f->seen[h / 32] & (1u << (h % 32));
+            f->seen[h / 32] |= 1u << (h % 32);
+        }
         uint8_t a = e.attr & 0x37;
         if (f->dos) {
             if (f->attr == A_VOL || (a & (A_HID | A_SYS | A_DIR) & ~f->attr) || !fs_fcb_match(f->fcb, e.fcb))
@@ -1516,6 +1624,8 @@ static int find_more(struct fs_find *f, struct fs_entry *out)
             if (!all && !fs_wild(p, e.name) && !fs_wild(p, e.alias))
                 continue;
         }
+        if (again)
+            number(v, &d, &e);
         fill_entry(&e, out);
         return 0;
     }
@@ -1614,8 +1724,12 @@ static void ex_sync(struct vol *vv)
     for (int i = 0; i < NODE_MAX; i++)
         if (nodes[i].refs && nodes[i].v == v)
             node_update(&nodes[i]);
-    v->changed = true;
+    if (v->marked_dirty) {
+        set_clean(v, true);
+        v->marked_dirty = true;                         /* done() mustn't set it again */
+    }
     done(v, 0);
+    v->marked_dirty = false;
 }
 
 static const struct fs_ops exfat_ops = {

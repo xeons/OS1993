@@ -94,10 +94,12 @@ class Checker:
 
 
 class Machine:
-    def __init__(self, variant="normal", mode="autorun", vmport=False, hostfwd=(), data_disk=None, files=None):
+    def __init__(self, variant="normal", mode="autorun", vmport=False, hostfwd=(), data_disk=None, files=None, data_index=2, big_disk=None):
         self.variant, self.mode, self.vmport = variant, mode, vmport
         self.hostfwd = hostfwd                      # e.g. ("tcp:127.0.0.1:5555-:7",)
-        self.data_disk = data_disk                  # an image for the secondary IDE master
+        self.data_disk = data_disk                  # an image for another IDE position
+        self.data_index = data_index                # 1 primary slave, 2 secondary master
+        self.big_disk = big_disk                    # another, as the secondary slave
         self.files = files or {}                    # {name: text} for C:\OS1993 (DOS line endings)
 
     def __enter__(self):
@@ -121,7 +123,8 @@ class Machine:
             "qemu-system-i386", "-M", "isapc,vmport=on" if self.vmport else "isapc,vmport=off",
             "-cpu", "486", "-m", "16", "-vga", "std", "-L", rom, "-L", "/usr/share/qemu",
             "-drive", f"file={IMG},format=raw,if=ide,index=0", "-serial", "file:SERIAL.LOG",
-            *(["-drive", f"file={self.data_disk},format=raw,if=ide,index=2"] if self.data_disk else []),
+            *(["-drive", f"file={self.data_disk},format=raw,if=ide,index={self.data_index}"] if self.data_disk else []),
+            *(["-drive", f"file={self.big_disk},format=raw,if=ide,index=3"] if self.big_disk else []),
             # an NE2000 on QEMU's user-mode network: DHCP, gateway 10.0.2.2 (the host)
             "-nic", "user,model=ne2k_isa,mac=52:54:00:12:34:56" + "".join(",hostfwd=" + f for f in self.hostfwd),
             "-device", "isa-debug-exit,iobase=0xf4,iosize=4",

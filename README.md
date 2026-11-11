@@ -27,7 +27,7 @@ are for later stages.
 | `make qemu-sessions` | types into two concurrent DOS sessions via QEMU's monitor |
 | `make qemu-absmouse` | absolute pointer through QEMU's VMware port: the cursor lands on the exact pixel, and clicks hit their control |
 | `make qemu-crt` | the C runtime: CRTTEST.BIN (CRT.DLL) and CRTSTAT.BIN (libcrt.a) pass its checks; a stack overrun, a heap overrun, a double free, a fortified memcpy, a broken Annex K constraint, `%n` and a failed assert each end the program with the reason logged; every process has its own canary |
-| `make qemu-fat` | the VMM's own disks: FAT32, FAT16, exFAT and ext2 partitions on the secondary IDE channel; FreeDOS had mounted the FAT ones as D: and E:, exFAT is F:, ext2 G:; a DOS session works on all four through the redirector (DIR, TYPE, COPY, MD, REN, DEL, a batch file read from E:), FSTEST.BIN's 119 checks through KERNEL.DLL (long names and aliases, a 300 KB file in pieces, writing, gaps, truncating, folders, moves, read-only, directories that grow, an exFAT file that can't stay contiguous, ext2's indirect blocks, symbolic links, case and dot files), DOS sees D: and E: as its own drives again after OS1993 ends, and mtools, `tools/exfat.py`, debugfs, fsck.fat, fsck.exfat and e2fsck check the image |
+| `make qemu-fat` | the VMM's own disks, run twice: with the data disk on the secondary channel and beside the boot disk (whose INT 13h the VMM then does); FAT32, FAT16, exFAT and two ext2 logical drives, plus a 5 GB exFAT disk; FreeDOS had mounted the FAT ones as D: and E:, exFAT is F:, ext2 G: and H:, the big disk I:; a DOS session works on them through the redirector (DIR, TYPE, COPY, MD, REN, DEL, a batch file read from E:), FSTEST.BIN's 151 checks through KERNEL.DLL (long names and aliases, numbered aliases, a 300 KB file in pieces, writing, gaps, truncating, folders, moves, read-only, locks, directories that grow, an exFAT file that can't stay contiguous, ext2's indirect blocks and 8 KB blocks, links, case and dot files, a 4.5 GB exFAT file on a 4 KB-sector disk, a 5 GB sparse ext2 file, the time zone), LFNTEST.COM's long-name calls, share modes and locks from DOS, DOS sees D: and E: as its own drives again after OS1993 ends, and mtools, `tools/exfat.py`, debugfs, fsck.fat, fsck.exfat and e2fsck check the image |
 | `make qemu-net` | the network: the NE2000 and a DHCP lease, NETTEST.BIN's 26 checks (loopback UDP and TCP with a server thread, refused connections, ICMP port unreachable, timeouts, non-blocking sockets and select, 64 KB echoed by a server on the host), PING to the host, the loopback and nobody, IPCONFIG, and the host connecting in to a server in the guest |
 | `make qemu-threads` | threads: 67 checks (joins and exit codes, critical sections, events, semaphores, mutexes, timeouts, TLS and errno per thread, suspend/terminate, the 16-thread limit, malloc and printf from several threads, virtual memory, private heaps, a child process, the file calls); a stack overflow hits the guard page, a read-only page faults, the last thread's code ends the process, `exit` from a second thread ends them all |
 | `make qemu-vesa` | the VBE display driver: Display Properties switches to 1024×768 high colour, 800×600 in 256 colours and true colour, No and the 15-second timeout go back, a DOS session and back keeps the mode, OS1993.INI restores it next session, and 640×480×16 is VGA again |
@@ -440,61 +440,85 @@ loopback, as Windows for Workgroups and Win95 had theirs in VxDs.
 
 ## Disks and file systems
 
-The VMM has its own disk driver and file system, as Windows for
-Workgroups 3.11 had 32-bit File Access, so files on its disks never go
-through DOS or the BIOS, and OS1993 programs get long names.
+The VMM has its own disk driver and file systems, as Windows for
+Workgroups 3.11 had 32-bit File Access and 32-bit Disk Access: files on its
+disks never go through DOS or the BIOS, OS1993 programs get long names,
+and DOS programs get them too.
 
-- **IDE** (`kernel/disk/ata.c`): both legacy channels, PIO, polled (the
-  drive's interrupt off). Each disk found is matched to its BIOS drive
-  number by reading its first sector both ways. The channel holding BIOS
-  drive 80h -- the disk DOS booted from -- stays DOS's; the VMM takes every
-  other channel: its ports read as empty from V86 code and INT 13h for its
-  disks fails, so nothing else touches it. LBA28 (up to 128 GB).
+- **IDE** (`kernel/disk/ata.c`): both legacy channels, PIO, interrupt-driven
+  (a transfer sleeps until the drive's interrupt; a timer tick rescues one
+  that never comes), LBA28 and LBA48 (to 2 TB). Each disk is matched to its
+  BIOS drive number by reading its first sector both ways, and the BIOS's
+  geometry for it is noted. The VMM takes every channel with a disk and no
+  ATAPI device (a CD driver in DOS needs that one): its ports read as empty
+  from V86 code, and **INT 13h** for its disks is done by the VMM
+  (`int13.c`): CHS calls with the BIOS's geometry, the EDD calls (41h-48h)
+  in LBA. So DOS's own boot drive, C:, works through the VMM's driver too,
+  and a disk may share a channel with it.
 - **Partitions** (`part.c`): the MBR's four entries and the logical drives
-  in an extended partition; a disk with a boot sector and no table is one
-  volume. **The block cache** (`cache.c`) keeps 160 sectors, least recently
-  used out first; every file system call that changed something writes it
-  all back before it returns, so the disk is consistent between calls.
+  in an extended partition; a disk with no table but a FAT or exFAT boot
+  sector or an ext2 superblock is one volume. **The block cache**
+  (`cache.c`): 1024 sectors in a hash table, least recently used out first,
+  **written behind**: a changed sector waits until it is two seconds old
+  (a flusher thread), its buffer is needed, a file is flushed
+  (FlushFileBuffers, DOS's commit, INT 21h AH=0Dh), raw INT 13h reads its
+  range, or OS1993 ends; neighbours go out as one transfer.
 - **FAT12, FAT16, FAT32** (`kernel/fs/fat.c`): the cluster count decides
   the type; every FAT copy is kept (unless FAT32 says otherwise), the FAT32
-  FSInfo free count and next free cluster too. **Long names** (VFAT): read
-  back from their entries (checked by sequence and checksum, an orphan
-  ignored), written for any name that isn't plain 8.3, with a unique
-  `BASIS~N.EXT` alias; an 8.3 name in one case per part gets Windows NT's
-  case bits instead (`lower.txt`). Names match without regard to case,
-  long or short. Open files are shared nodes, one per directory entry, so
-  every handle sees one size; whole clusters move straight between the
-  disk and the caller.
+  FSInfo free count and next free cluster too, and a bitmap of the free
+  clusters, read from the FAT once. FAT[1]'s "cleanly unmounted" bit is off
+  while the volume is changed and back on when OS1993 ends. **Long names**
+  (VFAT): read back from their entries (checked by sequence and checksum,
+  an orphan ignored), written for any name that isn't plain 8.3, with a
+  unique `BASIS~N.EXT` alias; an 8.3 name in one case per part gets
+  Windows NT's case bits instead (`lower.txt`). Names match without regard
+  to case, long or short. Open files are shared nodes, one per directory
+  entry, so every handle sees one size; whole clusters move straight
+  between the disk and the caller. Files up to 4 GB - 1, as FAT allows.
 - **exFAT** (`kernel/fs/exfat.c`): free space from the allocation bitmap;
   a file or directory is one contiguous run (NoFatChain) while the cluster
   after its end is free, and gets a FAT chain when it can't grow in place.
   Entry sets (File, Stream Extension, File Name entries) are checked by
   their checksum and written with it and the name hash; names keep their
-  case and compare through the volume's up-case table. Bytes past a file's
-  valid data length read as zeros. exFAT has no 8.3 names: DOS sees the
-  name itself if it fits 8.3, otherwise "XXhhhh~1.EXT" from the name hash;
-  "." and ".." are made up for searches, as FAT has them. Files up to 4 GB.
-- **ext2** (`kernel/fs/ext2.c`): block groups with their bitmaps and
-  inode tables, files mapped through direct and single, double and triple
-  indirect blocks (holes read as zeros), new blocks after the file's last
-  one and new directories spread over the groups; the free counts in the
-  group descriptors and the superblock stay exact, and the volume is
-  marked not clean while mounted. Directory records are split and folded
-  back as Linux does; a dir_index tree's flag goes when its directory
-  changes. Names are UTF-8 on the disk, Latin-1 here; ext2 tells case
-  apart, so a lookup tries the exact name first and a new name can't
-  differ from another only in case. The owner's write bit is the
-  read-only attribute, a leading dot hidden; symbolic links read as their
-  target. An ext3 volume (a journal) or one with read-only-compatible
-  features it doesn't know mounts read-only; ext4's incompatible features
-  (extents, 64-bit ...) aren't mounted at all.
+  case and compare through the volume's up-case table. Files of any size
+  (64-bit); bytes past a file's valid data length read as zeros, and a file
+  made longer is allocated but not written. Sectors of 512 bytes to 4 KB.
+  Timestamps carry the 10 ms field and, once the time zone is known, the
+  UTC offset; a time with another offset is moved to ours. The boot
+  sector's VolumeDirty flag is on while the volume is changed, and
+  PercentInUse is set when OS1993 ends. exFAT has no 8.3 names: DOS sees
+  the name itself if it fits 8.3, otherwise "XXhhhh~1.EXT" from the name
+  hash ("~2" ... "~9" for names that would share one); "." and ".." are
+  made up for searches, as FAT has them.
+- **ext2** (`kernel/fs/ext2.c`): block groups with their bitmaps and inode
+  tables, blocks of 1 to 64 KB, files mapped through direct and single,
+  double and triple indirect blocks (holes read as zeros; a file made
+  longer is a hole), files of any size (large_file), new blocks after the
+  file's last one and new directories spread over the groups; the free
+  counts in the group descriptors and the superblock stay exact, and the
+  volume is marked not clean while mounted. Directory records are split
+  and folded back as Linux does; a dir_index tree's flag goes when its
+  directory changes. Names are UTF-8 on the disk, Latin-1 here; ext2 tells
+  case apart, so a lookup tries the exact name first and a new name can't
+  differ from another only in case; DOS gets numbered aliases as on exFAT.
+  The owner's write bit is the read-only attribute, a leading dot hidden;
+  symbolic links read as their target. **Hard and symbolic links** can be
+  made (`CreateHardLink`, `CreateSymbolicLink`). Times are kept in UTC,
+  through the time zone. An ext3 volume (a journal) or one with
+  read-only-compatible features it doesn't know mounts read-only; ext4's
+  incompatible features (extents, 64-bit ...) aren't mounted at all.
 - **Drivers** plug in through an operations table (`kernel/fs/fsimpl.h`);
   `fs.c` mounts each partition with the first driver that knows it, and
-  holds the lock and the list of volumes.
+  holds the lock, the list of volumes, the share modes and byte-range
+  locks, and the time zone.
 - **OS1993 programs** use the same calls as before (`CreateFile`,
   `FindFirstFile` ...); `files.c` sends paths on the VMM's drives straight
   to the file system, keeping their case. `WIN32_FIND_DATA` has the long
-  `name` and the 8.3 `short_name`.
+  `name`, the 8.3 `short_name` and `size_high`; `SetFilePointerEx` and
+  `GetFileSizeEx` reach past 4 GB; `LockFile`/`UnlockFile` lock byte
+  ranges against other handles and DOS programs; `SetTimeZoneInformation`
+  sets the time zone, which the shell keeps in OS1993.INI
+  (`[timezone] tzbias=`, minutes, UTC = local + bias).
 - **DOS** (`kernel/fs/redir.c`) sees the same volumes as network drives: the
   drive letter's current directory structure is marked "network", so DOS
   sends every call for it to the network redirector, INT 2Fh AH=11h, as it
@@ -502,18 +526,29 @@ through DOS or the BIOS, and OS1993 programs get long names.
   calls; they trap into the V86 monitor, which answers them from the file
   system in 32-bit code, in whichever VM made them: 8.3 names from DOS's
   swappable data area, open files as DOS's own file table entries with our
-  file number in them, searches kept in the caller's DTA. A volume DOS had
-  mounted itself (the same serial number) keeps its letter: DOS's buffers
-  are flushed and dropped first, and when OS1993 ends the drive is given
-  back and DOS rebuilds it from the disk (FSInfo is up to date, so even
-  the free space is right). Other volumes get free letters below
-  LASTDRIVE.
+  file number in them, searches held by the VMM with a slot and a stamp in
+  the caller's DTA. **Share modes and locks** are enforced (INT 21h
+  AH=5Ch, the deny modes of an open), between DOS programs and OS1993's.
+  A volume DOS had mounted itself (the same boot sector, or serial number)
+  keeps its letter: DOS's buffers are flushed and dropped first, and when
+  OS1993 ends the drive is given back and DOS rebuilds it from the disk.
+  DOS's boot drive, and a drive with files open, stay DOS's (the VMM lets
+  go of that volume). Other volumes get free letters below LASTDRIVE.
+- **Long names for DOS programs** (`kernel/fs/lfn.c`): Windows 95's
+  INT 21h AX=71xxh calls (mkdir, rmdir, chdir, delete, attributes and
+  times, current directory, find first/next/close, rename, full path,
+  extended open/create, volume information, file information by handle,
+  time conversion, short names) on the VMM's drives, answered in the
+  monitor or turned into the plain DOS call with the 8.3 path. On DOS's own
+  drives DOS answers 7100h ("not supported"), so programs use 8.3 names
+  there, as on a DOS without long names.
 
-What doesn't work yet: other file systems (writing ext3, ext4, btrfs:
-see TODO.md), sharing a channel with the boot disk (that needs INT 13h done by
-the VMM for DOS too), more than 128 GB, sector sizes other than 512, DOS's
-file sharing and locks (accepted, not enforced), and long names for DOS
-programs (they see the aliases).
+What doesn't work: ext3's journal and ext4 (see TODO.md); long names on
+DOS's own drives (C:); TexFAT (exFAT with two FATs, which only Windows CE
+uses: desktop Windows doesn't mount it either) and ATAPI or 4 KB-sector
+drives; Unix owners, permissions beyond the write bit, and extended
+attributes on ext2 (kept as they are, not shown: nothing in a Win32-style
+API would show them); lost+found is e2fsck's to fill.
 
 ## The window system across processes
 
@@ -804,8 +839,8 @@ kernel/vmtest.c                          multi-VM self-test
 kernel/dosmgr.c                          one DOS shared by all VMs
 kernel/random.c                          random numbers (ChaCha20 from interrupt timing)
 kernel/net/                              the NE2000, Ethernet/ARP/IP/ICMP/DHCP, sockets and UDP, TCP
-kernel/disk/                             IDE (ATA PIO), partitions, the block cache
-kernel/fs/                               FAT12/16/32 with long names, exFAT, ext2, the DOS redirector (INT 2Fh AH=11h)
+kernel/disk/                             IDE (ATA PIO, interrupts, LBA48), INT 13h for DOS, partitions, the block cache
+kernel/fs/                               FAT12/16/32 with long names, exFAT, ext2, the DOS redirector (INT 2Fh AH=11h), long names for DOS (INT 21h AX=71xxh)
 kernel/files.c                           file calls for ring 3: DOS's drives through DOS, the VMM's directly
 kernel/vga.c gfx.c                       VGA state (VDD), planar drawing
 kernel/display.c vbe.c                   display modes: the VBE adapter, the VBE BIOS probe
@@ -823,7 +858,8 @@ kernel/gdt.c idt.c pic.c timer.c keyboard.c console.c serial.c kprintf.c panic.c
 kernel/include/          headers; bootinfo.h is shared with the loader
 kernel/linker.ld         links at 0x80000000, header first
 test/dosbox-x.conf       the emulated 1993 machine
-tools/                   check486.sh, check-test.sh, mkfreedos.sh, mkdata.sh, the QEMU tests
+tools/                   check486.sh, check-test.sh, mkfreedos.sh, mkdata.sh, exfat.py, the QEMU tests
+test/dos/lfntest.asm     a DOS program using the long-name calls, share modes and locks
 ```
 
 ## Rules of the house
@@ -850,9 +886,9 @@ tools/                   check486.sh, check-test.sh, mkfreedos.sh, mkdata.sh, th
    through `INT 21h` in the System VM on DOS's drives, and through the
    VMM's own IDE driver and FAT12/16/32 (long names), exFAT and ext2
    file systems on the others, which DOS reaches through a redirector in the V86 monitor (as
-   32-bit File Access did in Windows for Workgroups 3.11). Still to do:
-   INT 13h done by the VMM for DOS (so the boot disk can be the VMM's too),
-   and the other file systems in TODO.md.
+   32-bit File Access did in Windows for Workgroups 3.11), with INT 13h for
+   DOS done by the VMM and long names for DOS programs. Still to do: the
+   other file systems in TODO.md.
 5. **More virtual devices (VxD-style).** The PIC, keyboard and text display
    are done. Still to do: the PIT (programs that reprogram the timer), CRTC
    ports for background VMs, graphics modes, mouse, serial and printer ports.
