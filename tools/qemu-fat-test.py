@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""The VMM's own disks: IDE driver, FAT32 and FAT16, the DOS redirector.
+"""The VMM's own disks: IDE driver, FAT32, FAT16 and exFAT, the DOS redirector.
 
-A 64 MB disk on the secondary IDE master (tools/mkdata.sh: FAT32 and
-FAT16 partitions, with long names written by mtools) is the VMM's; FreeDOS
-had mounted it as D: and E:, and keeps those letters through the
-redirector. A DOS session runs E:\\DOSTEST.BAT (reading it through the
+A 96 MB disk on the secondary IDE master (tools/mkdata.sh: FAT32 and
+FAT16 partitions, with long names written by mtools, and exFAT, written by
+tools/exfat.py) is the VMM's; FreeDOS had mounted the FAT ones as D: and
+E:, and keeps those letters through the redirector; exFAT, which DOS
+can't read, is F:. A DOS session runs E:\\DOSTEST.BAT (reading it through the
 redirector too): DIR, TYPE, COPY, MD, REN, DEL, ECHO into files. Then
 FSTEST.BIN works on both volumes through KERNEL.DLL, long names and all,
 and checks what DOS did. After OS1993 ends, mtools reads what both wrote
@@ -37,6 +38,11 @@ e:
 cd \dosdir
 cd >> e:\dosout.txt
 c:
+type f:\readme.txt >> e:\dosout.txt
+copy f:\big.bin f:\bigdos.bin > nul
+md f:\dosx
+echo exfat from DOS> f:\dosx\dos.txt
+dir f:\ >> e:\dosout.txt
 echo batch done>> e:\dosout.txt
 exit
 """
@@ -79,12 +85,14 @@ def main():
         if not m.wait_log("PS/2 mouse"):
             raise SystemExit("  FAIL  VMM did not boot")
         log = m.log()
-        check("ATA: disk 2 (secondary master): QEMU HARDDISK, 64 MB, BIOS 81h, the VMM's" in log
+        check("ATA: disk 2 (secondary master): QEMU HARDDISK, 96 MB, BIOS 81h, the VMM's" in log
               and "BIOS 80h, left to DOS" in log, "IDE: the boot disk stays DOS's, the second channel is the VMM's")
         check("FAT32 on disk 2 at 2048: 96760 clusters of 512 bytes, serial 3232-3232" in log
               and "FAT16 on disk 2 at 100352: 7655 clusters of 2048 bytes" in log, "FAT32 and FAT16 mounted")
         check("REDIR: D: is the VMM's now (FAT32" in log and "REDIR: E: is the VMM's now (FAT16" in log,
               "DOS's D: and E: go through the redirector now")
+        check("exFAT on disk 2 at 131072: 7" in log and "REDIR: F: for the VMM's exFAT volume" in log,
+              "exFAT mounted, F: for DOS")
 
         m.key("n")
         m.wait_log("Started DOS 1")
@@ -106,7 +114,7 @@ def main():
         for f in re.findall(r"FS: FAIL .*", log):
             print("        " + f)
         line = re.search(r"FS: (\d+) of (\d+) checks passed", log)
-        check(line and line.group(1) == line.group(2) and int(line.group(2)) >= 50,
+        check(line and line.group(1) == line.group(2) and int(line.group(2)) >= 80,
               line.group(0) if line else "FSTEST: no result")
         check(m.shut_down(), "the GUI shuts down")
         m.key("x", 1)
@@ -134,8 +142,29 @@ def main():
     r = mtools("mdir", P1, "-b", "::/")
     check(b"New Long Name Document.txt" in r.stdout and b"GONE.TXT" not in r.stdout,
           "mtools sees the long name the VMM wrote, and not the file DOS deleted")
+    check("exFAT here." in out and re.search(r"BIGDOS\s+BIN\s+300[ ,.]?000", out), "DOS reads and writes exFAT through the redirector")
+    sys.path.insert(0, os.path.join(ROOT, "tools"))
+    from exfat import ExFat
+    try:
+        x = ExFat(IMG, 131072 * 512)
+        check(x.read("FROMGUI.TXT") == b"exFAT, written by an OS1993 program.\r\n", "tools/exfat.py reads F:\\FROMGUI.TXT")
+        names = [e.name for e in x.listdir("GUIDIR")]
+        check(len(names) == 40 and "Entry number 78 of a folder that grows.txt" in names,
+              "... and F:\\GUIDIR's 40 long names (checksums and name hashes right)")
+        check(x.read("frag1.bin") == bytes((i * 31 + 7) & 255 for i in range(6000)), "... and the file that was in pieces")
+        x.f.close()
+    except Exception as e:                              # noqa: BLE001
+        check(False, f"tools/exfat.py reads the exFAT volume ({e})")
     with open(IMG, "rb") as f:
         disk = f.read()
+    with tempfile.NamedTemporaryFile(suffix=".img") as t:
+        t.write(disk[131072 * 512:(131072 + 65536) * 512])
+        t.flush()
+        r = subprocess.run(["fsck.exfat", "-n", t.name], capture_output=True, text=True)
+        for l in (r.stdout + r.stderr).splitlines()[-6:]:
+            if "clean" not in l and "version" not in l:
+                print("        " + l)
+        check(r.returncode == 0 and "clean" in r.stdout, "fsck.exfat: the exFAT volume is clean")
     for name, start, count in (("FAT32", 2048, 98304), ("FAT16", 100352, 30720)):
         with tempfile.NamedTemporaryFile(suffix=".img") as t:
             t.write(disk[start * 512:(start + count) * 512])

@@ -45,6 +45,7 @@ struct fs_find {                        /* a search in progress */
     struct vol *v;
     uint32_t dir;                       /* directory cluster (0: the root) */
     uint32_t next;                      /* next entry index */
+    uint32_t dirlen;                    /* the directory's length in clusters, if the driver needs it */
     uint8_t  attr;                      /* DOS mode: the search attributes */
     bool     dos;                       /* DOS mode: FCB template, DOS's attribute rules */
     uint8_t  fcb[11];                   /* DOS mode's template */
@@ -105,10 +106,6 @@ void redir_init(void);                  /* drive letters for DOS (System VM, bef
 bool redir_int2f(struct vm *vm, struct regs *r);    /* true: handled */
 void redir_restore(void);               /* DOS's own drives back (shutdown) */
 void redir_vm_end(struct vm *vm);       /* close what a VM left open */
-
-/* fat.c, for fs.c */
-struct vol *fat_mount(struct partition *p);
-void fat_sync_all(void);
 
 /* user.c */
 void rtc_dos_time(uint16_t *date, uint16_t *time);

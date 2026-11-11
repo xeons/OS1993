@@ -349,6 +349,7 @@ static void save_search(uint32_t blk, const struct fs_find *f, char letter)
     *at(blk + 0x0C) = f->attr;
     wr16(blk + 0x0D, (uint16_t)f->next);
     wr32(blk + 0x0F, f->dir);
+    wr16(blk + 0x13, (uint16_t)f->dirlen);
 }
 
 static int find_first(uint32_t fn, struct fs_find *f, struct fs_entry *e, struct vol **vp)
@@ -622,6 +623,7 @@ bool redir_int2f(struct vm *vm, struct regs *r)
         f.attr = *at(es_di + 0x0C);
         f.next = rd16(es_di + 0x0D);
         f.dir = rd32(es_di + 0x0F);
+        f.dirlen = rd16(es_di + 0x13);
         rc = fs_find_next(&f, &e);
         if (rc == 0) {
             save_search(es_di, &f, fs_letter(f.v));

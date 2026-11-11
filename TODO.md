@@ -145,8 +145,15 @@ systems); DOS reaches its volumes through the redirector.
       bits).
 - [ ] FAT: write-behind (now every call writes through when it returns);
       a dirty-volume bit; a free-cluster bitmap instead of walking the FAT.
-- [ ] A volume ops table, so exFAT and ext2 plug in beside FAT.
-- [ ] exFAT (allocation bitmap, upcase table, checksummed entry sets).
+- [x] A volume ops table (`kernel/fs/fsimpl.h`), so file systems plug in beside FAT.
+- [x] exFAT (allocation bitmap, up-case table, checksummed entry sets,
+      contiguous files with FAT chains when they must).
+- [ ] exFAT: files over 4 GB (64-bit sizes through the API); the
+      VolumeDirty flag and PercentInUse; TexFAT's second FAT and bitmap;
+      sector sizes other than 512; names outside Latin-1 (the up-case
+      table beyond 256; UTF-16 names show as '_'); DOS aliases are made
+      from the name hash and can collide (one of the two is then out of
+      DOS's reach); timestamps' 10 ms and UTC offset fields.
 - [ ] ext2; ext3 (journal replay to read, journalled writes); ext4
       (extents, 64-bit blocks, htree directories, CRC32C metadata) read-only
       first.

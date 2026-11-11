@@ -24,7 +24,9 @@
  */
 #include "kernel.h"
 #include "disk.h"
-#include "fs.h"
+#include "fsimpl.h"
+#include "io.h"
+#include "sched.h"
 #include "user.h"
 
 #define A_RO   0x01
@@ -39,9 +41,8 @@
 #define NODE_MAX 64
 #define LFN_MAX  20                     /* 20 x 13 >= 255 */
 
-struct vol {
-    bool     used;
-    char     letter;
+struct fvol {
+    struct vol h;                       /* first: what fs.c sees */
     struct disk *disk;
     uint32_t start, count;              /* the partition */
     int      type;                      /* 12, 16, 32 */
@@ -55,13 +56,12 @@ struct vol {
     bool     free_known;
     uint32_t fsinfo;                    /* absolute LBA, 0: none */
     bool     fsinfo_dirty, changed;
-    uint32_t serial;
-    char     label[12];
 };
 
-struct fnode {
+struct fnod {
+    struct fnode h;                     /* first */
     int      refs;
-    struct vol *v;
+    struct fvol *v;
     uint32_t dir, idx, first;           /* its entries: LFN from first, the 8.3 one at idx */
     uint32_t clus, size;
     uint8_t  attr;
@@ -71,9 +71,10 @@ struct fnode {
     uint32_t c_idx, c_clus;             /* cluster c_idx of the file is c_clus (0: none) */
 };
 
-static struct vol vols[VOL_MAX];
+static struct fvol vols[VOL_MAX];
 static int nvols;
-static struct fnode nodes[NODE_MAX];
+static struct fnod nodes[NODE_MAX];
+static const struct fs_ops fat_ops;
 
 /* ---- little helpers ------------------------------------------------------ */
 
@@ -82,24 +83,25 @@ static uint32_t le32(const uint8_t *p) { return p[0] | p[1] << 8 | p[2] << 16 | 
 static void put16(uint8_t *p, uint32_t v) { p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); }
 static void put32(uint8_t *p, uint32_t v) { put16(p, v); put16(p + 2, v >> 16); }
 
-static char up(char c) { return c >= 'a' && c <= 'z' ? (char)(c - 32) : c; }
+#define up        fs_up
+#define name_eq   fs_name_eq
+#define wild      fs_wild
+#define fcb_match fs_fcb_match
+#define clean_name fs_clean_name
+#define short_char fs_short_char
+#define FV(x)     ((struct fvol *)(x))
+#define FN(x)     ((struct fnod *)(x))
+#define CFN(x)    ((const struct fnod *)(x))
 
-static bool name_eq(const char *a, const char *b)
-{
-    while (*a && up(*a) == up(*b))
-        a++, b++;
-    return !*a && !*b;
-}
+static uint32_t clus_lba(const struct fvol *v, uint32_t c) { return v->data_lba + (c - 2) * v->spc; }
+static bool clus_ok(const struct fvol *v, uint32_t c)      { return c >= 2 && c <= v->nclus + 1; }
 
-static uint32_t clus_lba(const struct vol *v, uint32_t c) { return v->data_lba + (c - 2) * v->spc; }
-static bool clus_ok(const struct vol *v, uint32_t c)      { return c >= 2 && c <= v->nclus + 1; }
-
-static uint32_t ent_clus(const struct vol *v, const uint8_t *e)
+static uint32_t ent_clus(const struct fvol *v, const uint8_t *e)
 {
     return le16(e + 26) | (v->type == 32 ? (uint32_t)le16(e + 20) << 16 : 0);
 }
 
-static void set_ent_clus(const struct vol *v, uint8_t *e, uint32_t c)
+static void set_ent_clus(const struct fvol *v, uint8_t *e, uint32_t c)
 {
     put16(e + 26, c);
     put16(e + 20, v->type == 32 ? c >> 16 : 0);
@@ -108,7 +110,7 @@ static void set_ent_clus(const struct vol *v, uint8_t *e, uint32_t c)
 /* ---- the FAT --------------------------------------------------------------- */
 
 /* One byte of FAT copy `copy` at byte offset off (FAT12 entries straddle). */
-static int fat_byte(struct vol *v, uint32_t copy, uint32_t off, uint8_t **p, struct buf **b)
+static int fat_byte(struct fvol *v, uint32_t copy, uint32_t off, uint8_t **p, struct buf **b)
 {
     *b = bread(v->disk, v->fat_lba + copy * v->fat_secs + off / SECTOR);
     if (!*b)
@@ -117,7 +119,7 @@ static int fat_byte(struct vol *v, uint32_t copy, uint32_t off, uint8_t **p, str
     return 0;
 }
 
-static int fat_get(struct vol *v, uint32_t c, uint32_t *next)
+static int fat_get(struct fvol *v, uint32_t c, uint32_t *next)
 {
     struct buf *b, *b2;
     uint8_t *p, *p2;
@@ -146,7 +148,7 @@ static int fat_get(struct vol *v, uint32_t c, uint32_t *next)
     return 0;
 }
 
-static int fat_set(struct vol *v, uint32_t c, uint32_t val)
+static int fat_set(struct fvol *v, uint32_t c, uint32_t val)
 {
     struct buf *b, *b2;
     uint8_t *p, *p2;
@@ -186,7 +188,7 @@ static int fat_set(struct vol *v, uint32_t c, uint32_t val)
     return 0;
 }
 
-static int count_free(struct vol *v)
+static int count_free(struct fvol *v)
 {
     uint32_t n = 0, x;
     for (uint32_t c = 2; c <= v->nclus + 1; c++) {
@@ -200,7 +202,7 @@ static int count_free(struct vol *v)
 }
 
 /* A free cluster, marked as a chain's end and linked after prev (if any). */
-static int alloc_clus(struct vol *v, uint32_t prev, uint32_t *out)
+static int alloc_clus(struct fvol *v, uint32_t prev, uint32_t *out)
 {
     if (v->free_known && v->free == 0)
         return -ERROR_DISK_FULL;
@@ -224,7 +226,7 @@ static int alloc_clus(struct vol *v, uint32_t prev, uint32_t *out)
     return -ERROR_DISK_FULL;
 }
 
-static int free_chain(struct vol *v, uint32_t c)
+static int free_chain(struct fvol *v, uint32_t c)
 {
     for (uint32_t n = 0; clus_ok(v, c) && n <= v->nclus; n++) {
         uint32_t next;
@@ -238,7 +240,7 @@ static int free_chain(struct vol *v, uint32_t c)
     return 0;
 }
 
-static int zero_clus(struct vol *v, uint32_t c)
+static int zero_clus(struct fvol *v, uint32_t c)
 {
     for (uint32_t s = 0; s < v->spc; s++) {
         struct buf *b = bzero_get(v->disk, clus_lba(v, c) + s);
@@ -251,12 +253,12 @@ static int zero_clus(struct vol *v, uint32_t c)
 /* ---- directories ------------------------------------------------------------ */
 
 struct dcur {                           /* a directory being walked */
-    struct vol *v;
+    struct fvol *v;
     uint32_t dir;                       /* 0: the root */
     uint32_t c_idx, c_clus;             /* its cluster c_idx is c_clus (0: none yet) */
 };
 
-static void dcur_init(struct dcur *d, struct vol *v, uint32_t dir)
+static void dcur_init(struct dcur *d, struct fvol *v, uint32_t dir)
 {
     *d = (struct dcur){ v, dir, 0, 0 };
 }
@@ -267,7 +269,7 @@ static bool fixed_root(const struct dcur *d) { return d->dir == 0 && d->v->type 
  * cluster chain is extended to reach it (with zeroed clusters). */
 static int dir_sector(struct dcur *d, uint32_t idx, bool grow, uint32_t *lba)
 {
-    struct vol *v = d->v;
+    struct fvol *v = d->v;
     if (fixed_root(d)) {
         if (idx >= v->root_ents)
             return 1;
@@ -426,7 +428,7 @@ static void short_display(const uint8_t *raw, char *out, bool use_case)
     out[n] = '\0';
 }
 
-static void fill_entry(const struct vol *v, const struct dent *d, struct fs_entry *e)
+static void fill_entry(const struct fvol *v, const struct dent *d, struct fs_entry *e)
 {
     const uint8_t *r = d->raw;
     short_display(r, e->short_name, false);
@@ -449,7 +451,7 @@ static void fill_entry(const struct vol *v, const struct dent *d, struct fs_entr
 }
 
 /* The entry called name (long or short, any case) in a directory. */
-static int dir_find(struct vol *v, uint32_t dir, const char *name, struct dent *e)
+static int dir_find(struct fvol *v, uint32_t dir, const char *name, struct dent *e)
 {
     struct dcur d;
     dcur_init(&d, v, dir);
@@ -468,7 +470,7 @@ static int dir_find(struct vol *v, uint32_t dir, const char *name, struct dent *
 }
 
 /* Walk to the directory holding the path's last component. */
-static int walk(struct vol *v, const char *path, uint32_t *dir, const char **last)
+static int walk(struct fvol *v, const char *path, uint32_t *dir, const char **last)
 {
     uint32_t c = 0;
     const char *s = path;
@@ -499,43 +501,6 @@ static int walk(struct vol *v, const char *path, uint32_t *dir, const char **las
 }
 
 /* ---- names ------------------------------------------------------------------ */
-
-static bool short_char(uint8_t c)
-{
-    if (c >= 0x80 || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9'))
-        return true;
-    for (const char *p = "$%'-_@~`!(){}^#&"; *p; p++)
-        if (c == (uint8_t)*p)
-            return true;
-    return false;
-}
-
-static bool long_char(uint8_t c)
-{
-    if (c < 32)
-        return false;
-    for (const char *p = "\"*/:<>?\\|"; *p; p++)
-        if (c == (uint8_t)*p)
-            return false;
-    return true;
-}
-
-/* A name as it will be stored: trailing dots and spaces go (as in Win32).
- * -> its length, or <0 if it can't be a name. */
-static int clean_name(const char *in, char *out)
-{
-    size_t n = strlen(in);
-    while (n > 0 && (in[n - 1] == '.' || in[n - 1] == ' '))
-        n--;
-    if (n == 0 || n > FS_NAME_MAX)
-        return n ? -ERROR_FILENAME_EXCED_RANGE : -ERROR_INVALID_NAME;
-    for (size_t i = 0; i < n; i++)
-        if (!long_char((uint8_t)in[i]))
-            return -ERROR_INVALID_NAME;
-    memcpy(out, in, n);
-    out[n] = '\0';
-    return (int)n;
-}
 
 /* Does the name fit 8.3 as it is (with *ntcase for an all-lower-case part)?
  * Otherwise fcb gets the basis of an alias and *lossy says whether
@@ -617,7 +582,7 @@ static bool fits_83(const char *name, uint8_t fcb[11], uint8_t *ntcase, bool *lo
     return fits;
 }
 
-static bool alias_taken(struct vol *v, uint32_t dir, const uint8_t fcb[11])
+static bool alias_taken(struct fvol *v, uint32_t dir, const uint8_t fcb[11])
 {
     struct dcur d;
     dcur_init(&d, v, dir);
@@ -631,7 +596,7 @@ static bool alias_taken(struct vol *v, uint32_t dir, const uint8_t fcb[11])
 
 /* Add entries for name in dir, from proto (attributes, cluster, size,
  * times); the 8.3 name and case bits are made here. */
-static int dir_add(struct vol *v, uint32_t dir, const char *in, const uint8_t proto[32], struct dent *out)
+static int dir_add(struct fvol *v, uint32_t dir, const char *in, const uint8_t proto[32], struct dent *out)
 {
     char name[FS_NAME_MAX + 1];
     int len = clean_name(in, name);
@@ -729,7 +694,7 @@ static int dir_add(struct vol *v, uint32_t dir, const char *in, const uint8_t pr
     return 0;
 }
 
-static int dir_remove(struct vol *v, uint32_t dir, const struct dent *e)
+static int dir_remove(struct fvol *v, uint32_t dir, const struct dent *e)
 {
     struct dcur d;
     dcur_init(&d, v, dir);
@@ -759,39 +724,8 @@ static void stamp(uint8_t *ent, bool created)
     }
 }
 
-/* ---- the lock ------------------------------------------------------------------ */
-
-#include "io.h"
-#include "sched.h"
-
-static struct thread *owner;
-static int depth;
-
-void fs_lock(void)
-{
-    for (;;) {
-        uint32_t f = irq_save();
-        if (!owner || owner == current) {
-            owner = current;
-            depth++;
-            irq_restore(f);
-            return;
-        }
-        irq_restore(f);
-        sched_yield();
-    }
-}
-
-void fs_unlock(void)
-{
-    uint32_t f = irq_save();
-    if (owner == current && --depth == 0)
-        owner = NULL;
-    irq_restore(f);
-}
-
 /* The end of a public call: what changed goes to the disk. */
-static int done(struct vol *v, int rc)
+static int done(struct fvol *v, int rc)
 {
     if (v && v->fsinfo && v->fsinfo_dirty) {
         struct buf *b = bread(v->disk, v->fsinfo);
@@ -841,8 +775,8 @@ struct vol *fat_mount(struct partition *p)
         return NULL;
     uint32_t nclus = (tot - meta) / spc;
 
-    struct vol *v = &vols[nvols];
-    *v = (struct vol){ .used = true, .disk = p->disk, .start = p->start, .count = tot };
+    struct fvol *v = &vols[nvols];
+    *v = (struct fvol){ .disk = p->disk, .start = p->start, .count = tot };
     v->type = nclus < 4085 ? 12 : nclus < 65525 ? 16 : 32;
     v->spc = spc;
     v->cbytes = spc * SECTOR;
@@ -893,10 +827,10 @@ struct vol *fat_mount(struct partition *p)
         return NULL;
     }
     if (ext[2] == 0x29) {
-        v->serial = le32(ext + 3);
-        memcpy(v->label, ext + 7, 11);
+        v->h.serial = le32(ext + 3);
+        memcpy(v->h.label, ext + 7, 11);
     } else {
-        memcpy(v->label, "NO NAME    ", 11);
+        memcpy(v->h.label, "NO NAME    ", 11);
     }
     /* the root's volume label entry wins over the boot sector's */
     struct dcur d;
@@ -905,47 +839,30 @@ struct vol *fat_mount(struct partition *p)
     uint32_t idx = 0;
     while (dir_next(&d, &idx, &e) > 0)
         if ((e.raw[11] & (A_VOL | A_DIR)) == A_VOL && e.raw[11] != A_LFN) {
-            memcpy(v->label, e.raw, 11);
+            memcpy(v->h.label, e.raw, 11);
             break;
         }
     int n = 11;
-    while (n > 0 && v->label[n - 1] == ' ')
+    while (n > 0 && v->h.label[n - 1] == ' ')
         n--;
-    v->label[n] = '\0';
+    v->h.label[n] = '\0';
+    v->h.ops = &fat_ops;
+    v->h.type = v->type == 12 ? "FAT12" : v->type == 16 ? "FAT16" : "FAT32";
     nvols++;
     klog("FS: FAT%d on disk %d at %u: %u clusters of %u bytes, serial %04X-%04X, label \"%s\"\n",
-         v->type, (int)(p->disk - disks), p->start, nclus, v->cbytes, v->serial >> 16,
-         v->serial & 0xFFFF, v->label);
-    return v;
-}
-
-int fs_volume_count(void)         { return nvols; }
-struct vol *fs_volume_at(int i)   { return i >= 0 && i < nvols ? &vols[i] : NULL; }
-char fs_letter(const struct vol *v)      { return v->letter; }
-void fs_set_letter(struct vol *v, char c) { v->letter = c; }
-uint32_t fs_serial(const struct vol *v)  { return v->serial; }
-const char *fs_label(const struct vol *v) { return v->label; }
-const char *fs_type_name(const struct vol *v)
-{
-    return v->type == 12 ? "FAT12" : v->type == 16 ? "FAT16" : "FAT32";
-}
-
-struct vol *fs_volume(char letter)
-{
-    letter = up(letter);
-    for (int i = 0; i < nvols; i++)
-        if (vols[i].letter && vols[i].letter == letter)
-            return &vols[i];
-    return NULL;
+         v->type, (int)(p->disk - disks), p->start, nclus, v->cbytes, v->h.serial >> 16,
+         v->h.serial & 0xFFFF, v->h.label);
+    fs_add_volume(&v->h);
+    return &v->h;
 }
 
 /* ---- files ----------------------------------------------------------------------- */
 
-static struct fnode *node_get(struct vol *v, uint32_t dir, const struct dent *e)
+static struct fnod *node_get(struct fvol *v, uint32_t dir, const struct dent *e)
 {
-    struct fnode *freen = NULL;
+    struct fnod *freen = NULL;
     for (int i = 0; i < NODE_MAX; i++) {
-        struct fnode *n = &nodes[i];
+        struct fnod *n = &nodes[i];
         if (n->refs && n->v == v && n->dir == dir && n->idx == e->idx) {
             n->refs++;
             return n;
@@ -956,14 +873,14 @@ static struct fnode *node_get(struct vol *v, uint32_t dir, const struct dent *e)
     if (!freen)
         return NULL;
     const uint8_t *r = e->raw;
-    *freen = (struct fnode){ .refs = 1, .v = v, .dir = dir, .idx = e->idx, .first = e->first,
+    *freen = (struct fnod){ .h.v = &v->h, .refs = 1, .v = v, .dir = dir, .idx = e->idx, .first = e->first,
                              .clus = ent_clus(v, r), .size = le32(r + 28), .attr = r[11],
                              .time = le16(r + 22), .date = le16(r + 24) };
     memcpy(freen->fcb, r, 11);
     return freen;
 }
 
-static bool node_open(struct vol *v, uint32_t dir, uint32_t idx)
+static bool node_open(struct fvol *v, uint32_t dir, uint32_t idx)
 {
     for (int i = 0; i < NODE_MAX; i++)
         if (nodes[i].refs && nodes[i].v == v && nodes[i].dir == dir && nodes[i].idx == idx)
@@ -971,7 +888,7 @@ static bool node_open(struct vol *v, uint32_t dir, uint32_t idx)
     return false;
 }
 
-static int node_update(struct fnode *n)
+static int node_update(struct fnod *n)
 {
     if (!n->dirty)
         return 0;
@@ -992,9 +909,9 @@ static int node_update(struct fnode *n)
 }
 
 /* The file's cluster number ci; with alloc, the chain grows to reach it. */
-static int node_clus(struct fnode *n, uint32_t ci, bool alloc, uint32_t *out)
+static int node_clus(struct fnod *n, uint32_t ci, bool alloc, uint32_t *out)
 {
-    struct vol *v = n->v;
+    struct fvol *v = n->v;
     int rc;
     if (!n->clus) {
         if (!alloc)
@@ -1028,9 +945,9 @@ static int node_clus(struct fnode *n, uint32_t ci, bool alloc, uint32_t *out)
 }
 
 /* Move bytes between the file and buf (NULL when writing: zeros). */
-static int node_io(struct fnode *n, uint32_t pos, uint8_t *buf, uint32_t len, bool write)
+static int node_io(struct fnod *n, uint32_t pos, uint8_t *buf, uint32_t len, bool write)
 {
-    struct vol *v = n->v;
+    struct fvol *v = n->v;
     uint32_t done_n = 0;
     while (done_n < len) {
         uint32_t c;
@@ -1085,9 +1002,9 @@ static int node_io(struct fnode *n, uint32_t pos, uint8_t *buf, uint32_t len, bo
     return (int)done_n;
 }
 
-static int set_size(struct fnode *n, uint32_t size)
+static int set_size(struct fnod *n, uint32_t size)
 {
-    struct vol *v = n->v;
+    struct fvol *v = n->v;
     if (size > n->size) {
         int rc = node_io(n, n->size, NULL, size - n->size, true);
         if (rc < 0)
@@ -1124,9 +1041,10 @@ static int set_size(struct fnode *n, uint32_t size)
     return 0;
 }
 
-int fs_open(struct vol *v, const char *path, uint32_t disp, bool write, uint8_t attr,
+static int fat_open(struct vol *vv, const char *path, uint32_t disp, bool write, uint8_t attr,
             struct fnode **out, bool *created)
 {
+    struct fvol *v = FV(vv);
     fs_lock();
     uint32_t dir;
     const char *name;
@@ -1161,7 +1079,7 @@ int fs_open(struct vol *v, const char *path, uint32_t disp, bool write, uint8_t 
         if ((rc = dir_add(v, dir, name, proto, &e)) < 0)
             return done(v, rc);
     }
-    struct fnode *n = node_get(v, dir, &e);
+    struct fnod *n = node_get(v, dir, &e);
     if (!n)
         return done(v, -ERROR_TOO_MANY_OPEN_FILES);
     if (truncate) {
@@ -1174,14 +1092,15 @@ int fs_open(struct vol *v, const char *path, uint32_t disp, bool write, uint8_t 
         n->dirty = true;
         node_update(n);
     }
-    *out = n;
+    *out = &n->h;
     if (created)
         *created = create;
     return done(v, 0);
 }
 
-int fs_read(struct fnode *n, uint32_t pos, void *buf, uint32_t len)
+static int fat_read(struct fnode *nn, uint32_t pos, void *buf, uint32_t len)
 {
+    struct fnod *n = FN(nn);
     fs_lock();
     if (pos >= n->size)
         return done(n->v, 0);
@@ -1190,10 +1109,11 @@ int fs_read(struct fnode *n, uint32_t pos, void *buf, uint32_t len)
     return done(n->v, node_io(n, pos, buf, len, false));
 }
 
-int fs_write(struct fnode *n, uint32_t pos, const void *buf, uint32_t len)
+static int fat_write(struct fnode *nn, uint32_t pos, const void *buf, uint32_t len)
 {
+    struct fnod *n = FN(nn);
     fs_lock();
-    struct vol *v = n->v;
+    struct fvol *v = n->v;
     if (len == 0)
         return done(v, 0);
     if (pos > n->size) {                                /* the gap reads as zeros */
@@ -1219,8 +1139,9 @@ int fs_write(struct fnode *n, uint32_t pos, const void *buf, uint32_t len)
     return done(v, rc > 0 && urc < 0 ? urc : rc);
 }
 
-int fs_set_size(struct fnode *n, uint32_t size)
+static int fat_set_size(struct fnode *nn, uint32_t size)
 {
+    struct fnod *n = FN(nn);
     fs_lock();
     int rc = set_size(n, size);
     if (rc == 0) {
@@ -1231,23 +1152,26 @@ int fs_set_size(struct fnode *n, uint32_t size)
     return done(n->v, rc < 0 ? rc : urc);
 }
 
-uint32_t fs_size(const struct fnode *n)    { return n->size; }
-uint8_t fs_node_attr(const struct fnode *n) { return n->attr; }
-void fs_name_of(const struct fnode *n, uint8_t fcb[11])
+static uint32_t fat_size(const struct fnode *n)  { return CFN(n)->size; }
+static uint8_t fat_attr(const struct fnode *n)    { return CFN(n)->attr; }
+static void fat_name_of(const struct fnode *nn, uint8_t fcb[11])
 {
+    const struct fnod *n = CFN(nn);
     memcpy(fcb, n->fcb, 11);
     if (fcb[0] == 0x05)
         fcb[0] = 0xE5;
 }
 
-void fs_get_time(const struct fnode *n, uint16_t *date, uint16_t *time)
+static void fat_get_time(const struct fnode *nn, uint16_t *date, uint16_t *time)
 {
+    const struct fnod *n = CFN(nn);
     *date = n->date;
     *time = n->time;
 }
 
-int fs_set_time(struct fnode *n, uint16_t date, uint16_t time)
+static int fat_set_time(struct fnode *nn, uint16_t date, uint16_t time)
 {
+    struct fnod *n = FN(nn);
     fs_lock();
     n->date = date;
     n->time = time;
@@ -1255,25 +1179,26 @@ int fs_set_time(struct fnode *n, uint16_t date, uint16_t time)
     return done(n->v, node_update(n));
 }
 
-int fs_flush(struct fnode *n)
+static int fat_flush(struct fnode *nn)
 {
+    struct fnod *n = FN(nn);
     fs_lock();
     n->v->changed = true;
     return done(n->v, node_update(n));
 }
 
-struct fnode *fs_dup(struct fnode *n)
+static void fat_dup(struct fnode *n)
 {
     fs_lock();
-    n->refs++;
+    FN(n)->refs++;
     fs_unlock();
-    return n;
 }
 
-void fs_close(struct fnode *n)
+static void fat_close(struct fnode *nn)
 {
+    struct fnod *n = FN(nn);
     fs_lock();
-    struct vol *v = n->v;
+    struct fvol *v = n->v;
     node_update(n);
     if (n->refs > 0)
         n->refs--;
@@ -1282,8 +1207,9 @@ void fs_close(struct fnode *n)
 
 /* ---- names ------------------------------------------------------------------------ */
 
-int fs_stat(struct vol *v, const char *path, struct fs_entry *e)
+static int fat_stat(struct vol *vv, const char *path, struct fs_entry *e)
 {
+    struct fvol *v = FV(vv);
     fs_lock();
     if (!*path) {
         memset(e, 0, sizeof *e);
@@ -1301,8 +1227,9 @@ int fs_stat(struct vol *v, const char *path, struct fs_entry *e)
     return done(v, rc);
 }
 
-int fs_set_attr(struct vol *v, const char *path, uint8_t attr)
+static int fat_set_attr(struct vol *vv, const char *path, uint8_t attr)
 {
+    struct fvol *v = FV(vv);
     fs_lock();
     uint32_t dir;
     const char *name;
@@ -1324,8 +1251,9 @@ int fs_set_attr(struct vol *v, const char *path, uint8_t attr)
     return done(v, rc);
 }
 
-int fs_delete(struct vol *v, const char *path)
+static int fat_delete(struct vol *vv, const char *path)
 {
+    struct fvol *v = FV(vv);
     fs_lock();
     uint32_t dir;
     const char *name;
@@ -1347,8 +1275,9 @@ int fs_delete(struct vol *v, const char *path)
     return done(v, rc);
 }
 
-int fs_mkdir(struct vol *v, const char *path)
+static int fat_mkdir(struct vol *vv, const char *path)
 {
+    struct fvol *v = FV(vv);
     fs_lock();
     uint32_t dir;
     const char *name;
@@ -1389,7 +1318,7 @@ int fs_mkdir(struct vol *v, const char *path)
     return done(v, rc);
 }
 
-static bool dir_empty(struct vol *v, uint32_t c)
+static bool dir_empty(struct fvol *v, uint32_t c)
 {
     struct dcur d;
     dcur_init(&d, v, c);
@@ -1403,8 +1332,9 @@ static bool dir_empty(struct vol *v, uint32_t c)
     return true;
 }
 
-int fs_rmdir(struct vol *v, const char *path)
+static int fat_rmdir(struct vol *vv, const char *path)
 {
+    struct fvol *v = FV(vv);
     fs_lock();
     uint32_t dir;
     const char *name;
@@ -1429,7 +1359,7 @@ int fs_rmdir(struct vol *v, const char *path)
 }
 
 /* Is directory c inside (or) directory anc? Up through the ".." entries. */
-static bool inside(struct vol *v, uint32_t c, uint32_t anc)
+static bool inside(struct fvol *v, uint32_t c, uint32_t anc)
 {
     for (int n = 0; c && n < 256; n++) {
         if (c == anc)
@@ -1444,8 +1374,9 @@ static bool inside(struct vol *v, uint32_t c, uint32_t anc)
     return false;
 }
 
-int fs_rename(struct vol *v, const char *from, const char *to)
+static int fat_rename(struct vol *vv, const char *from, const char *to)
 {
+    struct fvol *v = FV(vv);
     fs_lock();
     uint32_t fdir, tdir;
     const char *fname, *tname;
@@ -1488,7 +1419,7 @@ int fs_rename(struct vol *v, const char *from, const char *to)
         }
     }
     for (int i = 0; i < NODE_MAX; i++) {
-        struct fnode *n = &nodes[i];
+        struct fnod *n = &nodes[i];
         if (n->refs && n->v == v && n->dir == fdir && n->idx == fe.idx) {
             n->dir = tdir;
             n->idx = ne.idx;
@@ -1501,37 +1432,7 @@ int fs_rename(struct vol *v, const char *from, const char *to)
 
 /* ---- searches ---------------------------------------------------------------------- */
 
-static bool wild(const char *p, const char *s)
-{
-    while (*p) {
-        if (*p == '*') {
-            while (*p == '*')
-                p++;
-            if (!*p)
-                return true;
-            for (; *s; s++)
-                if (wild(p, s))
-                    return true;
-            return wild(p, s);
-        }
-        if (!*s)
-            return *p == '.' && p[1] == '*' && !p[2] ? true : false;
-        if (*p != '?' && up(*p) != up(*s))
-            return false;
-        p++, s++;
-    }
-    return !*s;
-}
-
-static bool fcb_match(const uint8_t *tmpl, const uint8_t *name)
-{
-    for (int i = 0; i < 11; i++)
-        if (tmpl[i] != '?' && tmpl[i] != name[i])
-            return false;
-    return true;
-}
-
-static int find_dir(struct vol *v, const char *dir, uint32_t *c)
+static int find_dir(struct fvol *v, const char *dir, uint32_t *c)
 {
     if (!*dir) {
         *c = 0;
@@ -1554,7 +1455,7 @@ static int find_dir(struct vol *v, const char *dir, uint32_t *c)
 static int find_more(struct fs_find *f, struct fs_entry *out)
 {
     struct dcur d;
-    dcur_init(&d, f->v, f->dir);
+    dcur_init(&d, FV(f->v), f->dir);
     struct dent e;
     for (;;) {
         int rc = dir_next(&d, &f->next, &e);
@@ -1584,17 +1485,18 @@ static int find_more(struct fs_find *f, struct fs_entry *out)
             if (!all && !(e.lfn && wild(p, e.lname)) && !wild(p, sname))
                 continue;
         }
-        fill_entry(f->v, &e, out);
+        fill_entry(FV(f->v), &e, out);
         return 0;
     }
 }
 
-int fs_find_first(struct vol *v, const char *dir, const char *pattern, struct fs_find *f,
+static int fat_find_first(struct vol *vv, const char *dir, const char *pattern, struct fs_find *f,
                   struct fs_entry *e)
 {
+    struct fvol *v = FV(vv);
     fs_lock();
     memset(f, 0, sizeof *f);
-    f->v = v;
+    f->v = &v->h;
     int rc = find_dir(v, dir, &f->dir);
     if (rc < 0)
         return done(v, rc);
@@ -1606,12 +1508,13 @@ int fs_find_first(struct vol *v, const char *dir, const char *pattern, struct fs
     return done(v, rc == -ERROR_NO_MORE_FILES ? -ERROR_FILE_NOT_FOUND : rc);
 }
 
-int fs_find_dos(struct vol *v, const char *dir, const uint8_t fcb[11], uint8_t attr,
+static int fat_find_dos(struct vol *vv, const char *dir, const uint8_t fcb[11], uint8_t attr,
                 struct fs_find *f, struct fs_entry *e)
 {
+    struct fvol *v = FV(vv);
     fs_lock();
     memset(f, 0, sizeof *f);
-    f->v = v;
+    f->v = &v->h;
     f->dos = true;
     f->attr = attr;
     memcpy(f->fcb, fcb, 11);
@@ -1622,14 +1525,15 @@ int fs_find_dos(struct vol *v, const char *dir, const uint8_t fcb[11], uint8_t a
     return done(v, rc == -ERROR_NO_MORE_FILES ? -ERROR_FILE_NOT_FOUND : rc);
 }
 
-int fs_find_next(struct fs_find *f, struct fs_entry *e)
+static int fat_find_next(struct fs_find *f, struct fs_entry *e)
 {
     fs_lock();
-    return done(f->v, find_more(f, e));
+    return done(FV(f->v), find_more(f, e));
 }
 
-int fs_space(struct vol *v, uint32_t *spc, uint32_t *bps, uint32_t *freec, uint32_t *total)
+static int fat_space(struct vol *vv, uint32_t *spc, uint32_t *bps, uint32_t *freec, uint32_t *total)
 {
+    struct fvol *v = FV(vv);
     fs_lock();
     int rc = 0;
     if (!v->free_known && (rc = count_free(v)) == 0)
@@ -1641,8 +1545,9 @@ int fs_space(struct vol *v, uint32_t *spc, uint32_t *bps, uint32_t *freec, uint3
     return done(v, rc);
 }
 
-int fs_short_path(struct vol *v, const char *path, char *out, uint32_t size)
+static int fat_short_path(struct vol *vv, const char *path, char *out, uint32_t size)
 {
+    struct fvol *v = FV(vv);
     fs_lock();
     uint32_t c = 0, n = 0;
     const char *s = path;
@@ -1680,15 +1585,24 @@ int fs_short_path(struct vol *v, const char *path, char *out, uint32_t size)
     return done(v, rc);
 }
 
-void fat_sync_all(void)
+static void fat_sync(struct vol *vv)
 {
+    struct fvol *v = FV(vv);
+    fs_lock();
     for (int i = 0; i < NODE_MAX; i++)
-        if (nodes[i].refs)
+        if (nodes[i].refs && nodes[i].v == v)
             node_update(&nodes[i]);
-    for (int i = 0; i < nvols; i++)
-        if (vols[i].fsinfo_dirty) {
-            fs_lock();
-            done(&vols[i], 0);
-        }
-    cache_sync();
+    v->changed = true;
+    v->fsinfo_dirty |= v->fsinfo != 0;
+    done(v, 0);
 }
+
+static const struct fs_ops fat_ops = {
+    .open = fat_open, .read = fat_read, .write = fat_write, .set_size = fat_set_size,
+    .size = fat_size, .get_time = fat_get_time, .set_time = fat_set_time, .attr = fat_attr,
+    .name_of = fat_name_of, .flush = fat_flush, .close = fat_close, .dup = fat_dup,
+    .stat = fat_stat, .set_attr = fat_set_attr, .del = fat_delete, .mkdir = fat_mkdir,
+    .rmdir = fat_rmdir, .rename = fat_rename, .short_path = fat_short_path,
+    .find_first = fat_find_first, .find_dos = fat_find_dos, .find_next = fat_find_next,
+    .space = fat_space, .sync = fat_sync,
+};

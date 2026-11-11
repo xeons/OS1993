@@ -1,7 +1,7 @@
 /*
- * fstest.c -- tests of the VMM's own disks: FAT32 (D:) and FAT16 (E:) on
- * the secondary IDE master, reached directly through KERNEL.DLL's file
- * calls, long names and all.
+ * fstest.c -- tests of the VMM's own disks: FAT32 (D:), FAT16 (E:) and
+ * exFAT (F:) on the secondary IDE master, reached directly through
+ * KERNEL.DLL's file calls, long names and all.
  *
  * tools/qemu-fat-test.py builds the disk (tools/mkdata.sh), lets a DOS
  * session work on it through the redirector first (E:\DOSTEST.BAT), then
@@ -242,11 +242,100 @@ static void test_writing(void)
     CHECK(spit("D:\\FROMGUI.TXT", "Written by an OS1993 program.\r\n", 31), "leave D:\\FROMGUI.TXT");
 }
 
+static bool alias_form(const char *s)                   /* "XXhhhh~1.EXT" */
+{
+    size_t n = strlen(s);
+    return n >= 8 && s[6] == '~' && s[7] == '1' && (n == 8 || s[8] == '.');
+}
+
+static void test_exfat(void)
+{
+    CHECK(text_is("F:\\Hello exFAT.txt", "Hello from exFAT.\r\n"), "exFAT: read a file a host tool wrote");
+    CHECK(text_is("f:\\HELLO EXFAT.TXT", "Hello from exFAT.\r\n"), "exFAT: ... names compare in any case");
+    CHECK(text_is("F:\\Long Folder Name\\A file in a folder with a long name.txt", "Inside exFAT.\r\n"),
+          "exFAT: a long path");
+    WIN32_FIND_DATA fd;
+    HANDLE f = FindFirstFile("F:\\Hello*", &fd);
+    CHECK(f != INVALID_HANDLE_VALUE && !strcmp(fd.name, "Hello exFAT.txt") && alias_form(fd.short_name),
+          "exFAT: FindFirstFile, with a DOS alias");
+    char alias[MAX_PATH];
+    snprintf(alias, sizeof alias, "F:\\%s", f != INVALID_HANDLE_VALUE ? fd.short_name : "?");
+    FindClose(f);
+    CHECK(text_is(alias, "Hello from exFAT.\r\n"), "exFAT: ... the alias opens it");
+    f = FindFirstFile("F:\\Long Folder Name\\*", &fd);
+    CHECK(f != INVALID_HANDLE_VALUE && !strcmp(fd.name, ".") && FindNextFile(f, &fd) && !strcmp(fd.name, ".."),
+          "exFAT: a folder lists . and .. first");
+    FindClose(f);
+    CHECK(listed("F:\\*", "README.TXT", NULL, NULL), "exFAT: an 8.3 name");
+    int n = slurp("F:\\big.bin", buf, sizeof buf);
+    CHECK(n == (int)sizeof big && !memcmp(buf, big, sizeof big), "exFAT: 300000 bytes, every one right");
+    n = slurp("F:\\BIGDOS.BIN", buf, sizeof buf);
+    CHECK(n == (int)sizeof big && !memcmp(buf, big, sizeof big), "exFAT: DOS's COPY of it");
+    CHECK(text_is("F:\\DOSX\\DOS.TXT", "exfat from DOS\r\n"), "exFAT: DOS made a folder and a file");
+
+    for (uint32_t i = 0; i < 100000; i++)
+        buf[i] = (uint8_t)(i * 31 + 7);
+    CHECK(spit("F:\\A new file with a long name.dat", buf, 100000), "exFAT: write 100000 bytes");
+    static uint8_t back[100000];
+    CHECK(slurp("F:\\A new file with a long name.dat", back, sizeof back) == 100000 && !memcmp(back, buf, 100000),
+          "exFAT: ... read them back");
+
+    /* a file that can't stay in one piece gets a FAT chain */
+    CHECK(spit("F:\\frag1.bin", buf, 4096) && spit("F:\\frag2.bin", buf, 4096), "exFAT: two small files");
+    HANDLE h = CreateFile("F:\\frag1.bin", GENERIC_READ | GENERIC_WRITE, OPEN_EXISTING);
+    uint32_t put;
+    SetFilePointer(h, 0, FILE_END);
+    CHECK(WriteFile(h, buf + 4096, 20000, &put) && put == 20000 && GetFileSize(h) == 24096,
+          "exFAT: the first grows past the second");
+    CloseHandle(h);
+    CHECK(slurp("F:\\frag1.bin", back, sizeof back) == 24096 && !memcmp(back, buf, 24096),
+          "exFAT: ... and reads back across the pieces");
+    h = CreateFile("F:\\frag1.bin", GENERIC_WRITE, OPEN_EXISTING);
+    SetFilePointer(h, 6000, FILE_BEGIN);
+    CHECK(SetEndOfFile(h) && GetFileSize(h) == 6000, "exFAT: truncate it to 6000");
+    CloseHandle(h);
+    CHECK(slurp("F:\\frag1.bin", back, sizeof back) == 6000 && !memcmp(back, buf, 6000), "exFAT: ... still right");
+    CHECK(DeleteFile("F:\\frag2.bin"), "exFAT: delete the other");
+
+    CHECK(CreateDirectory("F:\\New Folder") && spit("F:\\New Folder\\x.txt", "x", 1), "exFAT: a folder and a file");
+    CHECK(MoveFile("F:\\New Folder\\x.txt", "F:\\New Folder\\Renamed to something longer.txt") &&
+          MoveFile("F:\\New Folder", "F:\\Long Folder Name\\Moved In"), "exFAT: rename, and move a folder");
+    CHECK(text_is("F:\\Long Folder Name\\Moved In\\Renamed to something longer.txt", "x"), "exFAT: ... the file came along");
+    CHECK(!MoveFile("F:\\Long Folder Name", "F:\\Long Folder Name\\Moved In\\Deeper"), "exFAT: not into itself");
+    CHECK(!RemoveDirectory("F:\\Long Folder Name\\Moved In"), "exFAT: RemoveDirectory: not empty");
+    CHECK(DeleteFile("F:\\Long Folder Name\\Moved In\\Renamed to something longer.txt") &&
+          RemoveDirectory("F:\\Long Folder Name\\Moved In"), "exFAT: ... emptied, it goes");
+
+    CHECK(CreateDirectory("F:\\GUIDIR"), "exFAT: F:\\GUIDIR");
+    bool made = true;
+    for (int i = 0; i < 80 && made; i++) {
+        char name[80];
+        snprintf(name, sizeof name, "F:\\GUIDIR\\Entry number %d of a folder that grows.txt", i);
+        made = spit(name, name, (uint32_t)strlen(name));
+    }
+    CHECK(made && count("F:\\GUIDIR\\*") == 80, "exFAT: 80 long names (400 entries: the folder grows)");
+    CHECK(text_is("F:\\GUIDIR\\Entry number 79 of a folder that grows.txt", "F:\\GUIDIR\\Entry number 79 of a folder that grows.txt"),
+          "exFAT: ... the last reads back");
+    for (int i = 1; i < 80; i += 2) {
+        char name[80];
+        snprintf(name, sizeof name, "F:\\GUIDIR\\Entry number %d of a folder that grows.txt", i);
+        DeleteFile(name);
+    }
+    CHECK(count("F:\\GUIDIR\\*") == 40, "exFAT: delete every other one: 40 left");
+    CHECK(SetFileAttributes("F:\\README.TXT", FILE_ATTRIBUTE_READONLY) && !DeleteFile("F:\\README.TXT") &&
+          SetFileAttributes("F:\\README.TXT", FILE_ATTRIBUTE_ARCHIVE), "exFAT: read-only protects");
+    uint32_t spc, bps, freec, total;
+    CHECK(GetDiskFreeSpace("F:\\", &spc, &bps, &freec, &total) && spc == 8 && bps == 512 && freec > 0 && freec < total,
+          "exFAT: GetDiskFreeSpace");
+    CHECK(spit("F:\\FROMGUI.TXT", "exFAT, written by an OS1993 program.\r\n", 38), "exFAT: leave F:\\FROMGUI.TXT");
+}
+
 int main(void)
 {
     test_reading();
     test_dos_results();
     test_writing();
+    test_exfat();
     printf("FS: %d of %d checks passed\n", checks - failures, checks);
     return failures ? 1 : 0;
 }
