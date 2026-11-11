@@ -64,6 +64,7 @@ struct buf {
     uint32_t lba;
     uint16_t refs;
     bool     valid, dirty;
+    bool     pinned;                    /* in a journal transaction not yet committed: stays put */
     uint32_t used;                      /* LRU stamp */
     uint8_t  data[SECTOR];
 };
@@ -75,6 +76,8 @@ void brelse(struct buf *b);
 int  cache_sync(void);                  /* write every dirty sector; 0 or -1 */
 void cache_forget(struct disk *d, uint32_t lba, unsigned n);
 int  cache_flush_range(struct disk *d, uint32_t lba, unsigned n);  /* write those dirty in it */
+int  cache_flush_disk(struct disk *d);  /* a disk's dirty sectors (not pinned ones) */
+void cache_unpin(struct disk *d, uint32_t lba, unsigned n);
 uint32_t cache_hits(void), cache_misses(void);
 void cache_tick(void);                  /* timer: old dirty sectors wake the flusher */
 

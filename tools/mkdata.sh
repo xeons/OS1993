@@ -116,7 +116,7 @@ rm -f "$e8"
 e3=$tmp.e3
 rm -f "$e3"
 truncate -s 32M "$e3"
-mke2fs -q -F -t ext3 -b 1024 -L DATAE3 "$e3"
+mke2fs -q -F -t ext3 -b 1024 -J size=1 -L DATAE3 "$e3"
 d3=$(mktemp -d)
 printf 'old contents\n' > "$d3/v"; printf 'not replayed\n' > "$d3/r"
 printf 'old second\n' > "$d3/s"; printf 'written before the crash\n' > "$d3/b"

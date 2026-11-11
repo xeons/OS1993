@@ -81,6 +81,15 @@ struct evol {
     uint32_t free_blocks, free_inodes;
     struct group *g;
     bool    *g_dirty;
+    /* ext3: journalled writes (journal_*) */
+    bool     journal;
+    uint32_t *j_map;                    /* the journal's blocks */
+    uint32_t j_first, j_maxlen, j_head, j_used, j_seq, j_incompat;
+    uint8_t  j_uuid[16];
+    uint32_t t_blocks[128], t_n;        /* the transaction in progress: its metadata blocks */
+    uint32_t t_revoke[128], t_nrev;     /* ... and the blocks it freed */
+    uint8_t *j_buf, *j_copy;
+    uint32_t j_start, j_start_seq;      /* the oldest transaction not yet home */
 };
 
 struct enode {
@@ -137,6 +146,20 @@ static struct buf *bbyte(struct evol *v, uint32_t b, uint32_t off, uint8_t **p)
     return bf;
 }
 
+static void journal_note(struct evol *v, uint32_t block);
+static void journal_forget(struct evol *v, uint32_t block);
+
+/* A metadata sector changed: on ext3, part of the transaction (pinned in
+ * the cache until it commits). File data uses bdirty. */
+static void meta(struct evol *v, struct buf *bf)
+{
+    bdirty(bf);
+    if (v->journal) {
+        bf->pinned = true;
+        journal_note(v, (bf->lba - v->start) / v->spb);
+    }
+}
+
 static int rd32(struct evol *v, uint32_t b, uint32_t off, uint32_t *x)
 {
     uint8_t *p;
@@ -155,21 +178,27 @@ static int wr32(struct evol *v, uint32_t b, uint32_t off, uint32_t x)
     if (!bf)
         return -ERROR_GEN_FAILURE;
     put32(p, x);
-    bdirty(bf);
+    meta(v, bf);
     brelse(bf);
     v->changed = true;
     return 0;
 }
 
-static void zero_block(struct evol *v, uint32_t b)
+static void zero_any(struct evol *v, uint32_t b, bool is_meta)
 {
     for (uint32_t s = 0; s < v->spb; s++) {
         struct buf *bf = bzero_get(v->disk, blk_lba(v, b) + s);
-        bdirty(bf);
+        if (is_meta)
+            meta(v, bf);
+        else
+            bdirty(bf);
         brelse(bf);
     }
     v->changed = true;
 }
+
+static void zero_block(struct evol *v, uint32_t b) { zero_any(v, b, true); }   /* metadata */
+static void zero_data(struct evol *v, uint32_t b)  { zero_any(v, b, false); }
 
 /* ---- the superblock and group descriptors -------------------------------------------- */
 
@@ -182,7 +211,7 @@ static int write_meta(struct evol *v)
         put32(b->data + 12, v->free_blocks);
         put32(b->data + 16, v->free_inodes);
         put32(b->data + 48, now_unix());                /* s_wtime */
-        bdirty(b);
+        meta(v, b);
         brelse(b);
         v->sb_dirty = false;
         v->changed = true;
@@ -198,7 +227,7 @@ static int write_meta(struct evol *v)
         put16(p + 12, v->g[i].free_blocks);
         put16(p + 14, v->g[i].free_inodes);
         put16(p + 16, v->g[i].dirs);
-        bdirty(b);
+        meta(v, b);
         brelse(b);
         v->g_dirty[i] = false;
         v->changed = true;
@@ -206,11 +235,15 @@ static int write_meta(struct evol *v)
     return 0;
 }
 
+static int journal_commit(struct evol *v);
+
 static int done(struct evol *v, int rc)
 {
     int mrc = write_meta(v);
     if (mrc < 0 && rc >= 0)
         rc = mrc;
+    if (v->journal && journal_commit(v) < 0 && rc >= 0)
+        rc = -ERROR_GEN_FAILURE;
     if (v->changed) {
         v->changed = false;
         /* write-behind: the cache writes it out (cache.c) */
@@ -249,7 +282,7 @@ static int64_t take_bit(struct evol *v, uint32_t bm, uint32_t from, uint32_t nbi
         }
         if (!(byte & (1 << (i % 8)))) {
             *p = (uint8_t)(byte | (1 << (i % 8)));
-            bdirty(b);
+            meta(v, b);
             brelse(b);
             v->changed = true;
             return i;
@@ -266,7 +299,7 @@ static int clear_bit(struct evol *v, uint32_t bm, uint32_t i)
     if (!b)
         return -ERROR_GEN_FAILURE;
     *p &= (uint8_t)~(1 << (i % 8));
-    bdirty(b);
+    meta(v, b);
     brelse(b);
     v->changed = true;
     return 0;
@@ -317,6 +350,7 @@ static int free_block(struct evol *v, uint32_t b)
     v->g_dirty[g] = true;
     v->free_blocks++;
     v->sb_dirty = true;
+    journal_forget(v, b);
     cache_forget(v->disk, blk_lba(v, b), v->spb);
     return 0;
 }
@@ -358,7 +392,7 @@ static int inode_write(struct evol *v, uint32_t ino, const uint8_t raw[128])
     if (!b)
         return -ERROR_GEN_FAILURE;
     memcpy(p, raw, 128);
-    bdirty(b);
+    meta(v, b);
     brelse(b);
     v->changed = true;
     return 0;
@@ -383,7 +417,7 @@ static void set_isize(struct evol *v, uint8_t *r, uint64_t s)
             if (b) {
                 if (!(le32(b->data + 100) & RO_LARGE)) {
                     put32(b->data + 100, le32(b->data + 100) | RO_LARGE);
-                    bdirty(b);
+                    meta(v, b);
                     v->changed = true;
                 }
                 brelse(b);
@@ -430,7 +464,7 @@ static int alloc_inode(struct evol *v, uint32_t g0, bool dir, uint32_t *out)
             memset(p, 0, 128);
             if (done_b == 128 && v->extra_isize)
                 put16(p, v->extra_isize);               /* i_extra_isize */
-            bdirty(b);
+            meta(v, b);
             brelse(b);
         }
         *out = ino;
@@ -610,7 +644,7 @@ static int data_io(struct evol *v, uint8_t *raw, uint32_t *goal, uint64_t pos, u
             return done_n ? (int)done_n : rc;
         uint32_t chunk = v->bsize - in < len - done_n ? v->bsize - in : len - done_n;
         if (fresh && chunk != v->bsize)
-            zero_block(v, pb);                          /* no old bytes around a partial write */
+            zero_data(v, pb);                           /* no old bytes around a partial write */
         if (!pb) {                                      /* a hole */
             memset(buf + done_n, 0, chunk);
         } else if (in % SECTOR == 0 && chunk % SECTOR == 0 && buf) {
@@ -871,7 +905,7 @@ static int put_record(struct evol *v, uint8_t *draw, uint32_t off, uint32_t ino,
         if (!b)
             return -ERROR_GEN_FAILURE;
         *p = rec[k];
-        bdirty(b);
+        meta(v, b);
         brelse(b);
     }
     v->changed = true;
@@ -888,7 +922,7 @@ static int set_rec_len(struct evol *v, uint8_t *draw, uint32_t off, uint16_t rl)
     if (!b)
         return -ERROR_GEN_FAILURE;
     put16(p, rl);
-    bdirty(b);
+    meta(v, b);
     brelse(b);
     v->changed = true;
     return 0;
@@ -987,7 +1021,7 @@ static int dir_remove(struct evol *v, uint32_t dino, const struct dent *e)
         if (!b)
             return -ERROR_GEN_FAILURE;
         put16(p, le16(p) + e->rec_len);
-        bdirty(b);
+        meta(v, b);
         brelse(b);
         v->changed = true;
         rc = 0;
@@ -1312,6 +1346,268 @@ out:
     return rc;
 }
 
+/* ---- ext3: journalled writes ------------------------------------------------------ */
+
+/*
+ * Ordered mode, as ext3 defaults to. Every metadata block a call changes
+ * (superblock, group descriptors, bitmaps, inode tables, directory and
+ * indirect blocks) joins the transaction and stays pinned in the cache;
+ * blocks it frees are revoked. At the end of the call (done()): the file
+ * data still in the cache goes to the disk first, then the transaction --
+ * descriptor blocks naming the blocks, their copies (a first word that
+ * looks like the journal's magic number escaped), revoke records -- then,
+ * once those are on the disk, the commit block. Only then may the blocks
+ * go home, written behind like any other. A call too big for one
+ * transaction (it fills the pinned limit) is committed in parts.
+ *
+ * When the journal is full, everything is written home and the journal
+ * starts over (a checkpoint); the journal superblock points at the oldest
+ * transaction not yet home. While mounted the volume says needs_recovery;
+ * a clean shutdown writes everything home, empties the journal and clears
+ * it. A journal with checksums (csum v2/v3) or async commit, an external
+ * one, or a JBD v1 superblock keeps the volume read-only.
+ */
+static int journal_commit(struct evol *v);
+
+static uint32_t jnext(const struct evol *v, uint32_t b) { return b + 1 >= v->j_maxlen ? v->j_first : b + 1; }
+
+static uint32_t pin_limit(const struct evol *v)
+{
+    uint32_t n = 256 / v->spb;                          /* at most a quarter of the cache pinned */
+    return n < 2 ? 2 : n > 128 ? 128 : n;
+}
+
+static void unpin_block(struct evol *v, uint32_t b)
+{
+    cache_unpin(v->disk, blk_lba(v, b), v->spb);
+}
+
+static void journal_note(struct evol *v, uint32_t block)
+{
+    for (uint32_t i = 0; i < v->t_n; i++)
+        if (v->t_blocks[i] == block)
+            return;
+    if (v->t_n >= pin_limit(v))
+        journal_commit(v);                              /* a big call: this part first */
+    v->t_blocks[v->t_n++] = block;
+}
+
+/* A block freed: not to be replayed from the journal any more. */
+static void journal_forget(struct evol *v, uint32_t block)
+{
+    if (!v->journal)
+        return;
+    for (uint32_t i = 0; i < v->t_n; i++)
+        if (v->t_blocks[i] == block) {
+            unpin_block(v, block);
+            v->t_blocks[i] = v->t_blocks[--v->t_n];
+            break;
+        }
+    for (uint32_t i = 0; i < v->t_nrev; i++)
+        if (v->t_revoke[i] == block)
+            return;
+    if (v->t_nrev == 128)
+        journal_commit(v);
+    v->t_revoke[v->t_nrev++] = block;
+}
+
+static int jwrite(struct evol *v, uint32_t jb, const uint8_t *buf)
+{
+    uint32_t pb = v->j_map[jb];
+    cache_forget(v->disk, blk_lba(v, pb), v->spb);
+    return ata_write(v->disk, blk_lba(v, pb), v->spb, buf);
+}
+
+/* The journal superblock: where the log starts (0: empty), its sequence. */
+static int jsb_write(struct evol *v, uint32_t start, uint32_t seq)
+{
+    if (ata_read(v->disk, blk_lba(v, v->j_map[0]), v->spb, v->j_buf) < 0)
+        return -1;
+    putbe32(v->j_buf + 24, seq);
+    putbe32(v->j_buf + 28, start);
+    if (v->t_nrev) {                                    /* revoke records need the feature */
+        v->j_incompat |= JI_REVOKE;
+        putbe32(v->j_buf + 40, v->j_incompat);
+    }
+    if (jwrite(v, 0, v->j_buf) < 0)
+        return -1;
+    return ata_flush(v->disk);
+}
+
+/* Everything home; the journal starts over. */
+static int journal_checkpoint(struct evol *v)
+{
+    if (v->j_used)
+        klog("EXT2: journal full at transaction %u: everything home, it starts over\n", v->j_seq);
+    if (cache_flush_disk(v->disk) < 0)
+        return -1;
+    v->j_used = 0;
+    return jsb_write(v, 0, v->j_seq);
+}
+
+static void jheader(uint8_t *b, uint32_t type, uint32_t seq, uint32_t bsize)
+{
+    memset(b, 0, bsize);
+    putbe32(b, JBD_MAGIC);
+    putbe32(b + 4, type);
+    putbe32(b + 8, seq);
+}
+
+static int journal_commit(struct evol *v)
+{
+    if (!v->journal || (!v->t_n && !v->t_nrev))
+        return 0;
+    uint32_t bs = v->bsize, tsz = (v->j_incompat & JI_64BIT) ? 12 : 8;
+    uint32_t per_desc = (bs - 12 - 16) / tsz;
+    uint32_t rsz = (v->j_incompat & JI_64BIT) ? 8 : 4, per_rev = (bs - 16) / rsz;
+    uint32_t ndesc = (v->t_n + per_desc - 1) / per_desc, nrevb = (v->t_nrev + per_rev - 1) / per_rev;
+    uint32_t need = ndesc + v->t_n + nrevb + 1, cap = v->j_maxlen - v->j_first;
+    int rc = 0;
+    if (need > cap) {                                   /* (a journal smaller than a transaction) */
+        for (uint32_t i = 0; i < v->t_n; i++)
+            unpin_block(v, v->t_blocks[i]);
+        v->t_n = v->t_nrev = 0;
+        return cache_flush_disk(v->disk);
+    }
+    if (cache_flush_disk(v->disk) < 0)                  /* ordered: the file data first */
+        rc = -1;
+    if (v->j_used + need > cap && journal_checkpoint(v) < 0)
+        rc = -1;
+    bool fresh_log = !v->j_used;
+    if ((fresh_log || (v->t_nrev && !(v->j_incompat & JI_REVOKE))) &&
+        jsb_write(v, fresh_log ? v->j_head : v->j_start, fresh_log ? v->j_seq : v->j_start_seq) < 0)
+        rc = -1;                                        /* a new log: say where it starts */
+    if (fresh_log) {
+        v->j_start = v->j_head;
+        v->j_start_seq = v->j_seq;
+    }
+    uint32_t pos = v->j_head, seq = v->j_seq;
+    for (uint32_t i = 0; i < v->t_n;) {                 /* descriptors and copies */
+        uint32_t k = v->t_n - i < per_desc ? v->t_n - i : per_desc;
+        jheader(v->j_buf, JBD_DESC, seq, bs);
+        uint32_t off = 12;
+        for (uint32_t j = 0; j < k; j++) {
+            uint32_t blk = v->t_blocks[i + j];
+            uint8_t *p;
+            struct buf *b0 = bbyte(v, blk, 0, &p);
+            uint32_t first = b0 ? be32(p) : 0;
+            brelse(b0);
+            uint32_t flags = (j ? JF_SAME_UUID : 0) | (first == JBD_MAGIC ? JF_ESCAPE : 0) | (j + 1 == k ? JF_LAST : 0);
+            putbe32(v->j_buf + off, blk);
+            v->j_buf[off + 6] = (uint8_t)(flags >> 8);
+            v->j_buf[off + 7] = (uint8_t)flags;
+            off += tsz;
+            if (!j) {
+                memcpy(v->j_buf + off, v->j_uuid, 16);
+                off += 16;
+            }
+        }
+        if (jwrite(v, pos, v->j_buf) < 0)
+            rc = -1;
+        pos = jnext(v, pos);
+        for (uint32_t j = 0; j < k; j++) {
+            uint32_t blk = v->t_blocks[i + j];
+            if (block_io(v, blk, v->j_copy, false) < 0)
+                rc = -1;
+            if (be32(v->j_copy) == JBD_MAGIC)
+                putbe32(v->j_copy, 0);                  /* escaped: replay puts it back */
+            if (jwrite(v, pos, v->j_copy) < 0)
+                rc = -1;
+            pos = jnext(v, pos);
+        }
+        i += k;
+    }
+    for (uint32_t i = 0; i < v->t_nrev;) {              /* revoke records */
+        uint32_t k = v->t_nrev - i < per_rev ? v->t_nrev - i : per_rev;
+        jheader(v->j_buf, JBD_REVOKE, seq, bs);
+        putbe32(v->j_buf + 12, 16 + k * rsz);
+        for (uint32_t j = 0; j < k; j++)
+            putbe32(v->j_buf + 16 + j * rsz + rsz - 4, v->t_revoke[i + j]);
+        if (jwrite(v, pos, v->j_buf) < 0)
+            rc = -1;
+        pos = jnext(v, pos);
+        i += k;
+    }
+    if (ata_flush(v->disk) < 0)                         /* all of it on the disk ... */
+        rc = -1;
+    jheader(v->j_buf, JBD_COMMIT, seq, bs);             /* ... before the commit block */
+    if (jwrite(v, pos, v->j_buf) < 0 || ata_flush(v->disk) < 0)
+        rc = -1;
+    pos = jnext(v, pos);
+    v->j_head = pos;
+    v->j_used += need;
+    v->j_seq++;
+    for (uint32_t i = 0; i < v->t_n; i++)               /* now they may go home */
+        unpin_block(v, v->t_blocks[i]);
+    v->t_n = v->t_nrev = 0;
+    if (rc < 0)
+        klog("EXT2: a journal write failed\n");
+    return rc;
+}
+
+/* Journalled writes on: the journal empty (replayed if it wasn't). */
+static bool journal_open(struct evol *v, uint32_t inum)
+{
+    uint8_t raw[128];
+    if (!inum || inode_read(v, inum, raw) < 0 || !(v->j_buf = kmalloc(v->bsize)) || !(v->j_copy = kmalloc(v->bsize)))
+        return false;
+    uint32_t goal = 0, pb;
+    if (bmap(v, raw, 0, false, &goal, &pb) < 0 || !pb || block_io(v, pb, v->j_buf, false) < 0)
+        return false;
+    const uint8_t *sb = v->j_buf;
+    uint32_t incompat = be32(sb + 40);
+    if (be32(sb) != JBD_MAGIC || be32(sb + 4) != JBD_SB_V2 || be32(sb + 12) != v->bsize || be32(sb + 28) ||
+        (incompat & ~(uint32_t)(JI_REVOKE | JI_64BIT))) {
+        klog("EXT2: this journal (v%u, features %X) isn't written here: read-only\n",
+             be32(sb + 4) == JBD_SB_V2 ? 2 : 1, incompat);
+        return false;
+    }
+    v->j_maxlen = be32(sb + 16);
+    v->j_first = be32(sb + 20);
+    v->j_seq = be32(sb + 24);
+    v->j_incompat = incompat;
+    memcpy(v->j_uuid, sb + 48, 16);
+    if (!v->j_first || v->j_first >= v->j_maxlen || !(v->j_map = kmalloc(v->j_maxlen * 4)))
+        return false;
+    for (uint32_t lb = 0; lb < v->j_maxlen; lb++) {     /* the journal's blocks, once */
+        goal = 0;
+        if (bmap(v, raw, lb, false, &goal, &v->j_map[lb]) < 0 || !v->j_map[lb]) {
+            kfree(v->j_map);
+            v->j_map = NULL;
+            return false;
+        }
+    }
+    v->j_head = v->j_first;
+    v->j_used = 0;
+    v->journal = true;
+    return true;
+}
+
+/* Mounted (needs_recovery, not clean) or not. Written straight away. */
+static void journal_mounted(struct evol *v, bool mounted)
+{
+    struct buf *b = bread(v->disk, v->start + 2);
+    if (!b)
+        return;
+    uint32_t inc = le32(b->data + 96);
+    put32(b->data + 96, mounted ? (inc | INCOMPAT_RECOVER) : (inc & ~(uint32_t)INCOMPAT_RECOVER));
+    uint16_t st = le16(b->data + 58);
+    put16(b->data + 58, mounted ? (st & ~1u) : (st | 1));
+    bdirty(b);
+    brelse(b);
+    cache_flush_disk(v->disk);
+    ata_flush(v->disk);
+}
+
+static void journal_close(struct evol *v)
+{
+    if (!v->journal)
+        return;
+    journal_commit(v);
+    journal_checkpoint(v);
+    journal_mounted(v, false);
+}
+
 /* ---- mounting --------------------------------------------------------------------------- */
 
 struct vol *ext2_mount(struct partition *p)
@@ -1401,7 +1697,10 @@ struct vol *ext2_mount(struct partition *p)
     v->h.disk = p->disk;
     v->h.start = p->start;
     v->h.type = (compat & COMPAT_JOURNAL) ? "ext3" : "ext2";
-    if (!v->ro) {
+    if ((compat & COMPAT_JOURNAL) && !(ro_compat & ~(uint32_t)RO_KNOWN) && journal_open(v, le32(sb + 0xE0))) {
+        v->ro = false;
+        journal_mounted(v, true);                       /* needs_recovery until a clean shutdown */
+    } else if (!v->ro) {
         set_state(v, false);                            /* "not clean" while it is mounted */
         cache_sync();
     }
@@ -2145,9 +2444,16 @@ static void ex2_sync(struct vol *vv)
     for (int i = 0; i < NODE_MAX; i++)
         if (nodes[i].refs && nodes[i].v == v)
             node_update(&nodes[i]);
+    v->sb_dirty = true;
+    if (v->journal) {
+        done(v, 0);                                     /* the last transaction */
+        fs_lock();
+        journal_close(v);                               /* home, the journal empty, clean */
+        fs_unlock();
+        return;
+    }
     if (!v->ro)
         set_state(v, true);                             /* clean: everything is on the disk */
-    v->sb_dirty = true;
     done(v, 0);
 }
 

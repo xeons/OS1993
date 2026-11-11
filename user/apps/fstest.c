@@ -540,11 +540,65 @@ static void test_ext3(void)
     CHECK(text_is("I:\\second.txt", "NEW SECOND\n"), "ext3: ... and from its second");
     CHECK(text_is("I:\\revoked.txt", "not replayed\n"), "ext3: a revoked block isn't replayed");
     CHECK(text_is("I:\\before.txt", "written before the crash\n"), "ext3: the rest as it was");
-    CHECK(!spit("I:\\new.txt", "x", 1) && GetLastError() == ERROR_WRITE_PROTECT, "ext3: read-only (no journalled writes yet)");
+    /* written through the journal */
+    CHECK(spit("I:\\Written through the journal.txt", "journalled\r\n", 12) &&
+          text_is("I:\\Written through the journal.txt", "journalled\r\n"), "ext3: write a file (through the journal)");
+    for (uint32_t i = 0; i < sizeof big; i++)
+        buf[i] = (uint8_t)(i * 11 + 9);
+    static uint8_t back[300000];
+    CHECK(spit("I:\\big3.bin", buf, sizeof big) && slurp("I:\\big3.bin", back, sizeof back) == (int)sizeof big &&
+          !memcmp(back, buf, sizeof big), "ext3: 300000 bytes, every block's metadata journalled");
+    CHECK(CreateDirectory("I:\\Journal Dir") && MoveFile("I:\\Written through the journal.txt", "I:\\Journal Dir\\moved.txt"),
+          "ext3: a folder, and a file moved into it");
+    CHECK(DeleteFile("I:\\victim.txt") && GetFileAttributes("I:\\victim.txt") == INVALID_FILE_ATTRIBUTES, "ext3: delete");
+    HANDLE h = CreateFile("I:\\big3.bin", GENERIC_WRITE, OPEN_EXISTING);
+    SetFilePointer(h, 1000, FILE_BEGIN);
+    CHECK(SetEndOfFile(h) && GetFileSize(h) == 1000, "ext3: truncate (its blocks freed and revoked)");
+    CloseHandle(h);
+    bool made = true;
+    for (int i = 0; i < 150 && made; i++) {
+        char name[64];
+        snprintf(name, sizeof name, "I:\\Journal Dir\\file %d with a longer name.txt", i);
+        made = spit(name, name, (uint32_t)strlen(name));
+    }
+    CHECK(made && count("I:\\Journal Dir\\*") == 151, "ext3: 150 more files: many transactions (the journal wraps)");
+}
+
+/* fstest crash: write on I: through the journal, then wait to be killed
+ * (tools/qemu-fat-test.py pulls the plug); fstest aftercrash: what a
+ * replay must have brought back. */
+static void crash_write(void)
+{
+    spit("I:\\Crash One.txt", "written before the crash\r\n", 26);
+    CreateDirectory("I:\\Crash Dir");
+    spit("I:\\Crash Dir\\inside.txt", "inside, before the crash\r\n", 26);
+    DeleteFile("I:\\second.txt");
+    MoveFile("I:\\before.txt", "I:\\Crash Dir\\before, moved.txt");
+    printf("FS: crash point\n");
+    for (;;)
+        Sleep(1000);
+}
+
+static void after_crash(void)
+{
+    CHECK(text_is("I:\\Crash One.txt", "written before the crash\r\n"), "after the crash: a new file");
+    CHECK(text_is("I:\\Crash Dir\\inside.txt", "inside, before the crash\r\n"), "after the crash: a new folder and its file");
+    CHECK(GetFileAttributes("I:\\second.txt") == INVALID_FILE_ATTRIBUTES, "after the crash: the deleted file is gone");
+    CHECK(text_is("I:\\Crash Dir\\before, moved.txt", "written before the crash\n") &&
+          GetFileAttributes("I:\\before.txt") == INVALID_FILE_ATTRIBUTES, "after the crash: the moved file moved");
+    printf("FS: %d of %d checks passed\n", checks - failures, checks);
 }
 
 int main(void)
 {
+    if (!strcmp(GetCommandLine(), "crash")) {
+        crash_write();
+        return 0;
+    }
+    if (!strcmp(GetCommandLine(), "aftercrash")) {
+        after_crash();
+        return failures ? 1 : 0;
+    }
     test_reading();
     test_dos_results();
     test_writing();

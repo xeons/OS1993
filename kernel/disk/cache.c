@@ -9,7 +9,8 @@
  * seconds old (the flusher thread), something needs its buffer, a file is
  * flushed (FlushFileBuffers, DOS's commit, INT 21h AH=0Dh), raw INT 13h
  * reads its range, or OS1993 ends. Writing out sorts the sectors and
- * sends runs of neighbours as one transfer.
+ * sends runs of neighbours as one transfer. A pinned sector (an ext3
+ * transaction's, until it commits: ext2.c) is never written or reused.
  */
 #include "kernel.h"
 #include "devices.h"
@@ -134,7 +135,7 @@ static struct buf *get(struct disk *d, uint32_t lba, bool read)
         hits++;
     } else {
         misses++;
-        for (e = lru.lnext; e != &lru && e->b.refs; e = e->lnext)
+        for (e = lru.lnext; e != &lru && (e->b.refs || e->b.pinned); e = e->lnext)
             ;
         if (e == &lru)
             panic("Disk cache: every buffer is in use.");
@@ -146,6 +147,7 @@ static struct buf *get(struct disk *d, uint32_t lba, bool read)
             hash_remove(e);
         }
         e->b.valid = false;
+        e->b.pinned = false;
         e->b.disk = d;
         e->b.lba = lba;
         if (read && ata_read(d, lba, 1, e->b.data) < 0)
@@ -193,7 +195,7 @@ static int flush(struct disk *only, uint32_t lo, uint32_t n)
     int count = 0, rc = 0;
     for (int i = 0; i < NBUF; i++) {
         struct entry *e = &pool[i];
-        if (e->b.valid && e->b.dirty && (!only || (e->b.disk == only && e->b.lba - lo < n)))
+        if (e->b.valid && e->b.dirty && !e->b.pinned && (!only || (e->b.disk == only && e->b.lba - lo < n)))
             list[count++] = e;
     }
     for (int i = 1; i < count; i++) {                   /* insertion sort: disk, then sector */
@@ -235,6 +237,16 @@ static int flush(struct disk *only, uint32_t lo, uint32_t n)
 }
 
 int cache_sync(void)                            { return flush(NULL, 0, 0); }
+int cache_flush_disk(struct disk *d)            { return flush(d, 0, 0xFFFFFFFFu); }
+
+void cache_unpin(struct disk *d, uint32_t lba, unsigned n)
+{
+    for (uint32_t s = 0; s < n; s++) {
+        struct entry *e = find(d, lba + s);
+        if (e)
+            e->b.pinned = false;
+    }
+}
 int cache_flush_range(struct disk *d, uint32_t lba, unsigned n) { return flush(d, lba, n); }
 
 void cache_forget(struct disk *d, uint32_t lba, unsigned n)
@@ -242,6 +254,7 @@ void cache_forget(struct disk *d, uint32_t lba, unsigned n)
     for (uint32_t s = 0; s < n; s++) {
         struct entry *e = find(d, lba + s);
         if (e && !e->b.refs) {
+            e->b.pinned = false;
             mark_clean(e);
             hash_remove(e);
             e->b.valid = false;

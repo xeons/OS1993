@@ -155,9 +155,12 @@ and file systems); DOS reaches their volumes through the redirector.
 - [x] ext3: journal replay (JBD and JBD2's layout: descriptor, commit and
       revoke blocks, escaped blocks, a wrapping log), so a volume that
       wasn't unmounted cleanly is recovered and mounted.
-- [ ] ext3: journalled writes (now: read-only after replay); checking the
-      journal's checksums (csum v2/v3, async commit) instead of reading
-      past them; external journal devices.
+- [x] ext3: journalled writes, ordered mode (transactions per call, revoke
+      records, checkpoints, needs_recovery while mounted).
+- [ ] ext3: journal checksums (csum v2/v3, async commit: such journals are
+      read past in replay and keep the volume read-only); external journal
+      devices; data=journal mode; batching several calls per transaction
+      (now every call commits, with two cache flushes).
 - [ ] ext4: extents, 64-bit block numbers, flex_bg, htree directories,
       CRC32C metadata checksums -- read-only first (now: not mounted).
 - [ ] btrfs, read-only (CoW B-trees, chunk tree, checksums, zlib/LZO/zstd).

@@ -27,7 +27,7 @@ are for later stages.
 | `make qemu-sessions` | types into two concurrent DOS sessions via QEMU's monitor |
 | `make qemu-absmouse` | absolute pointer through QEMU's VMware port: the cursor lands on the exact pixel, and clicks hit their control |
 | `make qemu-crt` | the C runtime: CRTTEST.BIN (CRT.DLL) and CRTSTAT.BIN (libcrt.a) pass its checks; a stack overrun, a heap overrun, a double free, a fortified memcpy, a broken Annex K constraint, `%n` and a failed assert each end the program with the reason logged; every process has its own canary |
-| `make qemu-fat` | the VMM's own disks, run twice: with the data disk on the secondary channel and beside the boot disk (whose INT 13h the VMM then does); FAT32, FAT16, exFAT, two ext2 logical drives and an ext3 one left needing recovery, plus a 5 GB exFAT disk; FreeDOS had mounted the FAT ones as D: and E:, exFAT is F:, ext2 G: and H:, ext3 I:, the big disk J:; a DOS session works on them through the redirector (DIR, TYPE, COPY, MD, REN, DEL, a batch file read from E:), FSTEST.BIN's 156 checks through KERNEL.DLL (long names and aliases, numbered aliases, a 300 KB file in pieces, writing, gaps, truncating, folders, moves, read-only, locks, directories that grow, an exFAT file that can't stay contiguous, ext2's indirect blocks and 8 KB blocks, links, an ext3 journal replayed, case and dot files, a 4.5 GB exFAT file on a 4 KB-sector disk, a 5 GB sparse ext2 file, the time zone), LFNTEST.COM's long-name calls, share modes and locks from DOS, DOS sees D: and E: as its own drives again after OS1993 ends, and mtools, `tools/exfat.py`, debugfs, fsck.fat, fsck.exfat and e2fsck check the image |
+| `make qemu-fat` | the VMM's own disks, run twice: with the data disk on the secondary channel and beside the boot disk (whose INT 13h the VMM then does); FAT32, FAT16, exFAT, two ext2 logical drives and an ext3 one left needing recovery, plus a 5 GB exFAT disk; FreeDOS had mounted the FAT ones as D: and E:, exFAT is F:, ext2 G: and H:, ext3 I:, the big disk J:; a DOS session works on them through the redirector (DIR, TYPE, COPY, MD, REN, DEL, a batch file read from E:), FSTEST.BIN's 161 checks through KERNEL.DLL (long names and aliases, numbered aliases, a 300 KB file in pieces, writing, gaps, truncating, folders, moves, read-only, locks, directories that grow, an exFAT file that can't stay contiguous, ext2's indirect blocks and 8 KB blocks, links, an ext3 journal replayed and ext3 written through its journal, case and dot files, a 4.5 GB exFAT file on a 4 KB-sector disk, a 5 GB sparse ext2 file, the time zone), LFNTEST.COM's long-name calls, share modes and locks from DOS, DOS sees D: and E: as its own drives again after OS1993 ends, and mtools, `tools/exfat.py`, debugfs, fsck.fat, fsck.exfat and e2fsck check the image; then a crash: QEMU killed right after writes to ext3, e2fsck and the next boot both replay the journal |
 | `make qemu-net` | the network: the NE2000 and a DHCP lease, NETTEST.BIN's 26 checks (loopback UDP and TCP with a server thread, refused connections, ICMP port unreachable, timeouts, non-blocking sockets and select, 64 KB echoed by a server on the host), PING to the host, the loopback and nobody, IPCONFIG, and the host connecting in to a server in the guest |
 | `make qemu-threads` | threads: 67 checks (joins and exit codes, critical sections, events, semaphores, mutexes, timeouts, TLS and errno per thread, suspend/terminate, the 16-thread limit, malloc and printf from several threads, virtual memory, private heaps, a child process, the file calls); a stack overflow hits the guard page, a read-only page faults, the last thread's code ends the process, `exit` from a second thread ends them all |
 | `make qemu-vesa` | the VBE display driver: Display Properties switches to 1024×768 high colour, 800×600 in 256 colours and true colour, No and the 15-second timeout go back, a DOS session and back keeps the mode, OS1993.INI restores it next session, and 640×480×16 is VGA again |
@@ -504,14 +504,25 @@ and DOS programs get them too.
   The owner's write bit is the read-only attribute, a leading dot hidden;
   symbolic links read as their target. **Hard and symbolic links** can be
   made (`CreateHardLink`, `CreateSymbolicLink`). Times are kept in UTC,
-  through the time zone. An ext3 volume (a journal) or one with
-  read-only-compatible features it doesn't know mounts read-only; ext4's
-  incompatible features (extents, 64-bit ...) aren't mounted at all.
+  through the time zone. A volume with read-only-compatible features it
+  doesn't know mounts read-only; ext4's incompatible features (extents,
+  64-bit ...) aren't mounted at all.
   **ext3 journal replay**: a volume that wasn't unmounted cleanly
   (needs_recovery) has its journal replayed first, as Linux and e2fsck do
   it: the committed transactions found, revoke records gathered, every
   logged block written unless a later revoke covers it (escaped magic
   numbers restored), then the journal emptied and needs_recovery cleared.
+  **ext3 journalled writes**, in ordered mode as ext3 defaults to: every
+  metadata block a call changes (superblock, group descriptors, bitmaps,
+  inode tables, directory and indirect blocks) joins a transaction and is
+  pinned in the cache; freed blocks are revoked; at the end of the call the
+  file data goes out first, then descriptors, block copies and revoke
+  records, then the commit block, and only then may the blocks go home
+  (written behind). A full journal is checkpointed: everything home, the
+  log starts over. needs_recovery is set while mounted and cleared by a
+  clean shutdown; after a crash, the next mount -- or Linux, or e2fsck --
+  replays what was committed. Journals with checksums or async commit, and
+  external journals, stay read-only.
 - **Drivers** plug in through an operations table (`kernel/fs/fsimpl.h`);
   `fs.c` mounts each partition with the first driver that knows it, and
   holds the lock, the list of volumes, the share modes and byte-range
@@ -548,7 +559,7 @@ and DOS programs get them too.
   drives DOS answers 7100h ("not supported"), so programs use 8.3 names
   there, as on a DOS without long names.
 
-What doesn't work: writing ext3 through its journal, and ext4 (see TODO.md); long names on
+What doesn't work: ext4 (see TODO.md); long names on
 DOS's own drives (C:); TexFAT (exFAT with two FATs, which only Windows CE
 uses: desktop Windows doesn't mount it either) and ATAPI or 4 KB-sector
 drives; Unix owners, permissions beyond the write bit, and extended
