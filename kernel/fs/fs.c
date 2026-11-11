@@ -28,8 +28,10 @@ void fs_lock(void)
             irq_restore(f);
             return;
         }
-        irq_restore(f);
+        cpu_sti();                                      /* the owner may sleep on a disk interrupt */
         sched_yield();
+        if (!(f & 0x200))
+            cpu_cli();
     }
 }
 

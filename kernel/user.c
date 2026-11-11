@@ -1490,6 +1490,18 @@ void rtc_dos_time_odd(uint16_t *date, uint16_t *time, uint8_t *odd)
         *odd = (uint8_t)(t.second & 1);
 }
 
+/* Another thread's request to the console thread is in progress: wait our
+ * turn with interrupts on. The console may be asleep on a disk interrupt
+ * (INT 13h is the VMM's), which interrupts kept off would never deliver. */
+static void wait_turn(void)
+{
+    while (req.pending) {
+        cpu_sti();
+        sched_yield();
+        cpu_cli();
+    }
+}
+
 /* ---- INT 30h ------------------------------------------------------------------ */
 
 void syscall_dispatch(struct regs *r)
@@ -1807,8 +1819,7 @@ void syscall_dispatch(struct regs *r)
         }
         if (!r->ecx)
             args[0] = '\0';
-        while (req.pending)                         /* one request at a time */
-            schedule();
+        wait_turn();                                /* one request at a time */
         req.kind = REQ_EXEC;
         memcpy(req.name, name, sizeof name);
         memcpy(req.args, args, sizeof args);
@@ -1828,8 +1839,7 @@ void syscall_dispatch(struct regs *r)
             break;
         }
         memcpy(&fa, (const void *)(uintptr_t)r->ecx, sizeof fa);
-        while (req.pending)
-            schedule();
+        wait_turn();
         req.kind = REQ_FILE;
         req.proc = self;
         req.op = r->ebx;

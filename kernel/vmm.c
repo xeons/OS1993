@@ -69,10 +69,10 @@ static void check_paging(const struct bootinfo *bi)
 
 void kernel_shutdown(uint8_t exit_code)
 {
+    fs_shutdown();                      /* everything on the disks (interrupts still on) */
     cpu_cli();
     pic_mask_all();
     ne2000_stop();
-    fs_shutdown();                      /* everything on the disks */
     mouse_shutdown();                   /* or DOS's keyboard would jam */
     vm_restore_dos();                   /* the original DOS memory and screen */
     redir_restore();                    /* DOS's own drive letters back */
