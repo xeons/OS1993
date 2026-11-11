@@ -591,6 +591,9 @@ static void crash_write(void)
     DeleteFile("I:\\second.txt");
     MoveFile("I:\\before.txt", "I:\\Crash Dir\\before, moved.txt");
     spit("K:\\Crash K.txt", "external, before the crash\r\n", 28);
+    spit("J:\\Crash J.txt", "ext4, before the crash\r\n", 24);
+    HANDLE f3 = CreateFile("J:\\Crash J.txt", GENERIC_READ, OPEN_EXISTING);
+    FlushFileBuffers(f3);
     HANDLE f1 = CreateFile("I:\\Crash One.txt", GENERIC_READ, OPEN_EXISTING);
     HANDLE f2 = CreateFile("K:\\Crash K.txt", GENERIC_READ, OPEN_EXISTING);
     FlushFileBuffers(f1);                               /* committed: durable, though not yet home */
@@ -608,10 +611,11 @@ static void after_crash(void)
     CHECK(text_is("I:\\Crash Dir\\before, moved.txt", "written before the crash\n") &&
           GetFileAttributes("I:\\before.txt") == INVALID_FILE_ATTRIBUTES, "after the crash: the moved file moved");
     CHECK(text_is("K:\\Crash K.txt", "external, before the crash\r\n"), "after the crash: the external journal's too");
+    CHECK(text_is("J:\\Crash J.txt", "ext4, before the crash\r\n"), "after the crash: ext4's too");
     printf("FS: %d of %d checks passed\n", checks - failures, checks);
 }
 
-/* J: ext4 (read-only): extents, 64-bit descriptors, metadata checksums. */
+/* J: ext4: extents, 64-bit descriptors, metadata checksums. */
 static void test_ext4(void)
 {
     CHECK(text_is("J:\\Hello ext4.txt", "Hello from ext4.\n"), "ext4: read a file (extents)");
@@ -642,7 +646,113 @@ static void test_ext4(void)
     CHECK(text_is("J:\\journal.txt", "replayed, checksummed\n"), "ext4: its journal replayed (64-bit, checksum v3 tags)");
     CHECK(slurp("J:\\corrupt.txt", buf, 64) < 0 && GetLastError() == ERROR_FILE_CORRUPT,
           "ext4: an inode whose checksum is wrong isn't read");
-    CHECK(!spit("J:\\new.txt", "x", 1) && GetLastError() == ERROR_WRITE_PROTECT, "ext4: read-only");
+}
+
+static uint32_t free_on(const char *root)
+{
+    uint32_t spc, bps, fr = 0, total;
+    GetDiskFreeSpace(root, &spc, &bps, &fr, &total);
+    return fr;
+}
+
+/* n blocks of 4 KB, every other one (so none join: an extent each), written
+ * forwards or backwards; then read back, the gaps as zeros. */
+static bool sparse_file(const char *path, uint32_t n, bool backwards)
+{
+    static uint8_t blk[8192];
+    HANDLE h = CreateFile(path, GENERIC_READ | GENERIC_WRITE, CREATE_ALWAYS);
+    bool good = h != INVALID_HANDLE_VALUE;
+    for (uint32_t k = 0; k < n && good; k++) {
+        uint32_t i = backwards ? n - 1 - k : k, put = 0;
+        memset(blk, (int)(i % 251) + 1, 4096);
+        good = SetFilePointer(h, (int32_t)(i * 8192), FILE_BEGIN) == i * 8192 && WriteFile(h, blk, 4096, &put) && put == 4096;
+    }
+    good = good && SetFilePointer(h, 0, FILE_BEGIN) == 0;
+    for (uint32_t i = 0; i < n && good; i++) {
+        uint32_t want = i + 1 < n ? 8192 : 4096, got = 0;
+        good = ReadFile(h, blk, want, &got) && got == want;
+        for (uint32_t k = 0; k < want && good; k++)
+            good = blk[k] == (k < 4096 ? (uint8_t)(i % 251 + 1) : 0);
+    }
+    CloseHandle(h);
+    return good;
+}
+
+/* J: written: new files (extent trees grown, split, a level deeper), an
+ * existing file appended to, a preallocated one written into (unwritten
+ * extents split), another truncated, a hashed directory changed, a folder;
+ * every checksum kept (e2fsck checks the volume afterwards). */
+static void test_ext4_write(void)
+{
+    CHECK(spit("J:\\Written on ext4.txt", "written on ext4\r\n", 17) && text_is("J:\\Written on ext4.txt", "written on ext4\r\n"),
+          "ext4: write a new file");
+    uint32_t free0 = free_on("J:\\");
+    CHECK(sparse_file("J:\\Sparse.bin", 500, false), "ext4: 500 extents written forwards (the tree grows, a leaf fills)");
+    CHECK(sparse_file("J:\\Backwards.bin", 400, true), "ext4: 400 extents written backwards (leaves split in the middle)");
+    CHECK(DeleteFile("J:\\Sparse.bin") && DeleteFile("J:\\Backwards.bin") && free_on("J:\\") == free0,
+          "ext4: ... deleted, every block back (the tree's too)");
+    for (uint32_t i = 0; i < sizeof big; i++)
+        big[i] = pattern(i);
+    HANDLE h = CreateFile("J:\\Large on ext4.bin", GENERIC_WRITE, CREATE_ALWAYS);
+    bool good = h != INVALID_HANDLE_VALUE;
+    for (int k = 0; k < 10 && good; k++) {
+        uint32_t put = 0;
+        good = WriteFile(h, big, sizeof big, &put) && put == sizeof big;
+    }
+    CloseHandle(h);
+    h = CreateFile("J:\\Large on ext4.bin", GENERIC_READ, OPEN_EXISTING);
+    good = good && h != INVALID_HANDLE_VALUE && GetFileSize(h) == 3000000;
+    for (int k = 0; k < 10 && good; k++) {
+        uint32_t got = 0;
+        good = ReadFile(h, buf, sizeof buf, &got) && got == sizeof buf && !memcmp(buf, big, sizeof buf);
+    }
+    CloseHandle(h);
+    CHECK(good, "ext4: 3000000 bytes (across groups, bitmaps written for the first time)");
+    h = CreateFile("J:\\big.bin", GENERIC_WRITE, OPEN_EXISTING);
+    uint32_t put = 0;
+    good = h != INVALID_HANDLE_VALUE && SetFilePointer(h, 0, FILE_END) == 300000 && WriteFile(h, big, 100000, &put) && put == 100000;
+    CloseHandle(h);
+    int n = slurp("J:\\big.bin", buf, sizeof buf);
+    CHECK(good && n == 300000 && !memcmp(buf, big, 300000) && GetFileAttributes("J:\\big.bin") != INVALID_FILE_ATTRIBUTES,
+          "ext4: append to an existing file");
+    static uint8_t pre[40960 + 16];
+    h = CreateFile("J:\\prealloc.bin", GENERIC_WRITE, OPEN_EXISTING);
+    good = h != INVALID_HANDLE_VALUE && SetFilePointer(h, 5 * 4096 + 100, FILE_BEGIN) == 5 * 4096 + 100 &&
+           WriteFile(h, "MIDDLE", 6, &put) && put == 6;
+    memset(pre, 'Q', 8192);
+    good = good && SetFilePointer(h, 7 * 4096, FILE_BEGIN) == 7 * 4096 && WriteFile(h, pre, 4096, &put) &&
+           WriteFile(h, pre + 4096, 4096, &put) && put == 4096;
+    CloseHandle(h);
+    n = slurp("J:\\prealloc.bin", pre, sizeof pre);
+    good = good && n == 40960;
+    for (int i = 0; i < 40960 && good; i++) {
+        int b = i / 4096, o = i % 4096;
+        uint8_t want = b < 2 ? 'P' : (b == 7 || b == 8) ? 'Q' : (b == 5 && o >= 100 && o < 106) ? (uint8_t)"MIDDLE"[o - 100] : 0;
+        good = pre[i] == want;
+    }
+    CHECK(good, "ext4: write into unwritten extents (split; the rest still reads as zeros)");
+    h = CreateFile("J:\\frag.bin", GENERIC_WRITE, OPEN_EXISTING);
+    good = h != INVALID_HANDLE_VALUE && SetFilePointer(h, 500000, FILE_BEGIN) == 500000 && SetEndOfFile(h);
+    CloseHandle(h);
+    uint8_t *frag = malloc(500001);                    /* (too big for the program's own data) */
+    n = frag ? slurp("J:\\frag.bin", frag, 500001) : -1;
+    good = good && n == 500000;
+    for (int i = 0; i < 500000 && good; i++) {
+        uint32_t blk = (uint32_t)i / 4096;
+        good = frag[i] == (blk % 10 == 0 && blk >= 10 && blk <= 250 ? 0 : (uint8_t)(i * 13 + 1));
+    }
+    free(frag);
+    CHECK(good, "ext4: truncate a file of many extents");
+    CHECK(spit("J:\\Extent Dir\\added to a hashed directory.txt", "added\r\n", 7) &&
+          DeleteFile("J:\\Extent Dir\\entry number 5 in a big directory.txt") && count("J:\\Extent Dir\\*") == 120 &&
+          text_is("J:\\Extent Dir\\entry number 119 in a big directory.txt", "Hello from ext4.\n") &&
+          text_is("J:\\Extent Dir\\added to a hashed directory.txt", "added\r\n"),
+          "ext4: a hashed directory: a name added, one removed");
+    CHECK(CreateDirectory("J:\\New ext4 folder") && spit("J:\\New ext4 folder\\inside.txt", "inside\r\n", 8) &&
+          MoveFile("J:\\New ext4 folder\\inside.txt", "J:\\Moved out of the folder.txt") &&
+          RemoveDirectory("J:\\New ext4 folder") && CreateDirectory("J:\\Kept folder") &&
+          spit("J:\\Kept folder\\kept.txt", "kept\r\n", 6) && text_is("J:\\Moved out of the folder.txt", "inside\r\n"),
+          "ext4: folders: made, a file moved out, removed");
 }
 
 /* K: ext3 with an external journal (a partition of its own), data=journal,
@@ -743,6 +853,7 @@ int main(void)
     test_links();
     test_ext3();
     test_ext4();
+    test_ext4_write();
     test_ext3x();
     test_big();
     printf("FS: %d of %d checks passed\n", checks - failures, checks);

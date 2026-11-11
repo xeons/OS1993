@@ -49,7 +49,6 @@
 #define INDEX_FL      0x1000
 #define COMPAT_JOURNAL 0x0004
 #define INCOMPAT_FILETYPE 0x0002
-#define INCOMPAT_KNOWN    0x0002          /* what it writes */
 #define INCOMPAT_META_BG  0x0010
 #define INCOMPAT_EXTENTS  0x0040
 #define INCOMPAT_64BIT    0x0080
@@ -64,7 +63,17 @@
 #define EXT_MAGIC     0xF30A
 #define RO_SPARSE     0x0001
 #define RO_LARGE      0x0002
-#define RO_KNOWN      (RO_SPARSE | RO_LARGE)
+#define RO_HUGE_FILE  0x0008
+#define RO_GDT_CSUM   0x0010
+#define RO_DIR_NLINK  0x0020
+#define RO_EXTRA_ISIZE 0x0040
+#define RO_WRITABLE   (RO_SPARSE | RO_LARGE | RO_HUGE_FILE | RO_GDT_CSUM | RO_DIR_NLINK | RO_EXTRA_ISIZE | \
+                       RO_METADATA_CSUM)
+#define INCOMPAT_WRITABLE (INCOMPAT_FILETYPE | INCOMPAT_META_BG | INCOMPAT_EXTENTS | INCOMPAT_64BIT | \
+                           INCOMPAT_FLEX_BG | INCOMPAT_CSUM_SEED | INCOMPAT_LARGEDIR)
+#define BG_INODE_UNINIT 0x0001          /* the group's inode bitmap isn't written yet: all free */
+#define BG_BLOCK_UNINIT 0x0002          /* ... its block bitmap: only its own metadata in use */
+#define EXT_DEPTH     5                 /* an extent tree's deepest */
 #define FT_REG        1
 #define FT_DIR        2
 #define FT_SYMLINK    7
@@ -79,6 +88,8 @@
 struct group {
     uint32_t bbm, ibm, itab;
     uint16_t free_blocks, free_inodes, dirs;
+    uint16_t flags;                     /* BG_*: with uninit_bg or metadata_csum */
+    uint32_t unused;                    /* ... inodes at the table's end never used */
 };
 
 struct evol {
@@ -90,6 +101,10 @@ struct evol {
     uint32_t inode_size, first_ino;
     uint32_t desc_size, first_meta_bg;  /* ext4: 64-byte descriptors; meta_bg's layout */
     bool     meta_bg, ext4, csum;       /* csum: metadata_csum (CRC32C) */
+    bool     gdt_csum, uninit, sparse;  /* uninit_bg's CRC16 descriptors; either: BG_* flags */
+    bool     extents;                   /* new files get extent trees */
+    uint32_t rsv_gdt;                   /* blocks kept after the descriptors for growing */
+    uint8_t  uuid[16];
     uint32_t seed;                      /* ... its seed: CRC32C of the UUID */
     uint32_t dir_ok;                    /* the directory block last found sound */
     uint16_t extra_isize;
@@ -220,6 +235,62 @@ static void zero_any(struct evol *v, uint32_t b, bool is_meta)
 
 static void zero_block(struct evol *v, uint32_t b) { zero_any(v, b, true); }   /* metadata */
 
+/* A whole metadata block from memory. */
+static void meta_block(struct evol *v, uint32_t b, const uint8_t *data)
+{
+    for (uint32_t s = 0; s < v->spb; s++) {
+        struct buf *bf = bzero_get(v->disk, blk_lba(v, b) + s);
+        memcpy(bf->data, data + s * SECTOR, SECTOR);
+        meta(v, bf);
+        brelse(bf);
+    }
+    v->changed = true;
+}
+
+static int block_io(struct evol *v, uint32_t b, uint8_t *buf, bool write);
+
+static uint8_t *wbuf;                   /* a block, for checksums and new bitmaps */
+
+static int wbuf_get(void)
+{
+    if (!wbuf && !(wbuf = kmalloc(65536)))
+        return -ERROR_NOT_ENOUGH_MEMORY;
+    return 0;
+}
+
+/* uninit_bg's descriptor checksum: CRC16 (0x8005, reflected), as ext2fs. */
+static uint16_t crc16(uint16_t crc, const uint8_t *p, uint32_t len)
+{
+    while (len--) {
+        crc ^= *p++;
+        for (int k = 0; k < 8; k++)
+            crc = (uint16_t)((crc & 1) ? (crc >> 1) ^ 0xA001 : crc >> 1);
+    }
+    return crc;
+}
+
+static void gd_checksum(const struct evol *v, uint32_t g, uint8_t *q)
+{
+    uint8_t n[4] = { (uint8_t)g, (uint8_t)(g >> 8), (uint8_t)(g >> 16), (uint8_t)(g >> 24) };
+    q[0x1E] = q[0x1F] = 0;
+    if (v->csum) {
+        put16(q + 0x1E, fs_crc32c(fs_crc32c(v->seed, n, 4), q, v->desc_size));
+    } else if (v->gdt_csum) {
+        uint16_t c = crc16(crc16(crc16(0xFFFF, v->uuid, 16), n, 4), q, 0x1E);
+        if (v->desc_size > 0x20)
+            c = crc16(c, q + 0x20, v->desc_size - 0x20);
+        put16(q + 0x1E, c);
+    }
+}
+
+/* metadata_csum: a bitmap's checksum (its first bytes bytes). */
+static uint32_t bitmap_csum(struct evol *v, uint32_t blk, uint32_t bytes)
+{
+    if (wbuf_get() < 0 || block_io(v, blk, wbuf, false) < 0)
+        return 0;
+    return fs_crc32c(v->seed, wbuf, bytes);
+}
+
 /* ---- the superblock and group descriptors -------------------------------------------- */
 
 static bool has_super(uint32_t g)                       /* sparse_super: 0, 1, powers of 3, 5, 7 */
@@ -251,6 +322,8 @@ static void gd_loc(const struct evol *v, uint32_t g, uint32_t *blk, uint32_t *of
     *off = g * v->desc_size % v->bsize;
 }
 
+static void sb_checksum(struct evol *v, bool journaled);
+
 static int write_meta(struct evol *v)
 {
     if (v->sb_dirty) {
@@ -262,21 +335,50 @@ static int write_meta(struct evol *v)
         put32(b->data + 48, now_unix());                /* s_wtime */
         meta(v, b);
         brelse(b);
+        sb_checksum(v, true);
         v->sb_dirty = false;
         v->changed = true;
     }
     for (uint32_t i = 0; i < v->ngroups; i++) {
         if (!v->g_dirty[i])
             continue;
-        uint8_t *p;
-        uint32_t gb, go;
+        uint8_t *p, q[64];
+        uint32_t gb, go, bb = 0, ib = 0;
+        struct group *g = &v->g[i];
+        if (v->csum) {                                  /* (bitmaps not yet written have none) */
+            if (!(g->flags & BG_BLOCK_UNINIT))
+                bb = bitmap_csum(v, g->bbm, v->bpg / 8);
+            if (!(g->flags & BG_INODE_UNINIT))
+                ib = bitmap_csum(v, g->ibm, v->ipg / 8);
+        }
         gd_loc(v, i, &gb, &go);
         struct buf *b = bbyte(v, gb, go, &p);
         if (!b)
             return -ERROR_GEN_FAILURE;
-        put16(p + 12, v->g[i].free_blocks);
-        put16(p + 14, v->g[i].free_inodes);
-        put16(p + 16, v->g[i].dirs);
+        memcpy(q, p, v->desc_size);
+        put16(q + 12, g->free_blocks);
+        put16(q + 14, g->free_inodes);
+        put16(q + 16, g->dirs);
+        if (v->uninit) {
+            put16(q + 0x12, g->flags);
+            put16(q + 0x1C, g->unused);
+            if (v->desc_size >= 64)
+                put16(q + 0x32, g->unused >> 16);
+        }
+        if (v->csum) {
+            if (!(g->flags & BG_BLOCK_UNINIT))
+                put16(q + 0x18, bb);
+            if (!(g->flags & BG_INODE_UNINIT))
+                put16(q + 0x1A, ib);
+            if (v->desc_size >= 64) {
+                if (!(g->flags & BG_BLOCK_UNINIT))
+                    put16(q + 0x38, bb >> 16);
+                if (!(g->flags & BG_INODE_UNINIT))
+                    put16(q + 0x3A, ib >> 16);
+            }
+        }
+        gd_checksum(v, i, q);
+        memcpy(p, q, v->desc_size);
         meta(v, b);
         brelse(b);
         v->g_dirty[i] = false;
@@ -310,6 +412,7 @@ static void set_state(struct evol *v, bool clean)
     put16(b->data + 58, clean ? (st | 1) : (st & ~1u));
     bdirty(b);
     brelse(b);
+    sb_checksum(v, false);
     v->changed = true;
 }
 
@@ -360,6 +463,44 @@ static uint32_t group_blocks(const struct evol *v, uint32_t g)
     return v->nblocks - first < v->bpg ? v->nblocks - first : v->bpg;
 }
 
+/* A group's block bitmap written for the first time (BLOCK_UNINIT): its
+ * backup superblock and descriptors, and any group's bitmaps and inode table
+ * it holds (flex_bg) are in use. It must agree with the free count. */
+static int init_bbm(struct evol *v, uint32_t g)
+{
+    if (v->meta_bg || wbuf_get() < 0)
+        return -1;
+    uint32_t base = v->first_data + g * v->bpg, nb = group_blocks(v, g), used = 0;
+    memset(wbuf, 0, v->bsize);
+#define MARK(x) do { uint32_t x_ = (x) - base; \
+                     if ((x) >= base && x_ < nb && !(wbuf[x_ / 8] & (1 << (x_ % 8)))) { \
+                         wbuf[x_ / 8] |= (uint8_t)(1 << (x_ % 8)); used++; } } while (0)
+    if (!v->sparse || has_super(g)) {
+        uint32_t gdt = (v->ngroups * v->desc_size + v->bsize - 1) / v->bsize + v->rsv_gdt;
+        for (uint32_t k = 0; k <= gdt; k++)
+            MARK(base + k);
+    }
+    uint32_t itb = (v->ipg * v->inode_size + v->bsize - 1) / v->bsize;
+    for (uint32_t i = 0; i < v->ngroups; i++) {
+        MARK(v->g[i].bbm);
+        MARK(v->g[i].ibm);
+        for (uint32_t k = 0; k < itb; k++)
+            MARK(v->g[i].itab + k);
+    }
+#undef MARK
+    if (nb - used != v->g[g].free_blocks) {
+        klog("EXT2: group %u's block bitmap isn't written yet and doesn't add up (%u free, %u): not used\n",
+             g, v->g[g].free_blocks, nb - used);
+        return -1;
+    }
+    for (uint32_t i = nb; i < v->bsize * 8; i++)       /* past the group's end: in use */
+        wbuf[i / 8] |= (uint8_t)(1 << (i % 8));
+    meta_block(v, v->g[g].bbm, wbuf);
+    v->g[g].flags &= (uint16_t)~BG_BLOCK_UNINIT;
+    v->g_dirty[g] = true;
+    return 0;
+}
+
 /* A free block, as close after goal as there is. */
 static int alloc_block(struct evol *v, uint32_t goal, uint32_t *out)
 {
@@ -371,6 +512,8 @@ static int alloc_block(struct evol *v, uint32_t goal, uint32_t *out)
     for (uint32_t k = 0; k <= v->ngroups; k++) {
         uint32_t g = (g0 + k) % v->ngroups;
         if (!v->g[g].free_blocks)
+            continue;
+        if (v->uninit && (v->g[g].flags & BG_BLOCK_UNINIT) && init_bbm(v, g) < 0)
             continue;
         uint32_t from = k == 0 ? (goal - v->first_data) % v->bpg : 0;
         int64_t bit = take_bit(v, v->g[g].bbm, from, group_blocks(v, g));
@@ -429,6 +572,19 @@ static uint32_t inode_seed(const struct evol *v, uint32_t ino, const uint8_t *ra
     return fs_crc32c(c, raw + 0x64, 4);                 /* i_generation */
 }
 
+/* raw is inode ino's copy now. */
+static void seed_note(const uint8_t *raw, uint32_t ino)
+{
+    unsigned slot = seen_next % 16;
+    for (unsigned i = 0; i < 16; i++)
+        if (seen_ino[i].raw == raw)
+            slot = i;                                   /* the same buffer, another inode now */
+    if (slot == seen_next % 16)
+        seen_next++;
+    seen_ino[slot].raw = raw;
+    seen_ino[slot].ino = ino;
+}
+
 /* The seed for raw's blocks, or false if we don't know whose raw it is. */
 static bool raw_seed(const struct evol *v, const uint8_t *raw, uint32_t *seed)
 {
@@ -440,8 +596,9 @@ static bool raw_seed(const struct evol *v, const uint8_t *raw, uint32_t *seed)
     return false;
 }
 
-/* metadata_csum: the superblock's checksum, after a change to it. */
-static void sb_checksum(struct evol *v)
+/* metadata_csum: the superblock's checksum, after a change to it (journaled:
+ * as part of the transaction, like the change). */
+static void sb_checksum(struct evol *v, bool journaled)
 {
     if (!v->csum)
         return;
@@ -451,7 +608,10 @@ static void sb_checksum(struct evol *v)
         memcpy(sb, b0->data, 512);
         memcpy(sb + 512, b1->data, 512);
         put32(b1->data + 0x1FC, fs_crc32c(0xFFFFFFFFu, sb, 0x3FC));
-        bdirty(b1);
+        if (journaled)
+            meta(v, b1);
+        else
+            bdirty(b1);
     }
     brelse(b0);
     brelse(b1);
@@ -499,14 +659,7 @@ static int inode_read(struct evol *v, uint32_t ino, uint8_t raw[128])
             corrupt(v, "inode", ino);
             return -ERROR_FILE_CORRUPT;
         }
-        unsigned slot = seen_next % 16;
-        for (unsigned i = 0; i < 16; i++)
-            if (seen_ino[i].raw == raw)
-                slot = i;                               /* the same buffer, another inode now */
-        if (slot == seen_next % 16)
-            seen_next++;
-        seen_ino[slot].raw = raw;
-        seen_ino[slot].ino = ino;
+        seed_note(raw, ino);
     }
     return 0;
 }
@@ -524,7 +677,57 @@ static int inode_write(struct evol *v, uint32_t ino, const uint8_t raw[128])
     meta(v, b);
     brelse(b);
     v->changed = true;
+    if (!v->csum)
+        return 0;
+    /* metadata_csum: the whole inode, its checksum fields as zeros */
+    uint32_t c = inode_seed(v, ino, raw);
+    bool hi = false;
+    for (uint32_t d = 0; d < v->inode_size; d += 128) {
+        uint8_t part[128];
+        if (!(b = bbyte(v, blk, off + d, &p)))
+            return -ERROR_GEN_FAILURE;
+        memcpy(part, p, 128);
+        brelse(b);
+        if (d == 0) {
+            part[0x7C] = part[0x7D] = 0;
+        } else if (d == 128 && le16(part) >= 4) {
+            part[2] = part[3] = 0;
+            hi = true;
+        }
+        c = fs_crc32c(c, part, 128);
+    }
+    if (!(b = bbyte(v, blk, off, &p)))
+        return -ERROR_GEN_FAILURE;
+    put16(p + 0x7C, c);
+    meta(v, b);
+    brelse(b);
+    if (hi) {
+        if (!(b = bbyte(v, blk, off + 128, &p)))
+            return -ERROR_GEN_FAILURE;
+        put16(p + 2, c >> 16);
+        meta(v, b);
+        brelse(b);
+    }
     return 0;
+}
+
+/* A new inode's first 128 bytes: extents (a file, a directory, a long
+ * symbolic link) where the volume has them, a generation for its seeds. */
+static void new_inode(struct evol *v, uint8_t *raw, uint32_t ino, uint16_t mode, bool extents)
+{
+    memset(raw, 0, 128);
+    put16(raw, mode);
+    uint32_t t = now_unix();
+    put32(raw + 8, t);
+    put32(raw + 12, t);
+    put32(raw + 16, t);
+    put32(raw + 0x64, t * 2654435761u ^ ino * 40503u);  /* i_generation */
+    if (extents && v->extents) {
+        put32(raw + 32, EXTENTS_FL);
+        put16(raw + 40, EXT_MAGIC);
+        put16(raw + 44, 4);                             /* eh_max: four in the inode */
+    }
+    seed_note(raw, ino);
 }
 
 static uint16_t i_mode(const uint8_t *r)   { return le16(r); }
@@ -544,12 +747,15 @@ static void set_isize(struct evol *v, uint8_t *r, uint64_t s)
         if (s >= 0x80000000u) {                         /* a file of 2 GB or more: say so */
             struct buf *b = bread(v->disk, v->start + 2);
             if (b) {
-                if (!(le32(b->data + 100) & RO_LARGE)) {
+                bool set = !(le32(b->data + 100) & RO_LARGE);
+                if (set) {
                     put32(b->data + 100, le32(b->data + 100) | RO_LARGE);
                     meta(v, b);
                     v->changed = true;
                 }
                 brelse(b);
+                if (set)
+                    sb_checksum(v, true);
             }
         }
     }
@@ -571,10 +777,22 @@ static int alloc_inode(struct evol *v, uint32_t g0, bool dir, uint32_t *out)
         uint32_t g = (best + k) % v->ngroups;
         if (!v->g[g].free_inodes)
             continue;
+        if (v->uninit && (v->g[g].flags & BG_INODE_UNINIT)) {   /* its bitmap, for the first time */
+            if (wbuf_get() < 0)
+                continue;
+            memset(wbuf, 0, v->bsize);
+            for (uint32_t i = v->ipg; i < v->bsize * 8; i++)
+                wbuf[i / 8] |= (uint8_t)(1 << (i % 8));
+            meta_block(v, v->g[g].ibm, wbuf);
+            v->g[g].flags &= (uint16_t)~BG_INODE_UNINIT;
+            v->g_dirty[g] = true;
+        }
         uint32_t from = g == 0 ? v->first_ino - 1 : 0;
         int64_t bit = take_bit(v, v->g[g].ibm, from, v->ipg);
         if (bit < 0)
             continue;
+        if (v->uninit && (uint32_t)bit >= v->ipg - v->g[g].unused)
+            v->g[g].unused = v->ipg - (uint32_t)bit - 1;   /* the table's used part grows */
         v->g[g].free_inodes--;
         if (dir)
             v->g[g].dirs++;
@@ -686,14 +904,381 @@ static int ext_map(struct evol *v, const uint8_t *raw, uint32_t lb, uint32_t *ou
     return -ERROR_FILE_CORRUPT;
 }
 
+
+/* ---- extent trees, written ----------------------------------------------------------------
+ *
+ * A path from the root (in the inode) to the leaf for a logical block, each
+ * node a copy in memory; a node changed is written back whole (with its
+ * checksum tail), the root by the caller writing the inode. Inserting into
+ * a full node splits it (half moves to a new block -- or, at the end, the
+ * new entry starts the new block, as appending does), its parent getting an
+ * entry for the new one; a full root moves down into a block of its own and
+ * the tree grows a level. A node's first key is always its parent's key
+ * for it. */
+struct elevel { uint32_t blk; uint8_t *node; int pos; };     /* pos: the entry taken (leaf: or -1) */
+struct etree {
+    struct evol *v;
+    uint8_t *raw;
+    uint32_t seed, *goal;
+    int      depth;
+    struct elevel l[EXT_DEPTH + 2];
+};
+
+static uint8_t *epool[EXT_DEPTH + 3];
+static uint32_t epool_size;
+
+static int ext_pool(struct evol *v)
+{
+    if (epool_size >= v->bsize)
+        return 0;
+    for (int i = 0; i < EXT_DEPTH + 3; i++) {
+        kfree(epool[i]);
+        if (!(epool[i] = kmalloc(v->bsize))) {
+            epool_size = 0;
+            return -ERROR_NOT_ENOUGH_MEMORY;
+        }
+    }
+    epool_size = v->bsize;
+    return 0;
+}
+
+static uint8_t *ext_spare(struct etree *t)                  /* a buffer no level holds */
+{
+    for (int i = 0; i < EXT_DEPTH + 3; i++) {
+        bool used = false;
+        for (int k = 0; k <= t->depth; k++)
+            used |= t->l[k].node == epool[i];
+        if (!used)
+            return epool[i];
+    }
+    return NULL;
+}
+
+static uint8_t *ent(uint8_t *node, int i) { return node + 12 + 12 * i; }
+
+static int ext_open(struct etree *t, struct evol *v, uint8_t *raw, uint32_t *goal)
+{
+    *t = (struct etree){ .v = v, .raw = raw, .goal = goal };
+    int rc = ext_pool(v);
+    if (rc < 0)
+        return rc;
+    if (v->csum && !raw_seed(v, raw, &t->seed))
+        return -ERROR_GEN_FAILURE;                      /* (whose inode? never: every copy is noted) */
+    return 0;
+}
+
+static int ext_load(struct etree *t, uint32_t lb)
+{
+    struct evol *v = t->v;
+    uint8_t *nd = t->raw + 40;
+    if (le16(nd) != EXT_MAGIC || le16(nd + 6) > EXT_DEPTH)
+        return -ERROR_FILE_CORRUPT;
+    t->depth = le16(nd + 6);
+    t->l[0] = (struct elevel){ 0, nd, -1 };
+    for (int k = 1; k <= t->depth; k++)
+        t->l[k].node = NULL;
+    for (int lvl = 0;; lvl++) {
+        nd = t->l[lvl].node;
+        uint32_t n = le16(nd + 2);
+        int pick = -1;
+        for (uint32_t i = 0; i < n && le32(ent(nd, (int)i)) <= lb; i++)
+            pick = (int)i;
+        if (lvl == t->depth) {
+            t->l[lvl].pos = pick;
+            return 0;
+        }
+        if (!n)
+            return -ERROR_FILE_CORRUPT;
+        if (pick < 0)
+            pick = 0;
+        t->l[lvl].pos = pick;
+        uint32_t child = le32(ent(nd, pick) + 4);
+        if (le16(ent(nd, pick) + 8) || child < v->first_data || child >= v->nblocks)
+            return -ERROR_FILE_CORRUPT;
+        uint8_t *buf = epool[lvl + 1];
+        if (block_io(v, child, buf, false) < 0)
+            return -ERROR_GEN_FAILURE;
+        if (le16(buf) != EXT_MAGIC || le16(buf + 6) != t->depth - lvl - 1 || le16(buf + 2) > le16(buf + 4))
+            return -ERROR_FILE_CORRUPT;
+        t->l[lvl + 1] = (struct elevel){ child, buf, -1 };
+    }
+}
+
+/* Write a node block (its checksum after eh_max entries). */
+static void ext_put_block(struct etree *t, uint32_t blk, uint8_t *nd)
+{
+    struct evol *v = t->v;
+    uint32_t tail = 12 + 12 * le16(nd + 4);
+    if (v->csum && tail + 4 <= v->bsize)
+        put32(nd + tail, fs_crc32c(t->seed, nd, tail));
+    meta_block(v, blk, nd);
+}
+
+static void ext_store(struct etree *t, int lvl)
+{
+    if (lvl > 0)
+        ext_put_block(t, t->l[lvl].blk, t->l[lvl].node);
+    /* (the root: the caller writes the inode) */
+}
+
+/* The parents' keys for a node whose first key changed. */
+static void ext_fix_keys(struct etree *t, int lvl)
+{
+    for (; lvl > 0 && le16(t->l[lvl].node + 2); lvl--) {
+        uint8_t *pe = ent(t->l[lvl - 1].node, t->l[lvl - 1].pos);
+        uint32_t k = le32(ent(t->l[lvl].node, 0));
+        if (le32(pe) == k)
+            return;
+        put32(pe, k);
+        ext_store(t, lvl - 1);
+        if (t->l[lvl - 1].pos)
+            return;
+    }
+}
+
+static int ext_new_block(struct etree *t, uint32_t *b)
+{
+    int rc = alloc_block(t->v, *t->goal, b);
+    if (rc == 0)
+        put32(t->raw + 28, le32(t->raw + 28) + t->v->spb);
+    return rc;
+}
+
+static void ext_place(uint8_t *nd, uint32_t pos, const uint8_t e[12])
+{
+    uint32_t n = le16(nd + 2);
+    memmove(ent(nd, (int)pos + 1), ent(nd, (int)pos), 12 * (n - pos));
+    memcpy(ent(nd, (int)pos), e, 12);
+    put16(nd + 2, n + 1);
+}
+
+static int ext_insert_at(struct etree *t, int lvl, const uint8_t e[12])
+{
+    struct evol *v = t->v;
+    uint8_t *nd = t->l[lvl].node;
+    uint32_t n = le16(nd + 2), max = le16(nd + 4), key = le32(e), pos = 0;
+    while (pos < n && le32(ent(nd, (int)pos)) <= key)
+        pos++;
+    if (n < max) {
+        ext_place(nd, pos, e);
+        ext_store(t, lvl);
+        if (pos == 0)
+            ext_fix_keys(t, lvl);
+        return 0;
+    }
+    uint32_t b;
+    uint8_t *nb = ext_spare(t);
+    int rc;
+    if (!nb)
+        return -ERROR_GEN_FAILURE;
+    if (lvl == 0) {                                     /* the root is full: down into a block, one level more */
+        if (t->depth == EXT_DEPTH)
+            return -ERROR_DISK_FULL;
+        if ((rc = ext_new_block(t, &b)) < 0)
+            return rc;
+        memset(nb, 0, v->bsize);
+        put16(nb, EXT_MAGIC);
+        put16(nb + 2, n);
+        put16(nb + 4, (v->bsize - 12) / 12);
+        put16(nb + 6, t->depth);
+        memcpy(ent(nb, 0), ent(nd, 0), 12 * n);
+        for (int k = t->depth; k >= 1; k--)
+            t->l[k + 1] = t->l[k];
+        t->l[1] = (struct elevel){ b, nb, t->l[0].pos };
+        t->depth++;
+        memset(ent(nd, 0), 0, 12 * max);
+        put16(nd + 2, 1);
+        put16(nd + 6, t->depth);
+        put32(ent(nd, 0), le32(ent(nb, 0)));
+        put32(ent(nd, 0) + 4, b);
+        t->l[0].pos = 0;
+        ext_store(t, 1);
+        return ext_insert_at(t, 1, e);
+    }
+    if ((rc = ext_new_block(t, &b)) < 0)                /* split: the upper half (or just the new one) moves */
+        return rc;
+    memset(nb, 0, v->bsize);
+    put16(nb, EXT_MAGIC);
+    put16(nb + 4, max);
+    put16(nb + 6, le16(nd + 6));
+    uint32_t m = pos == n ? n : n / 2;
+    put16(nb + 2, n - m);
+    memcpy(ent(nb, 0), ent(nd, (int)m), 12 * (n - m));
+    memset(ent(nd, (int)m), 0, 12 * (n - m));
+    put16(nd + 2, m);
+    bool low = pos < n && pos <= m;
+    if (low)
+        ext_place(nd, pos, e);
+    else
+        ext_place(nb, pos - m, e);
+    ext_put_block(t, b, nb);
+    ext_store(t, lvl);
+    if (low && pos == 0)
+        ext_fix_keys(t, lvl);
+    uint8_t idx[12] = { 0 };
+    put32(idx, le32(ent(nb, 0)));
+    put32(idx + 4, b);
+    return ext_insert_at(t, lvl - 1, idx);
+}
+
+/* A new extent: len blocks from logical lb at pb (unwritten: reads as zeros). */
+static int ext_add(struct etree *t, uint32_t lb, uint32_t len, uint32_t pb, bool unwritten)
+{
+    uint8_t e[12] = { 0 };
+    put32(e, lb);
+    put16(e + 4, len + (unwritten ? 32768 : 0));
+    put32(e + 8, pb);
+    int rc = ext_load(t, lb);
+    return rc < 0 ? rc : ext_insert_at(t, t->depth, e);
+}
+
+/* Block lb mapped for writing: a hole gets a block (the extent before it
+ * grows when the block follows it on the disk too); an unwritten block
+ * becomes written (split out of its extent, or added to the written one
+ * before, as writing through a preallocated file goes). */
+static int ext_alloc(struct evol *v, uint8_t *raw, uint32_t lb, uint32_t *goal, uint32_t *out, bool *fresh)
+{
+    struct etree t;
+    int rc = ext_open(&t, v, raw, goal);
+    if (rc < 0 || (rc = ext_load(&t, lb)) < 0)
+        return rc;
+    uint8_t *leaf = t.l[t.depth].node;
+    int i = t.l[t.depth].pos;
+    uint8_t *e = i >= 0 ? ent(leaf, i) : NULL;
+    uint32_t eb = 0, elen = 0, es = 0;
+    bool un = false;
+    if (e) {
+        eb = le32(e);
+        elen = le16(e + 4);
+        es = le32(e + 8);
+        if ((un = elen > 32768))
+            elen -= 32768;
+        if (le16(e + 6))
+            return -ERROR_FILE_TOO_LARGE;
+    }
+    if (e && lb - eb < elen) {
+        uint32_t pb = es + (lb - eb), off = lb - eb;
+        *out = pb;
+        if (!un)
+            return 0;
+        *fresh = true;                                  /* (its old bytes aren't the file's) */
+        *goal = pb + 1;
+        if (elen == 1) {
+            put16(e + 4, 1);
+            ext_store(&t, t.depth);
+            return 0;
+        }
+        if (off == 0) {
+            put32(e, eb + 1);
+            put16(e + 4, elen - 1 + 32768);
+            put32(e + 8, es + 1);
+            uint8_t *pe = i > 0 ? ent(leaf, i - 1) : NULL;
+            if (pe && le16(pe + 4) < 32768 && !le16(pe + 6) && le32(pe) + le16(pe + 4) == lb &&
+                le32(pe + 8) + le16(pe + 4) == pb) {
+                put16(pe + 4, le16(pe + 4) + 1);
+                ext_store(&t, t.depth);
+                return 0;
+            }
+            ext_store(&t, t.depth);
+            if (i == 0)
+                ext_fix_keys(&t, t.depth);
+            return ext_add(&t, lb, 1, pb, false);
+        }
+        put16(e + 4, off + 32768);                      /* [eb, lb) stays unwritten */
+        ext_store(&t, t.depth);
+        if ((rc = ext_add(&t, lb, 1, pb, false)) < 0 || off + 1 == elen)
+            return rc;
+        return ext_add(&t, lb + 1, elen - off - 1, pb + 1, true);
+    }
+    uint32_t pb;
+    if ((rc = alloc_block(v, e ? es + (lb - eb) : *goal, &pb)) < 0)
+        return rc;
+    put32(raw + 28, le32(raw + 28) + v->spb);
+    *out = pb;
+    *fresh = true;
+    *goal = pb + 1;
+    if (e && !un && elen < 32768 && lb == eb + elen && pb == es + elen) {
+        put16(e + 4, elen + 1);
+        ext_store(&t, t.depth);
+        return 0;
+    }
+    if ((rc = ext_add(&t, lb, 1, pb, false)) < 0) {
+        free_block(v, pb);
+        put32(raw + 28, le32(raw + 28) - v->spb);
+    }
+    return rc;
+}
+
+/* Free everything from logical block keep on; a node left empty is freed
+ * (the root becomes an empty leaf). -> entries left. */
+static int ext_trunc_node(struct etree *t, int lvl, uint8_t *nd, uint32_t keep)
+{
+    struct evol *v = t->v;
+    int n = le16(nd + 2), depth = le16(nd + 6);
+    bool changed = false;
+    while (n > 0) {
+        uint8_t *e = ent(nd, n - 1);
+        uint32_t k = le32(e);
+        if (depth == 0) {
+            uint32_t len = le16(e + 4), flag = 0, s = le32(e + 8);
+            if (len > 32768) {
+                len -= 32768;
+                flag = 32768;
+            }
+            if (k + len <= keep)
+                break;
+            uint32_t from = k >= keep ? 0 : keep - k;
+            for (uint32_t j = from; j < len; j++) {
+                free_block(v, s + j);
+                put32(t->raw + 28, le32(t->raw + 28) - v->spb);
+            }
+            changed = true;
+            if (from) {
+                put16(e + 4, from + flag);
+                break;
+            }
+            memset(e, 0, 12);
+            n--;
+            continue;
+        }
+        uint32_t child = le32(e + 4);
+        uint8_t *cb = epool[lvl + 1];
+        if (lvl + 1 > EXT_DEPTH || child < v->first_data || child >= v->nblocks || block_io(v, child, cb, false) < 0 ||
+            le16(cb) != EXT_MAGIC)
+            break;
+        if (ext_trunc_node(t, lvl + 1, cb, keep) == 0) {
+            free_block(v, child);
+            put32(t->raw + 28, le32(t->raw + 28) - v->spb);
+            memset(e, 0, 12);
+            n--;
+            changed = true;
+        } else {
+            ext_put_block(t, child, cb);
+        }
+        if (k < keep)
+            break;
+    }
+    put16(nd + 2, (uint32_t)n);
+    if (lvl == 0 && n == 0)
+        put16(nd + 6, 0);
+    (void)changed;
+    return n;
+}
+
+static void ext_truncate(struct evol *v, uint8_t *raw, uint32_t keep)
+{
+    struct etree t;
+    uint32_t goal = 0;
+    if (ext_open(&t, v, raw, &goal) < 0 || le16(raw + 40) != EXT_MAGIC)
+        return;
+    ext_trunc_node(&t, 0, raw + 40, keep);
+}
+
 static int bmap2(struct evol *v, uint8_t *raw, uint32_t lb, bool alloc, uint32_t *goal, uint32_t *out, bool *fresh)
 {
     *fresh = false;
-    if (le32(raw + 32) & EXTENTS_FL) {                  /* ext4 (mounted read-only) */
-        if (alloc)
-            return -ERROR_WRITE_PROTECT;
-        return ext_map(v, raw, lb, out);
-    }
+    if (le32(raw + 32) & EXTENTS_FL)                    /* ext4: an extent tree */
+        return alloc ? ext_alloc(v, raw, lb, goal, out, fresh) : ext_map(v, raw, lb, out);
     uint32_t ppb = v->ppb, depth, idx[4], slot;
     if (lb < 12) {
         depth = 0;
@@ -793,6 +1378,10 @@ static bool trunc_ind(struct evol *v, uint8_t *raw, uint32_t b, int level, uint3
 
 static void truncate_blocks(struct evol *v, uint8_t *raw, uint32_t keep)
 {
+    if (le32(raw + 32) & EXTENTS_FL) {
+        ext_truncate(v, raw, keep);
+        return;
+    }
     for (uint32_t i = 0; i < 12; i++) {
         uint32_t b = le32(raw + 40 + i * 4);
         if (b && i >= keep) {
@@ -826,10 +1415,12 @@ static int data_io(struct evol *v, uint8_t *raw, uint32_t *goal, uint64_t pos, u
         if ((pos >> v->bshift) > 0xFFFFFFFFu)
             return done_n ? (int)done_n : -ERROR_FILE_TOO_LARGE;
         uint32_t lb = (uint32_t)(pos >> v->bshift), in = (uint32_t)pos & (v->bsize - 1), pb;
-        uint32_t blocks_before = le32(raw + 28);
+        uint8_t before[64];
+        memcpy(before, raw + 28, 4);
+        memcpy(before + 4, raw + 40, 60);
         bool fresh;
         int rc = bmap2(v, raw, lb, write, goal, &pb, &fresh);
-        if (le32(raw + 28) != blocks_before)
+        if (memcmp(before, raw + 28, 4) || memcmp(before + 4, raw + 40, 60))
             *raw_changed = true;
         if (rc < 0)
             return done_n ? (int)done_n : rc;
@@ -1092,6 +1683,72 @@ static int walk(struct evol *v, const char *path, uint32_t *dino, const char **l
     }
 }
 
+/* metadata_csum: a directory block's checksum tail, after a change. */
+static void dir_seal(struct evol *v, const uint8_t *draw, uint32_t pb)
+{
+    uint32_t seed;
+    if (!v->csum || !raw_seed(v, draw, &seed) || wbuf_get() < 0 || block_io(v, pb, wbuf, false) < 0)
+        return;
+    const uint8_t *tl = wbuf + v->bsize - 12;
+    if (le32(tl) || le16(tl + 4) != 12 || tl[6] || tl[7] != 0xDE)
+        return;
+    uint8_t *p;
+    struct buf *b = bbyte(v, pb, v->bsize - 4, &p);
+    if (!b)
+        return;
+    put32(p, fs_crc32c(seed, wbuf, v->bsize - 12));
+    meta(v, b);
+    brelse(b);
+    v->dir_ok = 0;
+}
+
+/* ... a new block's tail record (no inode, 12 bytes, type DEh), sealed. */
+static void dir_tail(struct evol *v, const uint8_t *draw, uint32_t pb)
+{
+    uint8_t *p;
+    struct buf *b = bbyte(v, pb, v->bsize - 12, &p);
+    if (!b)
+        return;
+    memset(p, 0, 12);
+    put16(p + 4, 12);
+    p[7] = 0xDE;
+    meta(v, b);
+    brelse(b);
+    dir_seal(v, draw, pb);
+}
+
+/* metadata_csum: a hashed directory about to change becomes a plain list:
+ * its index blocks become empty records with tails (the root's ".." ends
+ * before its tail), the index flag goes. (Without checksums the index
+ * blocks already read as empty records.) */
+static void unindex(struct evol *v, uint8_t *draw)
+{
+    uint32_t size = le32(draw + 4), goal = 0;
+    for (uint32_t lb = 0; (uint64_t)lb * v->bsize < size; lb++) {
+        uint32_t pb, at;
+        if (bmap(v, draw, lb, false, &goal, &pb) < 0 || !pb || wbuf_get() < 0 || block_io(v, pb, wbuf, false) < 0)
+            continue;
+        if (lb == 0) {
+            at = 12;
+            if (le16(wbuf + 4) != 12 || le16(wbuf + 16) != v->bsize - 12)
+                continue;
+        } else {
+            at = 0;
+            if (le32(wbuf) || le16(wbuf + 4) != v->bsize)
+                continue;
+        }
+        uint8_t *p;
+        struct buf *b = bbyte(v, pb, at + 4, &p);
+        if (!b)
+            continue;
+        put16(p, v->bsize - 12 - at);
+        meta(v, b);
+        brelse(b);
+        dir_tail(v, draw, pb);
+    }
+    put32(draw + 32, le32(draw + 32) & ~(uint32_t)INDEX_FL);
+}
+
 /* Write a record at offset off of directory draw (its block is mapped). */
 static int put_record(struct evol *v, uint8_t *draw, uint32_t off, uint32_t ino, uint16_t rl,
                       const char *raw, uint8_t type)
@@ -1156,16 +1813,18 @@ static int dir_add(struct evol *v, uint32_t dino, const char *name, uint32_t ino
     uint8_t draw[128];
     if (inode_read(v, dino, draw) < 0)
         return -ERROR_GEN_FAILURE;
+    if (v->csum && (le32(draw + 32) & INDEX_FL))
+        unindex(v, draw);
     uint32_t size = le32(draw + 4);
-    /* room after a record (or an empty first record) */
+    /* room after a record (or an empty first record); not in the checksum tail */
     for (uint32_t blk = 0; blk * v->bsize < size; blk++) {
         uint32_t goal = 0, pb;
         if (bmap(v, draw, blk, false, &goal, &pb) < 0)
             return -ERROR_GEN_FAILURE;
         if (!pb)
             continue;
-        uint32_t pos = 0;
-        while (pos < v->bsize) {
+        uint32_t pos = 0, end = v->csum ? v->bsize - 12 : v->bsize;
+        while (pos < end) {
             uint8_t hdr[8];
             uint8_t *p;
             struct buf *b = bbyte(v, pb, pos, &p);
@@ -1174,7 +1833,7 @@ static int dir_add(struct evol *v, uint32_t dino, const char *name, uint32_t ino
             memcpy(hdr, p, 8);
             brelse(b);
             uint16_t rl = le16(hdr + 4);
-            if (rl < 8 || rl % 4 || pos + rl > v->bsize)
+            if (rl < 8 || rl % 4 || pos + rl > end)
                 break;
             uint32_t used = le32(hdr) ? rec_size(v->filetype ? hdr[6] : le16(hdr + 6)) : 0;
             if (rl - used >= need) {
@@ -1187,6 +1846,7 @@ static int dir_add(struct evol *v, uint32_t dino, const char *name, uint32_t ino
                 }
                 if ((rc = put_record(v, draw, at, ino, (uint16_t)(rl - used), raw, type)) < 0)
                     return rc;
+                dir_seal(v, draw, pb);
                 touch_dir(v, draw);
                 return inode_write(v, dino, draw);
             }
@@ -1194,8 +1854,8 @@ static int dir_add(struct evol *v, uint32_t dino, const char *name, uint32_t ino
         }
     }
     /* a new block */
-    uint32_t goal = 0, pb;
-    for (uint32_t i = 0; i < 12; i++)
+    uint32_t goal = v->first_data + ((dino - 1) / v->ipg) * v->bpg, pb;
+    for (uint32_t i = 0; i < 12 && !(le32(draw + 32) & EXTENTS_FL); i++)
         if (le32(draw + 40 + i * 4))
             goal = le32(draw + 40 + i * 4) + 1;
     int rc = bmap(v, draw, size / v->bsize, true, &goal, &pb);
@@ -1203,8 +1863,11 @@ static int dir_add(struct evol *v, uint32_t dino, const char *name, uint32_t ino
         return rc;
     zero_block(v, pb);
     put32(draw + 4, size + v->bsize);
-    if ((rc = put_record(v, draw, size, ino, (uint16_t)v->bsize, raw, type)) < 0)
+    if (v->csum)
+        dir_tail(v, draw, pb);
+    if ((rc = put_record(v, draw, size, ino, (uint16_t)(v->csum ? v->bsize - 12 : v->bsize), raw, type)) < 0)
         return rc;
+    dir_seal(v, draw, pb);
     touch_dir(v, draw);
     return inode_write(v, dino, draw);
 }
@@ -1214,12 +1877,15 @@ static int dir_remove(struct evol *v, uint32_t dino, const struct dent *e)
     uint8_t draw[128];
     if (inode_read(v, dino, draw) < 0)
         return -ERROR_GEN_FAILURE;
+    if (v->csum && (le32(draw + 32) & INDEX_FL))
+        unindex(v, draw);                               /* (the records stay where they are) */
     int rc;
     if (e->prev == ~0u) {                               /* first in its block: just unused */
         uint32_t goal = 0, pb;
         if (bmap(v, draw, e->off / v->bsize, false, &goal, &pb) < 0 || !pb)
             return -ERROR_GEN_FAILURE;
         rc = wr32(v, pb, e->off % v->bsize, 0);
+        dir_seal(v, draw, pb);
     } else {
         uint32_t goal = 0, pb;
         if (bmap(v, draw, e->prev / v->bsize, false, &goal, &pb) < 0 || !pb)
@@ -1232,6 +1898,7 @@ static int dir_remove(struct evol *v, uint32_t dino, const struct dent *e)
         meta(v, b);
         brelse(b);
         v->changed = true;
+        dir_seal(v, draw, pb);
         rc = 0;
     }
     if (rc < 0)
@@ -1695,7 +2362,7 @@ static int journal_replay(struct evol *v)
     put32(b0->data + 96, le32(b0->data + 96) & ~(uint32_t)INCOMPAT_RECOVER);
     bdirty(b0);
     brelse(b0);
-    sb_checksum(v);
+    sb_checksum(v, false);
     rc = cache_sync() < 0 ? -1 : 0;
     ata_flush(v->j_disk);
 out:
@@ -1758,6 +2425,10 @@ static int jsb_write(struct evol *v, uint32_t start, uint32_t seq)
     if (v->t_nrev) {                                    /* revoke records need the feature */
         v->j_incompat |= JI_REVOKE;
         putbe32(v->j_buf + 40, v->j_incompat);
+    }
+    if (v->j_incompat & JI_CSUM3 || v->j_incompat & JI_CSUM2) {   /* the superblock's own checksum */
+        putbe32(v->j_buf + 0xFC, 0);
+        putbe32(v->j_buf + 0xFC, fs_crc32c(0xFFFFFFFFu, v->j_buf, 1024));
     }
     if (jwrite(v, v->j_sb, v->j_buf) < 0)
         return -1;
@@ -1928,6 +2599,7 @@ static void journal_mounted(struct evol *v, bool mounted)
     put16(b->data + 58, mounted ? (st & ~1u) : (st | 1));
     bdirty(b);
     brelse(b);
+    sb_checksum(v, false);
     cache_flush_disk(v->disk);
     ata_flush(v->disk);
 }
@@ -2001,13 +2673,25 @@ struct vol *ext2_mount(struct partition *p)
         v->inode_size > v->bsize || (uint64_t)v->nblocks * v->spb > p->count)
         return NULL;
     v->ngroups = (v->nblocks - v->first_data + v->bpg - 1) / v->bpg;
-    v->ro = (ro_compat & ~(uint32_t)RO_KNOWN) || (compat & COMPAT_JOURNAL) ||
-            (incompat & ~(uint32_t)(INCOMPAT_KNOWN | INCOMPAT_RECOVER));   /* ext4: read-only */
     v->ext4 = incompat & (INCOMPAT_EXTENTS | INCOMPAT_64BIT | INCOMPAT_FLEX_BG);
     v->desc_size = (incompat & INCOMPAT_64BIT) && le16(sb + 0xFE) >= 32 ? le16(sb + 0xFE) : 32;
+    /* written: the features it knows, no orphans waiting (e2fsck's), no MMP */
+    bool writable = !(incompat & ~(uint32_t)(INCOMPAT_WRITABLE | INCOMPAT_RECOVER)) &&
+                    !(ro_compat & ~(uint32_t)RO_WRITABLE) && v->desc_size <= 64 && v->inode_size <= 1024;
+    if (writable && le32(sb + 0xE8)) {
+        klog("FS: ext2 at %u: orphan inodes are waiting for e2fsck: read-only\n", p->start);
+        writable = false;
+    }
+    v->ro = !writable || (compat & COMPAT_JOURNAL);     /* (journaled: once its journal is open) */
+    v->sparse = ro_compat & RO_SPARSE;
+    v->rsv_gdt = le16(sb + 0xCE);
+    v->extents = incompat & INCOMPAT_EXTENTS;
+    memcpy(v->uuid, sb + 104, 16);
     v->meta_bg = incompat & INCOMPAT_META_BG;
     v->first_meta_bg = le32(sb + 0x104);
     v->csum = ro_compat & RO_METADATA_CSUM;
+    v->gdt_csum = (ro_compat & RO_GDT_CSUM) && !v->csum;
+    v->uninit = v->csum || v->gdt_csum;
     v->seed = (incompat & INCOMPAT_CSUM_SEED) ? le32(sb + 0x270) : fs_crc32c(0xFFFFFFFFu, sb + 104, 16);
     if (v->desc_size > v->bsize || (v->desc_size & (v->desc_size - 1)))
         return NULL;
@@ -2031,7 +2715,10 @@ struct vol *ext2_mount(struct partition *p)
             return NULL;
         memcpy(q, qp, v->desc_size > 64 ? 64 : v->desc_size);
         brelse(b);
-        v->g[i] = (struct group){ le32(q), le32(q + 4), le32(q + 8), le16(q + 12), le16(q + 14), le16(q + 16) };
+        v->g[i] = (struct group){ le32(q), le32(q + 4), le32(q + 8), le16(q + 12), le16(q + 14), le16(q + 16),
+                                  v->uninit ? le16(q + 0x12) : 0, v->uninit ? le16(q + 0x1C) : 0 };
+        if (v->uninit && v->desc_size >= 64)
+            v->g[i].unused |= (uint32_t)le16(q + 0x32) << 16;
         if (v->desc_size >= 64 && (le32(q + 0x20) || le32(q + 0x24) || le32(q + 0x28))) {
             klog("FS: ext4 at %u: group %u's tables are past 2^32 blocks: not mounted\n", p->start, i);
             return NULL;
@@ -2067,8 +2754,7 @@ struct vol *ext2_mount(struct partition *p)
     v->h.start = p->start;
     v->h.type = v->ext4 ? "ext4" : (compat & COMPAT_JOURNAL) ? "ext3" : "ext2";
     v->data_journal = (le32(sb + 0x100) & 0x60) == 0x20;        /* default mount options: data=journal */
-    if (have_journal && !v->ext4 && !(incompat & ~(uint32_t)(INCOMPAT_KNOWN | INCOMPAT_RECOVER)) &&
-        !(ro_compat & ~(uint32_t)RO_KNOWN) && journal_open(v)) {
+    if (have_journal && writable && journal_open(v)) {
         v->ro = false;
         journal_mounted(v, true);                       /* needs_recovery until a clean shutdown */
     } else if (!v->ro) {
@@ -2107,7 +2793,7 @@ static struct enode *node_get(struct evol *v, uint32_t ino, const char *name, co
     char alias[13];
     fs_make_alias(name, fs_hash16(raw), fr->fcb, alias);
     fr->goal = v->first_data + ((ino - 1) / v->ipg) * v->bpg;
-    for (int i = 11; i >= 0; i--)
+    for (int i = 11; i >= 0 && !(le32(fr->raw + 32) & EXTENTS_FL); i--)    /* (extents: ext_alloc's own) */
         if (le32(fr->raw + 40 + i * 4)) {
             fr->goal = le32(fr->raw + 40 + i * 4) + 1;
             break;
@@ -2206,13 +2892,8 @@ static int ex2_open(struct vol *vv, const char *path, uint32_t disp, bool write,
         uint32_t ino;
         if ((rc = alloc_inode(v, (dino - 1) / v->ipg, false, &ino)) < 0)
             return done(v, rc);
-        memset(raw, 0, sizeof raw);
-        put16(raw, S_IFREG | ((attr & A_RO) ? 0444 : 0644));
+        new_inode(v, raw, ino, S_IFREG | ((attr & A_RO) ? 0444 : 0644), true);
         put16(raw + 26, 1);
-        uint32_t t = now_unix();
-        put32(raw + 8, t);
-        put32(raw + 12, t);
-        put32(raw + 16, t);
         if ((rc = inode_write(v, ino, raw)) < 0 || (rc = dir_add(v, dino, clean, ino, FT_REG)) < 0) {
             free_inode(v, ino, false);
             return done(v, rc);
@@ -2520,20 +3201,23 @@ static int ex2_mkdir(struct vol *vv, const char *path)
     }
     zero_block(v, blk);
     uint8_t raw[128];
-    memset(raw, 0, sizeof raw);
-    put16(raw, S_IFDIR | 0755);
+    new_inode(v, raw, ino, S_IFDIR | 0755, true);
     put32(raw + 4, v->bsize);
-    uint32_t t = now_unix();
-    put32(raw + 8, t);
-    put32(raw + 12, t);
-    put32(raw + 16, t);
     put16(raw + 26, 2);
     put32(raw + 28, v->spb);
-    put32(raw + 40, blk);
+    if (le32(raw + 32) & EXTENTS_FL) {                  /* one extent: block 0 at blk */
+        put16(raw + 42, 1);
+        put16(raw + 56, 1);
+        put32(raw + 60, blk);
+    } else {
+        put32(raw + 40, blk);
+    }
     if ((rc = inode_write(v, ino, raw)) < 0)
         return done(v, rc);
     put_record(v, raw, 0, ino, 12, ".", FT_DIR);
-    put_record(v, raw, 12, dino, (uint16_t)(v->bsize - 12), "..", FT_DIR);
+    put_record(v, raw, 12, dino, (uint16_t)(v->bsize - 12 - (v->csum ? 12 : 0)), "..", FT_DIR);
+    if (v->csum)
+        dir_tail(v, raw, blk);
     if ((rc = dir_add(v, dino, clean, ino, FT_DIR)) < 0) {
         free_block(v, blk);
         free_inode(v, ino, true);
@@ -2638,8 +3322,10 @@ static int ex2_rename(struct vol *vv, const char *from, const char *to)
         static struct dent dd;
         if (dir_find(v, fe.ino, "..", &dd) == 0) {
             uint32_t goal = 0, pb;
-            if (bmap(v, raw, dd.off / v->bsize, false, &goal, &pb) == 0 && pb)
+            if (bmap(v, raw, dd.off / v->bsize, false, &goal, &pb) == 0 && pb) {
                 wr32(v, pb, dd.off % v->bsize, tdir);
+                dir_seal(v, raw, pb);
+            }
         }
         link_count(v, fdir, -1);
         link_count(v, tdir, +1);
@@ -2918,13 +3604,8 @@ static int ex2_symlink(struct vol *vv, const char *path, const char *target)
     if ((rc = alloc_inode(v, (dino - 1) / v->ipg, false, &ino)) < 0)
         return done(v, rc);
     uint8_t raw[128];
-    memset(raw, 0, sizeof raw);
-    put16(raw, S_IFLNK | 0777);
+    new_inode(v, raw, ino, S_IFLNK | 0777, tl >= 60);   /* (a short one lives in the block pointers) */
     put16(raw + 26, 1);
-    uint32_t now = now_unix();
-    put32(raw + 8, now);
-    put32(raw + 12, now);
-    put32(raw + 16, now);
     put32(raw + 4, (uint32_t)tl);
     if (tl < 60) {                                      /* fast: in the block pointers */
         memcpy(raw + 40, utarget, (size_t)tl);

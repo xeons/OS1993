@@ -27,7 +27,7 @@ are for later stages.
 | `make qemu-sessions` | types into two concurrent DOS sessions via QEMU's monitor |
 | `make qemu-absmouse` | absolute pointer through QEMU's VMware port: the cursor lands on the exact pixel, and clicks hit their control |
 | `make qemu-crt` | the C runtime: CRTTEST.BIN (CRT.DLL) and CRTSTAT.BIN (libcrt.a) pass its checks; a stack overrun, a heap overrun, a double free, a fortified memcpy, a broken Annex K constraint, `%n` and a failed assert each end the program with the reason logged; every process has its own canary |
-| `make qemu-fat` | the VMM's own disks, run twice: with the data disk on the secondary channel and beside the boot disk (whose INT 13h the VMM then does); FAT32, FAT16, exFAT, two ext2 logical drives and an ext3 one left needing recovery, plus a 5 GB exFAT disk; FreeDOS had mounted the FAT ones as D: and E:, exFAT is F:, ext2 G: and H:, ext3 I:, the big disk J:; a DOS session works on them through the redirector (DIR, TYPE, COPY, MD, REN, DEL, a batch file read from E:), FSTEST.BIN's 175 checks through KERNEL.DLL (long names and aliases, numbered aliases, a 300 KB file in pieces, writing, gaps, truncating, folders, moves, read-only, locks, directories that grow, an exFAT file that can't stay contiguous, ext2's indirect blocks and 8 KB blocks, links, an ext3 journal replayed and ext3 written through its journal (internal, and an external one with data=journal and CRC32 checksums), ext4 read with its checksums, a long name on C:, case and dot files, a 4.5 GB exFAT file on a 4 KB-sector disk, a 5 GB sparse ext2 file, the time zone), LFNTEST.COM's long-name calls, share modes and locks from DOS, DOS sees D: and E: as its own drives again after OS1993 ends, and mtools, `tools/exfat.py`, debugfs, fsck.fat, fsck.exfat and e2fsck check the image; then a crash: QEMU killed right after writes to ext3, e2fsck and the next boot both replay the journal; then btrfs (zstd with a subvolume, LZO, zlib with a damaged sector) on a disk of its own |
+| `make qemu-fat` | the VMM's own disks, run twice: with the data disk on the secondary channel and beside the boot disk (whose INT 13h the VMM then does); FAT32, FAT16, exFAT, two ext2 logical drives and an ext3 one left needing recovery, plus a 5 GB exFAT disk; FreeDOS had mounted the FAT ones as D: and E:, exFAT is F:, ext2 G: and H:, ext3 I:, the big disk J:; a DOS session works on them through the redirector (DIR, TYPE, COPY, MD, REN, DEL, a batch file read from E:), FSTEST.BIN's 184 checks through KERNEL.DLL (long names and aliases, numbered aliases, a 300 KB file in pieces, writing, gaps, truncating, folders, moves, read-only, locks, directories that grow, an exFAT file that can't stay contiguous, ext2's indirect blocks and 8 KB blocks, links, an ext3 journal replayed and ext3 written through its journal (internal, and an external one with data=journal and CRC32 checksums), ext4 read with its checksums and written (extent trees grown, split and truncated, unwritten extents written, a hashed directory changed, bitmaps written for the first time), a long name on C:, case and dot files, a 4.5 GB exFAT file on a 4 KB-sector disk, a 5 GB sparse ext2 file, the time zone), LFNTEST.COM's long-name calls, share modes and locks from DOS, DOS sees D: and E: as its own drives again after OS1993 ends, and mtools, `tools/exfat.py`, debugfs, fsck.fat, fsck.exfat and e2fsck check the image; then a crash: QEMU killed right after writes to ext3 and ext4, e2fsck and the next boot both replay the journals; then btrfs (zstd with a subvolume, LZO, zlib with a damaged sector) on a disk of its own |
 | `make qemu-net` | the network: the NE2000 and a DHCP lease, NETTEST.BIN's 26 checks (loopback UDP and TCP with a server thread, refused connections, ICMP port unreachable, timeouts, non-blocking sockets and select, 64 KB echoed by a server on the host), PING to the host, the loopback and nobody, IPCONFIG, and the host connecting in to a server in the guest |
 | `make qemu-threads` | threads: 67 checks (joins and exit codes, critical sections, events, semaphores, mutexes, timeouts, TLS and errno per thread, suspend/terminate, the 16-thread limit, malloc and printf from several threads, virtual memory, private heaps, a child process, the file calls); a stack overflow hits the guard page, a read-only page faults, the last thread's code ends the process, `exit` from a second thread ends them all |
 | `make qemu-vesa` | the VBE display driver: Display Properties switches to 1024×768 high colour, 800×600 in 256 colours and true colour, No and the 15-second timeout go back, a DOS session and back keeps the mode, OS1993.INI restores it next session, and 640×480×16 is VGA again |
@@ -506,13 +506,22 @@ and DOS programs get them too.
   made (`CreateHardLink`, `CreateSymbolicLink`). Times are kept in UTC,
   through the time zone. A volume with read-only-compatible features it
   doesn't know mounts read-only.
-  **ext4**, read-only: extent trees (index blocks, uninitialized extents
-  as zeros), 64-bit block group descriptors, flex_bg, meta_bg, hashed
-  directories (read as the linear lists they also are), and metadata_csum:
-  the superblock's, group descriptors', inodes', extent blocks' and
-  directory blocks' CRC32C checksums are checked, and what fails isn't
-  read. Inline data, encryption and journal devices of its own aren't
-  mounted.
+  **ext4**: extent trees (index blocks, uninitialized extents as zeros),
+  64-bit block group descriptors, flex_bg, meta_bg, hashed directories
+  (read as the linear lists they also are), and metadata_csum: the
+  superblock's, group descriptors', inodes', extent blocks' and directory
+  blocks' CRC32C checksums are checked, and what fails isn't read. It is
+  written too, through its journal (checksum v3): new files and folders
+  get extent trees, which grow (an extent extended when the next block
+  follows on the disk), split full nodes and gain levels, and shrink when
+  a file is truncated; writing into a preallocated range splits its
+  unwritten extent; every checksum is kept up to date (inodes, extent and
+  directory blocks with their tails, bitmaps, descriptors, the superblock,
+  the journal's); a group whose bitmaps were never written (uninit_bg)
+  gets them when first used; a hashed directory that changes becomes a
+  plain list (valid, if slower for Linux). uninit_bg's CRC16 descriptors
+  are kept too. Inline data, encryption, quotas, bigalloc and journal
+  devices of its own aren't mounted, or mount read-only.
   **ext3 journal replay**: a volume that wasn't unmounted cleanly
   (needs_recovery) has its journal replayed first, as Linux and e2fsck do
   it: the committed transactions found, revoke records gathered, every
@@ -588,8 +597,8 @@ and DOS programs get them too.
   drives DOS answers 7100h ("not supported"), so programs use 8.3 names
   there, as on a DOS without long names.
 
-What doesn't work: writing ext4 and btrfs, btrfs on several devices or
-RAID (see TODO.md); TexFAT (exFAT with two FATs, which only Windows CE
+What doesn't work: writing btrfs, btrfs on several devices or RAID (see
+TODO.md); TexFAT (exFAT with two FATs, which only Windows CE
 uses: desktop Windows doesn't mount it either) and ATAPI or 4 KB-sector
 drives; Unix owners, permissions beyond the write bit, and extended
 attributes on ext2 (kept as they are, not shown: nothing in a Win32-style

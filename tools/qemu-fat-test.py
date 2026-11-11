@@ -93,6 +93,20 @@ def ext3_image():
         return f.read(65536 * 512)
 
 
+def ext4_image(data):
+    """J:'s partition, its deliberately broken inode put right (so e2fsck
+    judges only what the VMM wrote)."""
+    with tempfile.NamedTemporaryFile(suffix=".img") as t:
+        t.write(data)
+        t.flush()
+        out = subprocess.run(["debugfs", "-R", "imap corrupt.txt", t.name], capture_output=True, text=True).stdout
+    m = re.search(r"located at block (\d+), offset 0x([0-9a-f]+)", out)
+    if not m:
+        return data
+    at = int(m.group(1)) * 4096 + int(m.group(2), 16) + 0x10
+    return data[:at] + bytes([data[at] ^ 0x5A]) + data[at + 1:]
+
+
 def crash_test():
     """Write on the ext3 volume, pull the plug; e2fsck must replay our
     journal on a copy, and so must our own driver at the next boot."""
@@ -132,6 +146,26 @@ def crash_test():
         k = subprocess.run(["debugfs", "-R", 'cat "Crash K.txt"', t.name], capture_output=True).stdout
         check(r.returncode in (0, 1) and k == b"external, before the crash\r\n",
               "e2fsck replays our external journal (CRC32 checksums) too")
+    with tempfile.NamedTemporaryFile(suffix=".img") as t:
+        with open(IMG, "rb") as f:
+            f.seek(E4 * 512)
+            t.write(f.read(65536 * 512))
+        t.flush()
+        # the replay first (it brings back the broken inode's block), then that inode put right
+        j = subprocess.run(["e2fsck", "-E", "journal_only", "-y", t.name], capture_output=True, text=True)
+        with open(t.name, "rb") as f:
+            fixed = ext4_image(f.read())
+        with open(t.name, "r+b") as f:
+            f.write(fixed)
+        r = subprocess.run(["e2fsck", "-fy", t.name], capture_output=True, text=True)
+        r.stdout = j.stdout + r.stdout
+        noise = [l for l in r.stdout.splitlines() if not l.startswith(("Pass ", "e2fsck", "DATAE4:"))
+                 and "recovering journal" not in l and l.strip()]
+        for l in noise[:8]:
+            print("        " + l)
+        k = subprocess.run(["debugfs", "-R", 'cat "Crash J.txt"', t.name], capture_output=True).stdout
+        check(r.returncode in (0, 1) and not noise and k == b"ext4, before the crash\r\n",
+              "e2fsck replays our ext4 journal (checksum v3): the file is there, nothing else to fix")
     with Machine(data_disk=IMG, big_disk=BIG) as m:
         m.wait_log("PS/2 mouse")
         log = m.log()
@@ -142,7 +176,7 @@ def crash_test():
         log = m.log()
         for f in re.findall(r"FS: FAIL .*", log):
             print("        " + f)
-        check("FS: 5 of 5 checks passed" in log, "... and everything written before the crash is there")
+        check("FS: 6 of 6 checks passed" in log, "... and everything written before the crash is there")
         m.shut_down()
         m.key("x", 1)
         m.wait_exit(30)
@@ -243,7 +277,7 @@ def main():
         for f in re.findall(r"FS: FAIL .*", log):
             print("        " + f)
         line = re.search(r"FS: (\d+) of (\d+) checks passed", log)
-        check(line and line.group(1) == line.group(2) and int(line.group(2)) >= 175,
+        check(line and line.group(1) == line.group(2) and int(line.group(2)) >= 184,
               line.group(0) if line else "FSTEST: no result")
         check("EXT2: journal full at transaction" in m.log(), "ext3: the journal filled up and started over (a checkpoint)")
         with open(os.path.join(QDIR, "SERIAL-main.LOG"), "w") as f:
@@ -354,6 +388,22 @@ def main():
         t.flush()
         h = subprocess.run(["dumpe2fs", "-h", t.name], capture_output=True, text=True).stdout
         check("needs_recovery" not in h, "ext4: needs_recovery gone after the replay")
+    with tempfile.NamedTemporaryFile(suffix=".img") as t:
+        t.write(ext4_image(disk[E4 * 512:(E4 + 65536) * 512]))
+        t.flush()
+        r = subprocess.run(["e2fsck", "-fn", t.name], capture_output=True, text=True)
+        for l in r.stdout.splitlines():
+            if not l.startswith(("Pass ", "e2fsck", "DATAE4:")):
+                print("        " + l)
+        check(r.returncode == 0, "e2fsck: the ext4 volume is clean after our writes (every checksum right)")
+        def dbg(cmd):
+            return subprocess.run(["debugfs", "-R", cmd, t.name], capture_output=True).stdout
+        big = bytes((i * 7 + i // 251) & 255 for i in range(300000))
+        check(dbg('cat "Large on ext4.bin"') == big * 10 and dbg('cat big.bin') == big + big[:100000]
+              and dbg('cat "Kept folder/kept.txt"') == b"kept\r\n",
+              "debugfs reads what the VMM wrote on ext4")
+        groups = subprocess.run(["dumpe2fs", t.name], capture_output=True, text=True).stdout
+        check(groups.count("BLOCK_UNINIT") < 2, "ext4: a group's block bitmap was written for the first time")
     with tempfile.NamedTemporaryFile(suffix=".img") as t, tempfile.NamedTemporaryFile(suffix=".jnl") as j:
         t.write(disk[FX * 512:(FX + 65536) * 512])
         t.flush()

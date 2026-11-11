@@ -206,7 +206,7 @@ rm -f "$e3"
 e4=$tmp.e4
 rm -f "$e4"
 truncate -s 32M "$e4"
-mke2fs -q -F -t ext4 -b 4096 -L DATAE4 "$e4"
+mke2fs -q -F -t ext4 -b 4096 -g 1024 -L DATAE4 "$e4"   # eight groups, some never used
 d4=$(mktemp -d)
 printf 'Hello from ext4.\n' > "$d4/hello"
 python3 -c "import sys; sys.stdout.buffer.write(bytes((i * 7 + i // 251) & 255 for i in range(300000)))" > "$d4/big"

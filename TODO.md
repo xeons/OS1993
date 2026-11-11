@@ -161,8 +161,11 @@ and file systems); DOS reaches their volumes through the redirector.
       external journal devices; data=journal.
 - [x] ext4, read-only: extents, 64-bit descriptors, flex_bg, meta_bg,
       hashed directories, metadata_csum checked.
-- [ ] ext4 writing (extent trees, checksums everywhere); inline data;
-      async commit journals.
+- [x] ext4 writing: extent trees (grown, split, deeper, truncated),
+      unwritten extents written, every checksum kept, uninit_bg groups.
+- [ ] ext4: inline data, quotas, bigalloc, the orphan file in use; async
+      commit journals; extended attribute blocks freed with their file
+      (ext2/3 too); hashed directories kept hashed (now: made plain).
 - [x] btrfs, read-only: chunk, root and file system trees, subvolumes,
       zlib/LZO/zstd, node and data checksums (CRC32C).
 - [ ] btrfs: several devices and RAID profiles; xxhash/SHA-256/BLAKE2
