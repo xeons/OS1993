@@ -1227,7 +1227,7 @@ static void emergency(void)
 /* Console thread, every loop: run exec requests, free ended processes. */
 void user_service(void)
 {
-    if (u.running && u.cad_tick && !u.cad_acked && timer_ticks() - u.cad_tick > 36)
+    if (u.running && u.cad_tick && !u.cad_acked && (int32_t)(timer_ticks() - u.cad_tick) > 36)
         emergency();
 
     uint32_t f = irq_save();
