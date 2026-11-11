@@ -1,6 +1,6 @@
 /*
- * fstest.c -- tests of the VMM's own disks: FAT32 (D:), FAT16 (E:) and
- * exFAT (F:) on the secondary IDE master, reached directly through
+ * fstest.c -- tests of the VMM's own disks: FAT32 (D:), FAT16 (E:),
+ * exFAT (F:) and ext2 (G:) on the secondary IDE master, reached directly through
  * KERNEL.DLL's file calls, long names and all.
  *
  * tools/qemu-fat-test.py builds the disk (tools/mkdata.sh), lets a DOS
@@ -330,12 +330,97 @@ static void test_exfat(void)
     CHECK(spit("F:\\FROMGUI.TXT", "exFAT, written by an OS1993 program.\r\n", 38), "exFAT: leave F:\\FROMGUI.TXT");
 }
 
+static void test_ext2(void)
+{
+    CHECK(text_is("G:\\Hello ext2.txt", "Hello from ext2.\n"), "ext2: read a file debugfs wrote");
+    CHECK(text_is("g:\\HELLO EXT2.TXT", "Hello from ext2.\n"), "ext2: ... in any case");
+    CHECK(text_is("G:\\Long Directory Name\\A file in a directory with a long name.txt", "Inside ext2.\n"),
+          "ext2: a long path");
+    WIN32_FIND_DATA fd;
+    HANDLE f = FindFirstFile("G:\\Hello*", &fd);
+    CHECK(f != INVALID_HANDLE_VALUE && !strcmp(fd.name, "Hello ext2.txt") && alias_form(fd.short_name),
+          "ext2: FindFirstFile, with a DOS alias");
+    char alias[MAX_PATH];
+    snprintf(alias, sizeof alias, "G:\\%s", f != INVALID_HANDLE_VALUE ? fd.short_name : "?");
+    FindClose(f);
+    CHECK(text_is(alias, "Hello from ext2.\n"), "ext2: ... the alias opens it");
+    uint32_t attr = 0;
+    CHECK(listed("G:\\*", "lost+found", NULL, &attr) && (attr & FILE_ATTRIBUTE_DIRECTORY), "ext2: lost+found is a folder");
+    CHECK(listed("G:\\*", "link-to-hello", NULL, &attr) && (attr & FILE_ATTRIBUTE_SYSTEM) && (attr & FILE_ATTRIBUTE_READONLY),
+          "ext2: a symbolic link shows as a read-only system file");
+    CHECK(text_is("G:\\link-to-hello", "Hello ext2.txt"), "ext2: ... and reads as its target");
+    f = FindFirstFile("G:\\Long Directory Name\\*", &fd);
+    CHECK(f != INVALID_HANDLE_VALUE && !strcmp(fd.name, ".") && FindNextFile(f, &fd) && !strcmp(fd.name, ".."),
+          "ext2: a folder lists . and ..");
+    FindClose(f);
+    int n = slurp("G:\\big.bin", buf, sizeof buf);
+    CHECK(n == (int)sizeof big && !memcmp(buf, big, sizeof big), "ext2: 300000 bytes through double indirect blocks");
+    n = slurp("G:\\BIGDOS.BIN", buf, sizeof buf);
+    CHECK(n == (int)sizeof big && !memcmp(buf, big, sizeof big), "ext2: DOS's COPY of it");
+    CHECK(text_is("G:\\DOSX\\DOS.TXT", "ext2 from DOS\r\n"), "ext2: DOS made a folder and a file");
+
+    uint32_t spc, bps, free0, free1, total;
+    GetDiskFreeSpace("G:\\", &spc, &bps, &free0, &total);
+    for (uint32_t i = 0; i < sizeof big; i++)
+        buf[i] = (uint8_t)(i * 17 + 3);
+    CHECK(spit("G:\\A large new file.dat", buf, sizeof big), "ext2: write 300000 bytes (indirect blocks allocated)");
+    CHECK(slurp("G:\\A large new file.dat", big, sizeof big) == (int)sizeof big && !memcmp(big, buf, sizeof big),
+          "ext2: ... and read them back");
+    HANDLE h = CreateFile("G:\\A large new file.dat", GENERIC_WRITE, OPEN_EXISTING);
+    SetFilePointer(h, 5000, FILE_BEGIN);
+    CHECK(SetEndOfFile(h) && GetFileSize(h) == 5000, "ext2: truncate it to 5000");
+    CloseHandle(h);
+    GetDiskFreeSpace("G:\\", &spc, &bps, &free1, &total);
+    CHECK(free0 - free1 == 5, "ext2: ... its other blocks and indirect blocks are free again");
+    CHECK(slurp("G:\\A large new file.dat", big, sizeof big) == 5000 && !memcmp(big, buf, 5000), "ext2: ... still right");
+    for (uint32_t i = 0; i < sizeof big; i++)
+        big[i] = pattern(i);
+
+    CHECK(spit("G:\\CaseTest.txt", "c", 1), "ext2: CaseTest.txt");
+    CHECK(CreateFile("G:\\casetest.txt", GENERIC_WRITE, CREATE_NEW) == INVALID_HANDLE_VALUE &&
+          GetLastError() == ERROR_FILE_EXISTS, "ext2: casetest.txt is the same name here");
+    CHECK(spit("G:\\.hidden", "h", 1) && listed("G:\\*", ".hidden", NULL, &attr) && (attr & FILE_ATTRIBUTE_HIDDEN),
+          "ext2: a dot file is hidden");
+
+    CHECK(CreateDirectory("G:\\New Folder") && spit("G:\\New Folder\\x.txt", "x", 1), "ext2: a folder and a file");
+    CHECK(MoveFile("G:\\New Folder\\x.txt", "G:\\New Folder\\Renamed to something longer.txt") &&
+          MoveFile("G:\\New Folder", "G:\\Long Directory Name\\Moved In"), "ext2: rename, and move a folder");
+    CHECK(text_is("G:\\Long Directory Name\\Moved In\\Renamed to something longer.txt", "x"), "ext2: ... the file came along");
+    CHECK(text_is("G:\\Long Directory Name\\Moved In\\..\\A file in a directory with a long name.txt", "Inside ext2.\n"),
+          "ext2: ... its .. is the new parent");
+    CHECK(!MoveFile("G:\\Long Directory Name", "G:\\Long Directory Name\\Moved In\\Deeper"), "ext2: not into itself");
+    CHECK(!RemoveDirectory("G:\\Long Directory Name\\Moved In"), "ext2: RemoveDirectory: not empty");
+    CHECK(DeleteFile("G:\\Long Directory Name\\Moved In\\Renamed to something longer.txt") &&
+          RemoveDirectory("G:\\Long Directory Name\\Moved In"), "ext2: ... emptied, it goes");
+
+    CHECK(CreateDirectory("G:\\GUIDIR"), "ext2: G:\\GUIDIR");
+    bool made = true;
+    for (int i = 0; i < 80 && made; i++) {
+        char name[80];
+        snprintf(name, sizeof name, "G:\\GUIDIR\\Entry number %d of a directory that grows.txt", i);
+        made = spit(name, name, (uint32_t)strlen(name));
+    }
+    CHECK(made && count("G:\\GUIDIR\\*") == 80, "ext2: 80 long names (the directory takes more blocks)");
+    for (int i = 1; i < 80; i += 2) {
+        char name[80];
+        snprintf(name, sizeof name, "G:\\GUIDIR\\Entry number %d of a directory that grows.txt", i);
+        DeleteFile(name);
+    }
+    CHECK(count("G:\\GUIDIR\\*") == 40, "ext2: delete every other one: 40 left");
+    CHECK(SetFileAttributes("G:\\README.TXT", FILE_ATTRIBUTE_READONLY) && !DeleteFile("G:\\README.TXT") &&
+          SetFileAttributes("G:\\README.TXT", FILE_ATTRIBUTE_ARCHIVE), "ext2: read-only (the write bit) protects");
+    CHECK(GetDiskFreeSpace("G:\\", &spc, &bps, &free1, &total) && spc == 2 && bps == 512 && free1 > 0 && free1 < total,
+          "ext2: GetDiskFreeSpace");
+    CHECK(spit("G:\\FROMGUI.TXT", "ext2, written by an OS1993 program.\r\n", 37), "ext2: leave G:\\FROMGUI.TXT");
+}
+
 int main(void)
 {
     test_reading();
     test_dos_results();
     test_writing();
     test_exfat();
+    test_ext2();
     printf("FS: %d of %d checks passed\n", checks - failures, checks);
     return failures ? 1 : 0;
 }

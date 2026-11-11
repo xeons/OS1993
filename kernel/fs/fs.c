@@ -56,7 +56,7 @@ void fs_init(void)
     fs_lock();
     part_scan();
     for (int i = 0; i < nparts; i++)
-        if (!exfat_mount(&parts[i]))
+        if (!exfat_mount(&parts[i]) && !ext2_mount(&parts[i]))
             fat_mount(&parts[i]);
     fs_unlock();
     redir_init();
@@ -222,4 +222,126 @@ int fs_clean_name(const char *in, char *out)
     memcpy(out, in, n);
     out[n] = '\0';
     return (int)n;
+}
+
+/* DOS's name for an entry: the name in upper case if it is 8.3, else
+ * "XXhhhh~1.EXT" from the name hash. */
+void fs_make_alias(const char *name, uint16_t hash, uint8_t fcb[11], char *alias)
+{
+    memset(fcb, ' ', 11);
+    const char *dot = NULL;
+    int dots = 0;
+    for (const char *p = name; *p; p++)
+        if (*p == '.') {
+            dot = p;
+            dots++;
+        }
+    bool fits = name[0] != '.' && dots <= 1;
+    int n = 0;
+    uint8_t basis[8];
+    int bn = 0;
+    for (const char *p = name; *p && (!dot || p < dot); p++) {
+        uint8_t c = (uint8_t)fs_up(*p);
+        if (c == ' ' || !fs_short_char(c)) {
+            fits = false;
+            if (c == ' ' || c == '.')
+                continue;
+            c = '_';
+        }
+        if (n < 8)
+            fcb[n++] = c;
+        else
+            fits = false;
+        if (bn < 8)
+            basis[bn++] = c;
+    }
+    if (!n)
+        fits = false;
+    if (dot) {
+        int m = 0;
+        for (const char *p = dot + 1; *p; p++) {
+            uint8_t c = (uint8_t)fs_up(*p);
+            if (c == ' ' || !fs_short_char(c)) {
+                fits = false;
+                if (c == ' ')
+                    continue;
+                c = '_';
+            }
+            if (m < 3)
+                fcb[8 + m++] = c;
+            else
+                fits = false;
+        }
+    }
+    if (!fits) {
+        static const char hex[] = "0123456789ABCDEF";
+        memset(fcb, ' ', 8);
+        int k = 0;
+        for (int i = 0; i < bn && k < 2; i++)
+            fcb[k++] = basis[i];
+        for (int s = 12; s >= 0; s -= 4)
+            fcb[k++] = (uint8_t)hex[(hash >> s) & 15];
+        fcb[k++] = '~';
+        fcb[k++] = '1';
+    }
+    if (fcb[0] == 0xE5)
+        fcb[0] = 0x05;
+    int a = 0;
+    for (int i = 0; i < 8 && fcb[i] != ' '; i++)
+        alias[a++] = (char)(i == 0 && fcb[0] == 0x05 ? 0xE5 : fcb[i]);
+    if (fcb[8] != ' ') {
+        alias[a++] = '.';
+        for (int i = 8; i < 11 && fcb[i] != ' '; i++)
+            alias[a++] = (char)fcb[i];
+    }
+    alias[a] = '\0';
+    if (fcb[0] == 0x05)
+        fcb[0] = 0xE5;
+}
+
+
+/* A 16-bit hash of a name's bytes (exFAT's rotate-and-add), for aliases. */
+uint16_t fs_hash16(const char *name)
+{
+    uint16_t h = 0;
+    for (const uint8_t *p = (const uint8_t *)name; *p; p++)
+        h = (uint16_t)(((h & 1) ? 0x8000 : 0) + (h >> 1) + *p);
+    return h;
+}
+
+/* ---- times: DOS's and Unix's (seconds since 1970, taken as local time) ---------- */
+
+void fs_unix_to_dos(uint32_t t, uint16_t *date, uint16_t *time)
+{
+    uint32_t days = t / 86400, secs = t % 86400;
+    uint32_t z = days + 719468, era = z / 146097, doe = z - era * 146097;
+    uint32_t yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    uint32_t y = yoe + era * 400, doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    uint32_t mp = (5 * doy + 2) / 153, d = doy - (153 * mp + 2) / 5 + 1;
+    uint32_t m = mp < 10 ? mp + 3 : mp - 9;
+    y += m <= 2;
+    if (y < 1980) {
+        *date = (1 << 5) | 1;                           /* 1980-01-01 */
+        *time = 0;
+        return;
+    }
+    if (y > 2107)
+        y = 2107;
+    *date = (uint16_t)((y - 1980) << 9 | m << 5 | d);
+    *time = (uint16_t)((secs / 3600) << 11 | (secs / 60 % 60) << 5 | (secs % 60) / 2);
+}
+
+uint32_t fs_dos_to_unix(uint16_t date, uint16_t time)
+{
+    uint32_t y = 1980 + (date >> 9), m = (date >> 5) & 15, d = date & 31;
+    if (m < 1 || m > 12)
+        m = 1;
+    if (d < 1)
+        d = 1;
+    y -= m <= 2;
+    uint32_t era = y / 400, yoe = y - era * 400;
+    uint32_t doy = (153 * (m > 2 ? m - 3 : m + 9) + 2) / 5 + d - 1;
+    uint32_t doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    uint32_t days = era * 146097 + doe - 719468;
+    return days * 86400 + (uint32_t)(time >> 11) * 3600 + ((time >> 5) & 63) * 60 + (time & 31) * 2;
 }

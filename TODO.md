@@ -154,9 +154,17 @@ systems); DOS reaches its volumes through the redirector.
       table beyond 256; UTF-16 names show as '_'); DOS aliases are made
       from the name hash and can collide (one of the two is then out of
       DOS's reach); timestamps' 10 ms and UTC offset fields.
-- [ ] ext2; ext3 (journal replay to read, journalled writes); ext4
-      (extents, 64-bit blocks, htree directories, CRC32C metadata) read-only
-      first.
+- [x] ext2 (block groups, indirect blocks, UTF-8 names, permissions as
+      the read-only attribute, symbolic links read as their target).
+- [ ] ext2: block sizes over 4 KB; files over 4 GB (large_file sizes are
+      read, writes stop at 4 GB); hard links and symbolic links can't be
+      made; owners and permissions beyond the write bit; extended
+      attributes are kept but not shown; times as UTC with a time zone;
+      lost+found isn't used (e2fsck's job).
+- [ ] ext3: journal replay so a volume that wasn't unmounted can be read
+      (now: mounted read-only as it is), then journalled writes.
+- [ ] ext4: extents, 64-bit block numbers, flex_bg, htree directories,
+      CRC32C metadata checksums -- read-only first (now: not mounted).
 - [ ] btrfs, read-only (CoW B-trees, chunk tree, checksums, zlib/LZO/zstd).
 - [ ] 64-bit offsets everywhere without libgcc's division; caches that fit
       in 16 MB.

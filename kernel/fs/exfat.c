@@ -396,81 +396,6 @@ static uint16_t name_hash(const struct xvol *v, const char *name)
     return h;
 }
 
-/* DOS's name for an entry: the name in upper case if it is 8.3, else
- * "XXhhhh~1.EXT" from the name hash. */
-static void make_alias(const char *name, uint16_t hash, uint8_t fcb[11], char *alias)
-{
-    memset(fcb, ' ', 11);
-    const char *dot = NULL;
-    int dots = 0;
-    for (const char *p = name; *p; p++)
-        if (*p == '.') {
-            dot = p;
-            dots++;
-        }
-    bool fits = name[0] != '.' && dots <= 1;
-    int n = 0;
-    uint8_t basis[8];
-    int bn = 0;
-    for (const char *p = name; *p && (!dot || p < dot); p++) {
-        uint8_t c = (uint8_t)fs_up(*p);
-        if (c == ' ' || !fs_short_char(c)) {
-            fits = false;
-            if (c == ' ' || c == '.')
-                continue;
-            c = '_';
-        }
-        if (n < 8)
-            fcb[n++] = c;
-        else
-            fits = false;
-        if (bn < 8)
-            basis[bn++] = c;
-    }
-    if (!n)
-        fits = false;
-    if (dot) {
-        int m = 0;
-        for (const char *p = dot + 1; *p; p++) {
-            uint8_t c = (uint8_t)fs_up(*p);
-            if (c == ' ' || !fs_short_char(c)) {
-                fits = false;
-                if (c == ' ')
-                    continue;
-                c = '_';
-            }
-            if (m < 3)
-                fcb[8 + m++] = c;
-            else
-                fits = false;
-        }
-    }
-    if (!fits) {
-        static const char hex[] = "0123456789ABCDEF";
-        memset(fcb, ' ', 8);
-        int k = 0;
-        for (int i = 0; i < bn && k < 2; i++)
-            fcb[k++] = basis[i];
-        for (int s = 12; s >= 0; s -= 4)
-            fcb[k++] = (uint8_t)hex[(hash >> s) & 15];
-        fcb[k++] = '~';
-        fcb[k++] = '1';
-    }
-    if (fcb[0] == 0xE5)
-        fcb[0] = 0x05;
-    int a = 0;
-    for (int i = 0; i < 8 && fcb[i] != ' '; i++)
-        alias[a++] = (char)(i == 0 && fcb[0] == 0x05 ? 0xE5 : fcb[i]);
-    if (fcb[8] != ' ') {
-        alias[a++] = '.';
-        for (int i = 8; i < 11 && fcb[i] != ' '; i++)
-            alias[a++] = (char)fcb[i];
-    }
-    alias[a] = '\0';
-    if (fcb[0] == 0x05)
-        fcb[0] = 0xE5;
-}
-
 /* Decode a set already read into e->raw. false: not a sound file set. */
 static bool decode(struct xent *e)
 {
@@ -496,7 +421,7 @@ static bool decode(struct xent *e)
     e->name[n] = '\0';
     if (!n)
         return false;
-    make_alias(e->name, le16(s + 4), e->fcb, e->alias);
+    fs_make_alias(e->name, le16(s + 4), e->fcb, e->alias);
     return true;
 }
 
@@ -1496,7 +1421,7 @@ static int ex_rename(struct vol *vv, const char *from, const char *to)
     char alias[13];
     char clean[FS_NAME_MAX + 1];
     fs_clean_name(tname, clean);
-    make_alias(clean, le16(raw + 32 + 4), fcb, alias);
+    fs_make_alias(clean, le16(raw + 32 + 4), fcb, alias);
     for (int i = 0; i < NODE_MAX; i++) {
         struct xnode *n = &nodes[i];
         if (n->refs && n->v == v && n->parent.first == fdir.d.first && n->idx == fe.idx) {

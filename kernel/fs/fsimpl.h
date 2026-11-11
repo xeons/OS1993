@@ -65,5 +65,12 @@ bool fs_wild(const char *pattern, const char *name);     /* * and ?, any case */
 bool fs_fcb_match(const uint8_t *tmpl, const uint8_t *name);
 int  fs_clean_name(const char *in, char *out);  /* -> length, or -ERROR_* */
 bool fs_short_char(uint8_t c);
+/* DOS's name for a long one: the name in upper case if it fits 8.3, else
+ * "XXhhhh~1.EXT" from hash (fcb as in a directory entry, alias "NAME.EXT"). */
+void fs_make_alias(const char *name, uint16_t hash, uint8_t fcb[11], char *alias);
+uint16_t fs_hash16(const char *name);
+void fs_unix_to_dos(uint32_t t, uint16_t *date, uint16_t *time);
+uint32_t fs_dos_to_unix(uint16_t date, uint16_t time);
+struct vol *ext2_mount(struct partition *p);
 
 #endif

@@ -43,6 +43,11 @@ copy f:\big.bin f:\bigdos.bin > nul
 md f:\dosx
 echo exfat from DOS> f:\dosx\dos.txt
 dir f:\ >> e:\dosout.txt
+type g:\readme.txt >> e:\dosout.txt
+copy g:\big.bin g:\bigdos.bin > nul
+md g:\dosx
+echo ext2 from DOS> g:\dosx\dos.txt
+dir g:\ >> e:\dosout.txt
 echo batch done>> e:\dosout.txt
 exit
 """
@@ -85,7 +90,7 @@ def main():
         if not m.wait_log("PS/2 mouse"):
             raise SystemExit("  FAIL  VMM did not boot")
         log = m.log()
-        check("ATA: disk 2 (secondary master): QEMU HARDDISK, 96 MB, BIOS 81h, the VMM's" in log
+        check("ATA: disk 2 (secondary master): QEMU HARDDISK, 128 MB, BIOS 81h, the VMM's" in log
               and "BIOS 80h, left to DOS" in log, "IDE: the boot disk stays DOS's, the second channel is the VMM's")
         check("FAT32 on disk 2 at 2048: 96760 clusters of 512 bytes, serial 3232-3232" in log
               and "FAT16 on disk 2 at 100352: 7655 clusters of 2048 bytes" in log, "FAT32 and FAT16 mounted")
@@ -93,6 +98,8 @@ def main():
               "DOS's D: and E: go through the redirector now")
         check("exFAT on disk 2 at 131072: 7" in log and "REDIR: F: for the VMM's exFAT volume" in log,
               "exFAT mounted, F: for DOS")
+        check("ext2 on disk 2 at 196608: 32768 blocks of 1024 bytes" in log and "REDIR: G: for the VMM's ext2 volume" in log,
+              "ext2 mounted, G: for DOS")
 
         m.key("n")
         m.wait_log("Started DOS 1")
@@ -114,7 +121,7 @@ def main():
         for f in re.findall(r"FS: FAIL .*", log):
             print("        " + f)
         line = re.search(r"FS: (\d+) of (\d+) checks passed", log)
-        check(line and line.group(1) == line.group(2) and int(line.group(2)) >= 80,
+        check(line and line.group(1) == line.group(2) and int(line.group(2)) >= 115,
               line.group(0) if line else "FSTEST: no result")
         check(m.shut_down(), "the GUI shuts down")
         m.key("x", 1)
@@ -155,8 +162,27 @@ def main():
         x.f.close()
     except Exception as e:                              # noqa: BLE001
         check(False, f"tools/exfat.py reads the exFAT volume ({e})")
+    check("ext2 here." in out and re.search(r"BIGDOS\s+BIN\s+300[ ,.]?000", out), "DOS reads and writes ext2 through the redirector")
     with open(IMG, "rb") as f:
         disk = f.read()
+    with tempfile.NamedTemporaryFile(suffix=".img") as t:
+        t.write(disk[196608 * 512:(196608 + 65536) * 512])
+        t.flush()
+        r = subprocess.run(["e2fsck", "-fn", t.name], capture_output=True, text=True)
+        for l in r.stdout.splitlines():
+            if not l.startswith(("Pass ", "e2fsck", "DATAE2:")):
+                print("        " + l)
+        check(r.returncode == 0, "e2fsck: the ext2 volume is clean")
+
+        def dbg(cmd):
+            return subprocess.run(["debugfs", "-R", cmd, t.name], capture_output=True).stdout
+
+        check(dbg("cat FROMGUI.TXT") == b"ext2, written by an OS1993 program.\r\n", "debugfs reads G:\\FROMGUI.TXT")
+        ls = dbg("ls -p GUIDIR").decode("latin-1")
+        check(len(re.findall(r"Entry number \d+ of a directory that grows\.txt", ls)) == 40,
+              "... and G:\\GUIDIR's 40 names")
+        check(dbg('cat "A large new file.dat"') == bytes((i * 17 + 3) & 255 for i in range(5000)),
+              "... and the truncated file")
     with tempfile.NamedTemporaryFile(suffix=".img") as t:
         t.write(disk[131072 * 512:(131072 + 65536) * 512])
         t.flush()
