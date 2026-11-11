@@ -6,6 +6,11 @@ EXPORTS
     OutputDebugString
     DebugLog
     GetTickCount
+    GetPrivateProfileString
+    GetPrivateProfileInt
+    GetPrivateProfileSection
+    WritePrivateProfileString
+    Beep
     Sleep
     GetStartupInfo
     StartDosSession
@@ -68,6 +73,9 @@ EXPORTS
     SetFileAttributes
     GetFullPathName
     GetDiskFreeSpace
+    GetLogicalDrives
+    GetDriveType
+    GetVolumeInformation
     CopyFile
     GetFileTime
     SetFileTime

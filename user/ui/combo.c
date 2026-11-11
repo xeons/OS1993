@@ -15,8 +15,16 @@
  * until an item is chosen (click, Enter) or the list is dismissed (Esc, a
  * click outside). Hovering highlights; the keys move the highlight.
  *
- * Item strings live in the owning process's heap: w->ctl is a struct
- * combo. w->value = selection (-1 none), w->pressed = the list is down.
+ * CBS_SIMPLE has no drop-down: the field with a list box always below it
+ * (the window's height takes both). An editable box completes what is
+ * typed from the first item that starts with it (the rest selected, so
+ * typing on replaces it). CBS_OWNERDRAWFIXED items are drawn by the
+ * parent (WM_DRAWITEM). CB_SHOWDROPDOWN returns at once: the list opens
+ * when the message loop next runs.
+ *
+ * Item strings and values live in the owning process's heap: w->ctl is a
+ * struct combo. w->value = selection (-1 none), w->pressed = the list is
+ * down.
  */
 #include "uipriv.h"
 
@@ -24,13 +32,20 @@
 #define ARROW_W  18             /* the drop arrow's part of the box */
 #define ROWS     8              /* the most rows the list shows */
 #define EDIT_ID  1001           /* CBS_DROPDOWN's field (as in Windows) */
+#define LIST_ID  1000           /* CBS_SIMPLE's list */
+#define EDIT_H   24
+#define CBM_DROP (WM_USER + 0x7F00)     /* CB_SHOWDROPDOWN, later */
 
 static const uint16_t g_drop[4] = { 0xFE00, 0x7C00, 0x3800, 0x1000 };
 
 struct combo {
     char      **items;
+    LPARAM     *data;           /* CB_SETITEMDATA */
     int         n, cap;
-    struct wnd *edit;           /* CBS_DROPDOWN */
+    int         typed_len;      /* the field's length before the last change */
+    bool        completing;
+    struct wnd *simple;         /* CBS_SIMPLE's list box */
+    struct wnd *edit;           /* CBS_DROPDOWN, CBS_SIMPLE */
     struct wnd *list;           /* while dropped down */
     int         hot, top;       /* the list's highlight and first row */
     bool        close;          /* CB_SHOWDROPDOWN 0 while dropped */
@@ -38,7 +53,21 @@ struct combo {
 
 static struct combo *data_of(struct wnd *w) { return (struct combo *)w->ctl; }
 
-static bool editable(struct wnd *w) { return (w->style & 3) == CBS_DROPDOWN; }
+static bool editable(struct wnd *w) { return (w->style & 3) == CBS_DROPDOWN || (w->style & 3) == CBS_SIMPLE; }
+static bool is_simple(struct wnd *w) { return (w->style & 3) == CBS_SIMPLE; }
+static bool owner_drawn(struct wnd *w) { return (w->style & CBS_OWNERDRAWFIXED) != 0; }
+static int box_h(struct wnd *w) { return is_simple(w) ? EDIT_H : w->h; }
+
+static void sync_simple(struct wnd *w)             /* CBS_SIMPLE: the list box shows the items */
+{
+    struct combo *c = data_of(w);
+    if (!c || !c->simple)
+        return;
+    SendMessage(c->simple, LB_RESETCONTENT, 0, 0);
+    for (int i = 0; i < c->n; i++)
+        SendMessage(c->simple, LB_ADDSTRING, 0, (LPARAM)c->items[i]);
+    SendMessage(c->simple, LB_SETCURSEL, (WPARAM)w->value, 0);
+}
 
 static void notify(struct wnd *w, int code)
 {
@@ -83,16 +112,30 @@ static int insert(struct wnd *w, int at, const char *s)
         if (!p)
             return CB_ERR;
         c->items = p;
+        LPARAM *d = c->data ? LocalReAlloc(c->data, (uint32_t)cap * sizeof *d, 0)
+                            : LocalAlloc(LMEM_FIXED, (uint32_t)cap * sizeof *d);
+        if (!d)
+            return CB_ERR;
+        c->data = d;
         c->cap = cap;
     }
     char *copy = LocalAlloc(LMEM_FIXED, (uint32_t)strlen(s) + 1);
     if (!copy)
         return CB_ERR;
     memcpy(copy, s, strlen(s) + 1);
-    if (at < 0 || at > c->n)
+    if (at < 0 || at > c->n) {
         at = c->n;
+        if (w->style & CBS_SORT)
+            for (at = 0; at < c->n; at++) {
+                const char *a = c->items[at], *b = s;
+                while (*a && lower(*a) == lower(*b)) a++, b++;
+                if (lower(*a) > lower(*b)) break;
+            }
+    }
     memmove(&c->items[at + 1], &c->items[at], (size_t)(c->n - at) * sizeof *c->items);
+    memmove(&c->data[at + 1], &c->data[at], (size_t)(c->n - at) * sizeof *c->data);
     c->items[at] = copy;
+    c->data[at] = 0;
     c->n++;
     if (w->value >= at)
         w->value++;
@@ -106,9 +149,12 @@ static void show_text(struct wnd *w)               /* the selection, in the box 
     strncpy0(w->text, s, TEXT_MAX);
     if (c->edit) {
         SendMessage(c->edit, WM_SETTEXT, 0, (LPARAM)w->text);
+        c->typed_len = (int)strlen(w->text);
         if (GetFocus() == c->edit)
             SendMessage(c->edit, EM_SETSEL, 0, -1);
     }
+    if (c->simple)
+        SendMessage(c->simple, LB_SETCURSEL, (WPARAM)w->value, 0);
     InvalidateRect(w, NULL);
 }
 
@@ -142,6 +188,7 @@ LRESULT combolist_proc(HWND h, unsigned msg, WPARAM wp, LPARAM lp)
     struct combo *c = data_of(w);
     PAINTSTRUCT ps;
     HDC dc = BeginPaint(h, &ps);
+        SelectFont(dc, FONT_GUI);
     bool bar = c->n > ROWS;
     int iw = l->w - 2 - (bar ? SCROLL_W : 0);
     RECT o = { 0, 0, l->w, l->h }, in = { 1, 1, 1 + iw, l->h - 1 };
@@ -150,10 +197,15 @@ LRESULT combolist_proc(HWND h, unsigned msg, WPARAM wp, LPARAM lp)
     for (int i = 0; i < ROWS && c->top + i < c->n; i++) {
         int item = c->top + i, y = 2 + i * ITEM_H;
         bool hot = item == c->hot;
-        if (hot) {
-            RECT r = { 1, y, 1 + iw, y + ITEM_H };
-            FillRect(dc, &r, C_ACCENT);
+        RECT r = { 1, y, 1 + iw, y + ITEM_H };
+        if (owner_drawn(w)) {
+            owner_draw(w, dc, ODT_COMBOBOX, (unsigned)item, ODA_DRAWENTIRE, hot ? ODS_SELECTED : 0, r,
+                       c->data[item]);
+            SelectFont(dc, FONT_GUI);
+            continue;
         }
+        if (hot)
+            FillRect(dc, &r, C_ACCENT);
         TextOut(dc, 6, y, c->items[item], hot ? C_WHITE : C_BLACK, -1);
     }
     if (bar) {
@@ -322,6 +374,9 @@ static void drop(struct wnd *w)
         return;
     w->pressed = false;
     InvalidateRect(w, NULL);
+    notify(w, chosen >= 0 ? CBN_SELENDOK : CBN_SELENDCANCEL);
+    if (!wnd_from(w))
+        return;
     notify(w, CBN_CLOSEUP);
     if (chosen >= 0 && wnd_from(w)) {
         if (chosen == w->value && c->edit && strcmp(c->edit->text, c->items[chosen]))
@@ -342,6 +397,8 @@ static void paint(HDC dc, struct wnd *w)
     struct combo *c = data_of(w);
     bool dis = !w->enabled, down = w->pressed;
     int x = RING, y = RING, bw = w->w - 2 * RING, bh = w->h - 2 * RING;
+    if (c->simple)
+        return;                                     /* the field and the list are children */
     if (c->edit) {                                  /* just the arrow button */
         int ax = w->w - ARROW_W;
         RECT o = { ax, y, ax + ARROW_W - RING, y + bh }, in = { ax + 1, y + 1, ax + ARROW_W - RING - 1, y + bh - 1 };
@@ -373,9 +430,15 @@ static void paint(HDC dc, struct wnd *w)
     DrawLine(dc, ax, y + 3, bh - 6, true, C_GRAY4);
     DrawLine(dc, ax + 1, y + 3, bh - 6, true, C_WHITE);
     paint_arrow(dc, ax, y, bh, dis);
+    if (owner_drawn(w) && w->value >= 0) {
+        RECT r = { x + 3, y + 2, ax - 1, y + bh - 2 };
+        owner_draw(w, dc, ODT_COMBOBOX, (unsigned)w->value, ODA_DRAWENTIRE,
+                   ODS_COMBOBOXEDIT | (dis ? ODS_DISABLED : 0) | (ui_has_focus(w) ? ODS_FOCUS : 0), r,
+                   c->data[w->value]);
+        return;
+    }
     char buf[TEXT_MAX];
-    int room = clampi((ax - x - 8) / 8, 0, TEXT_MAX - 1);     /* what fits before the arrow */
-    strncpy0(buf, w->text, (size_t)room + 1);
+    fit_text(w->text, ax - x - 8, buf, sizeof buf);          /* what fits before the arrow */
     TextOut(dc, x + 6, y + (bh - 16) / 2, buf, dis ? C_GRAY3 : down ? C_WHITE : C_BLACK, -1);
 }
 
@@ -401,28 +464,37 @@ LRESULT combo_proc(HWND h, unsigned msg, WPARAM wp, LPARAM lp)
         if (!(w->ctl = c = LocalAlloc(LMEM_ZEROINIT, sizeof *c)))
             return -1;
         if (editable(w)) {
+            int ew = is_simple(w) ? w->w : w->w - ARROW_W;
             c->edit = wnd_from(CreateWindow(WC_EDIT, w->text, WS_CHILD | WS_VISIBLE | (w->style & WS_DISABLED),
-                                            0, 0, w->w - ARROW_W, w->h, h, EDIT_ID, NULL));
+                                            0, 0, ew, box_h(w), h, EDIT_ID, NULL));
             if (c->edit)
                 SetWindowLong(c->edit, GWL_WNDPROC, (int32_t)(uintptr_t)edit_sub);
         }
+        if (is_simple(w))
+            c->simple = wnd_from(CreateWindow(WC_LISTBOX, "", WS_CHILD | WS_VISIBLE | LBS_NOTIFY |
+                                              (w->style & WS_DISABLED), 0, EDIT_H, w->w, w->h - EDIT_H,
+                                              h, LIST_ID, NULL));
         return 0;
     case WM_DESTROY:
         if (c) {
             for (int i = 0; i < c->n; i++)
                 LocalFree(c->items[i]);
             LocalFree(c->items);
+            LocalFree(c->data);
             LocalFree(c);
             w->ctl = NULL;
         }
         return 0;
     case WM_SIZE:
         if (c && c->edit)
-            MoveWindow(c->edit, 0, 0, w->w - ARROW_W, w->h, true);
+            MoveWindow(c->edit, 0, 0, is_simple(w) ? w->w : w->w - ARROW_W, box_h(w), true);
+        if (c && c->simple)
+            MoveWindow(c->simple, 0, EDIT_H, w->w, w->h - EDIT_H, true);
         return 0;
     case WM_PAINT: {
         PAINTSTRUCT ps;
         HDC dc = BeginPaint(h, &ps);
+        SelectFont(dc, FONT_GUI);
         paint(dc, w);
         EndPaint(h, &ps);
         return 0;
@@ -448,25 +520,56 @@ LRESULT combo_proc(HWND h, unsigned msg, WPARAM wp, LPARAM lp)
             SendMessage(c->edit, WM_SETTEXT, 0, (LPARAM)w->text);
         InvalidateRect(h, NULL);
         return 1;
-    case WM_COMMAND:                                /* from the field */
-        if ((HWND)lp == c->edit && HIWORD(wp) == EN_CHANGE) {
+    case WM_COMMAND:                                /* from the field, or CBS_SIMPLE's list */
+        if ((HWND)lp == c->edit && HIWORD(wp) == EN_CHANGE && !c->completing) {
+            int len = (int)strlen(c->edit->text);
+            bool grew = len > c->typed_len;
+            c->typed_len = len;
+            if (grew && !(w->style & CBS_NOAUTOCOMPLETE) && len > 0) {   /* complete it */
+                int a, z;
+                SendMessage(c->edit, EM_GETSEL, (WPARAM)&a, (LPARAM)&z);
+                int i = a == len && z == len ? find(c, -1, c->edit->text, false) : CB_ERR;
+                if (i >= 0 && (int)strlen(c->items[i]) > len) {
+                    c->completing = true;
+                    strncpy0(c->edit->text + len, c->items[i] + len, (size_t)(TEXT_MAX - len));
+                    SendMessage(c->edit, EM_SETSEL, (WPARAM)len, -1);
+                    InvalidateRect(c->edit, NULL);
+                    c->completing = false;
+                }
+            }
             strncpy0(w->text, c->edit->text, TEXT_MAX);
+            if (c->simple) {                        /* the list follows the text */
+                int i = find(c, -1, w->text, false);
+                if (i >= 0) SendMessage(c->simple, LB_SETCURSEL, (WPARAM)i, 0);
+            }
             notify(w, CBN_EDITCHANGE);
+        } else if ((HWND)lp == c->simple && HIWORD(wp) == LBN_SELCHANGE) {
+            int i = (int)SendMessage(c->simple, LB_GETCURSEL, 0, 0);
+            if (i >= 0 && i != w->value) {
+                w->value = -1;
+                select(w, i, true);
+            }
+        } else if ((HWND)lp == c->simple && HIWORD(wp) == LBN_DBLCLK) {
+            notify(w, CBN_DBLCLK);
         }
+        return 0;
+    case CBM_DROP:
+        drop(w);
         return 0;
     case WM_LBUTTONDOWN:
         SetFocus(h);
-        drop(w);
+        if (!c->simple)
+            drop(w);
         return 0;
     case WM_SYSKEYDOWN:
         if (wp == VK_UP || wp == VK_DOWN) {         /* Alt+Down */
-            drop(w);
+            if (!c->simple) drop(w);
             return 0;
         }
         break;
     case WM_KEYDOWN:
         switch (wp) {
-        case VK_F4:    drop(w); break;
+        case VK_F4:    if (!c->simple) drop(w); break;
         case VK_UP:
         case VK_LEFT:  select(w, w->value < 0 ? 0 : w->value - 1, true); break;
         case VK_DOWN:
@@ -489,14 +592,37 @@ LRESULT combo_proc(HWND h, unsigned msg, WPARAM wp, LPARAM lp)
         int i = insert(w, msg == CB_ADDSTRING ? -1 : (int)wp, (const char *)lp);
         if (c->list)
             InvalidateRect(c->list, NULL);
+        sync_simple(w);
         return i;
     }
+    case CB_SETITEMDATA:
+        if ((int)wp < 0 || (int)wp >= c->n) return CB_ERR;
+        c->data[wp] = lp;
+        return 0;
+    case CB_GETITEMDATA:
+        if ((int)wp < 0 || (int)wp >= c->n) return CB_ERR;
+        return c->data[wp];
+    case CB_SELECTSTRING: {
+        int i = find(c, (int)wp, (const char *)lp, false);
+        if (i >= 0) select(w, i, false);
+        return i;
+    }
+    case CB_LIMITTEXT:
+        if (c->edit) SendMessage(c->edit, EM_LIMITTEXT, wp, 0);
+        return 1;
+    case CB_GETEDITSEL:
+        if (c->edit) return SendMessage(c->edit, EM_GETSEL, wp, lp);
+        return CB_ERR;
+    case CB_SETEDITSEL:
+        if (c->edit) SendMessage(c->edit, EM_SETSEL, LOWORD(lp), (int16_t)HIWORD(lp));
+        return c->edit ? 1 : CB_ERR;
     case CB_DELETESTRING: {
         int i = (int)wp;
         if (i < 0 || i >= c->n)
             return CB_ERR;
         LocalFree(c->items[i]);
         memmove(&c->items[i], &c->items[i + 1], (size_t)(c->n - i - 1) * sizeof *c->items);
+        memmove(&c->data[i], &c->data[i + 1], (size_t)(c->n - i - 1) * sizeof *c->data);
         c->n--;
         if (w->value == i) {
             w->value = -1;
@@ -505,6 +631,7 @@ LRESULT combo_proc(HWND h, unsigned msg, WPARAM wp, LPARAM lp)
         } else if (w->value > i) {
             w->value--;
         }
+        sync_simple(w);
         return c->n;
     }
     case CB_RESETCONTENT:
@@ -514,6 +641,7 @@ LRESULT combo_proc(HWND h, unsigned msg, WPARAM wp, LPARAM lp)
         w->value = -1;
         if (!c->edit)
             show_text(w);
+        sync_simple(w);
         return 0;
     case CB_GETCOUNT:
         return c->n;
@@ -537,10 +665,10 @@ LRESULT combo_proc(HWND h, unsigned msg, WPARAM wp, LPARAM lp)
     case CB_FINDSTRING:
     case CB_FINDSTRINGEXACT:
         return find(c, (int)wp, (const char *)lp, msg == CB_FINDSTRINGEXACT);
-    case CB_SHOWDROPDOWN:
-        if (wp)
-            drop(w);
-        else if (c->list)
+    case CB_SHOWDROPDOWN:                           /* returns at once; the list opens soon */
+        if (wp && !c->list && !c->simple)
+            PostMessage(h, CBM_DROP, 0, 0);
+        else if (!wp && c->list)
             c->close = true;
         return 1;
     case CB_GETDROPPEDSTATE:

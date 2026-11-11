@@ -10,6 +10,12 @@
  * keys (UDS_ARROWKEYS, by subclassing the buddy). w->ctl holds the buddy
  * and its old window procedure; w->part is the arrow being held (1 the
  * one toward max, 2 the other), w->pressed whether the pointer is on it.
+ *
+ * Each step is first offered to the parent as WM_NOTIFY UDN_DELTAPOS
+ * (NMUPDOWN: nonzero stops it; the parent may change iDelta). Held down,
+ * the steps grow (UDM_SETACCEL: after 2 seconds 5 at a time, after 5
+ * seconds 20). The buddy's number gets thousands separators unless
+ * UDS_NOTHOUSANDS; UDM_SETBASE 16 shows it in hex.
  */
 #include "uipriv.h"
 
@@ -25,7 +31,14 @@ static const uint16_t g_right[7] = { 0x8000, 0xC000, 0xE000, 0xF000, 0xE000, 0xC
 
 enum { PART_NONE, PART_INC, PART_DEC };
 
-struct updown { struct wnd *buddy; WNDPROC buddy_proc; };
+#define ACCEL_MAX 8
+struct updown {
+    struct wnd *buddy;
+    WNDPROC buddy_proc;
+    UDACCEL accel[ACCEL_MAX];
+    int naccel, base;
+    uint32_t held_since;
+};
 
 static struct updown *data_of(struct wnd *w) { return (struct updown *)w->ctl; }
 
@@ -61,12 +74,25 @@ static void show_pos(struct wnd *w)                 /* UDS_SETBUDDYINT: the numb
     struct wnd *b = buddy_of(w);
     if (!b || !(w->style & UDS_SETBUDDYINT))
         return;
-    char buf[12], *p = buf + sizeof buf;
-    int v = w->value;
-    unsigned u = v < 0 ? 0u - (unsigned)v : (unsigned)v;
+    char buf[24], *p = buf + sizeof buf;
+    int v = w->value, digits = 0;
+    struct updown *d = data_of(w);
     *--p = '\0';
-    do *--p = (char)('0' + u % 10); while (u /= 10);
-    if (v < 0) *--p = '-';
+    if (d->base == 16) {
+        unsigned u = (unsigned)v;
+        do { *--p = "0123456789ABCDEF"[u & 15]; } while (u >>= 4);
+        *--p = 'x';
+        *--p = '0';
+    } else {
+        unsigned u = v < 0 ? 0u - (unsigned)v : (unsigned)v;
+        do {
+            if (digits && digits % 3 == 0 && !(w->style & UDS_NOTHOUSANDS))
+                *--p = ',';
+            *--p = (char)('0' + u % 10);
+            digits++;
+        } while (u /= 10);
+        if (v < 0) *--p = '-';
+    }
     SetWindowText(b, p);
 }
 
@@ -79,13 +105,27 @@ static bool read_pos(struct wnd *w, int *out)
     char buf[TEXT_MAX];
     GetWindowText(b, buf, sizeof buf);
     const char *s = buf;
+    if (data_of(w)->base == 16) {
+        if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) s += 2;
+        unsigned v = 0;
+        int n = 0;
+        for (; *s; s++, n++) {
+            int dgt = *s >= '0' && *s <= '9' ? *s - '0' : *s >= 'a' && *s <= 'f' ? *s - 'a' + 10 :
+                      *s >= 'A' && *s <= 'F' ? *s - 'A' + 10 : -1;
+            if (dgt < 0) return false;
+            v = v * 16 + (unsigned)dgt;
+        }
+        if (!n) return false;
+        *out = (int)v;
+        return true;
+    }
     bool neg = *s == '-';
     if (neg) s++;
     if (*s < '0' || *s > '9')
         return false;
     int v = 0;
-    for (; *s >= '0' && *s <= '9'; s++)
-        if (v < 100000) v = v * 10 + (*s - '0');
+    for (; (*s >= '0' && *s <= '9') || *s == ','; s++)
+        if (*s != ',' && v < 100000000) v = v * 10 + (*s - '0');
     if (*s)
         return false;
     *out = neg ? -v : v;
@@ -145,12 +185,29 @@ static void notify(struct wnd *w, int code)
                     MAKEWPARAM(code, w->value), (LPARAM)w);
 }
 
+/* How far a step goes now: the acceleration for how long it's been held. */
+static int increment(struct wnd *w)
+{
+    struct updown *d = data_of(w);
+    int inc = 1;
+    uint32_t held = w->tracking ? (GetTickCount() - d->held_since) / 1000 : 0;
+    for (int i = 0; i < d->naccel; i++)
+        if (held >= d->accel[i].nSec)
+            inc = (int)d->accel[i].nInc;
+    return inc > 0 ? inc : 1;
+}
+
 static void step(struct wnd *w, int part)
 {
     int v = w->value;
     read_pos(w, &v);
     int dir = (part == PART_INC) == (w->max >= w->min) ? 1 : -1;
-    int n = v + dir;
+    NMUPDOWN nm = { { 0 }, v, dir * increment(w) };
+    if (w->parent && wnd_mine(w->parent) && ui_notify(w, &nm.hdr, UDN_DELTAPOS))
+        return;                                     /* the parent said no */
+    if (!wnd_from(w))
+        return;
+    int n = v + nm.iDelta;
     if (n > hi(w)) n = (w->style & UDS_WRAP) ? lo(w) : hi(w);
     if (n < lo(w)) n = (w->style & UDS_WRAP) ? hi(w) : lo(w);
     w->value = n;
@@ -184,10 +241,16 @@ LRESULT updown_proc(HWND h, unsigned msg, WPARAM wp, LPARAM lp)
     if (!data_of(w) && msg != WM_CREATE)
         return DefWindowProc(h, msg, wp, lp);
     switch (msg) {
-    case WM_CREATE:
+    case WM_CREATE: {
         w->max = 100;
-        if (!(w->ctl = LocalAlloc(LMEM_ZEROINIT, sizeof(struct updown))))
+        struct updown *d = LocalAlloc(LMEM_ZEROINIT, sizeof(struct updown));
+        if (!(w->ctl = d))
             return -1;
+        d->accel[0] = (UDACCEL){ 0, 1 };
+        d->accel[1] = (UDACCEL){ 2, 5 };
+        d->accel[2] = (UDACCEL){ 5, 20 };
+        d->naccel = 3;
+        d->base = 10;
         if ((w->style & UDS_AUTOBUDDY) && w->parent) {      /* the sibling before it */
             struct wnd *prev = NULL;
             for (struct wnd *c = w->parent->first; c && c != w; c = c->next)
@@ -195,6 +258,7 @@ LRESULT updown_proc(HWND h, unsigned msg, WPARAM wp, LPARAM lp)
             set_buddy(w, prev);
         }
         return 0;
+    }
     case WM_DESTROY:
         KillTimer(h, TIMER_ID);
         unhook(w);
@@ -220,6 +284,7 @@ LRESULT updown_proc(HWND h, unsigned msg, WPARAM wp, LPARAM lp)
             SetFocus(buddy_of(w));
         SetCapture(h);
         w->tracking = w->pressed = true;
+        data_of(w)->held_since = GetTickCount();
         InvalidateRect(h, NULL);
         step(w, w->part);
         SetTimer(h, TIMER_ID, FIRST_DELAY);
@@ -284,6 +349,53 @@ LRESULT updown_proc(HWND h, unsigned msg, WPARAM wp, LPARAM lp)
     }
     case UDM_GETBUDDY:
         return (LRESULT)(uintptr_t)buddy_of(w);
+    case UDM_SETACCEL: {
+        struct updown *d = data_of(w);
+        const UDACCEL *a = (const UDACCEL *)lp;
+        if (!a || !wp) return 0;
+        d->naccel = (int)wp < ACCEL_MAX ? (int)wp : ACCEL_MAX;
+        memcpy(d->accel, a, (size_t)d->naccel * sizeof *a);
+        return 1;
+    }
+    case UDM_GETACCEL: {
+        struct updown *d = data_of(w);
+        int n = (int)wp < d->naccel ? (int)wp : d->naccel;
+        if (lp) memcpy((void *)lp, d->accel, (size_t)n * sizeof(UDACCEL));
+        return d->naccel;
+    }
+    case UDM_SETBASE: {
+        struct updown *d = data_of(w);
+        int old = d->base;
+        if (wp != 10 && wp != 16) return 0;
+        d->base = (int)wp;
+        show_pos(w);
+        return old;
+    }
+    case UDM_GETBASE:
+        return data_of(w)->base;
+    case UDM_SETRANGE32:
+        w->min = (int)wp;
+        w->max = (int)lp;
+        w->value = clampi(w->value, lo(w), hi(w));
+        show_pos(w);
+        return 0;
+    case UDM_GETRANGE32:
+        if (wp) *(int *)wp = w->min;
+        if (lp) *(int *)lp = w->max;
+        return 0;
+    case UDM_SETPOS32: {
+        int old = w->value;
+        w->value = clampi((int)lp, lo(w), hi(w));
+        show_pos(w);
+        return old;
+    }
+    case UDM_GETPOS32: {
+        int v = w->value;
+        bool bad = buddy_of(w) && (w->style & UDS_SETBUDDYINT) && !read_pos(w, &v);
+        if (!bad) w->value = clampi(v, lo(w), hi(w));
+        if (lp) *(int *)lp = bad;
+        return w->value;
+    }
     }
     return DefWindowProc(h, msg, wp, lp);
 }

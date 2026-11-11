@@ -22,11 +22,35 @@ void cache_tick(void);                  /* cache.c */
 #define TICKS_PER_DAY 0x1800B0
 
 static volatile uint32_t ticks;
+static volatile uint32_t beep_off;      /* the tick the speaker goes quiet (0: it is) */
+
+/* The PC speaker: PIT channel 2 at hz, gated on through port 61h, off
+ * again from the tick handler after ms. */
+void speaker_beep(unsigned hz, unsigned ms)
+{
+    if (hz < 20 || hz > 20000 || !ms) {
+        outb(0x61, inb(0x61) & ~3);
+        beep_off = 0;
+        return;
+    }
+    unsigned div = 1193182u / hz;
+    outb(0x43, 0xB6);
+    outb(0x42, (uint8_t)div);
+    outb(0x42, (uint8_t)(div >> 8));
+    outb(0x61, inb(0x61) | 3);
+    uint32_t n = ms * TIMER_HZ_X10 / 10000;
+    beep_off = ticks + (n ? n : 1) + 1;
+    if (!beep_off) beep_off = 1;
+}
 
 static void timer_irq(struct regs *r)
 {
     (void)r;
     ticks++;
+    if (beep_off && (int32_t)(ticks - beep_off) >= 0) {
+        outb(0x61, inb(0x61) & ~3);
+        beep_off = 0;
+    }
     sched_tick();
     user_tick();
     net_tick();

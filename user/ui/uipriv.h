@@ -33,21 +33,27 @@
 #define MENUBAR_H   20
 
 #define WND_MAX     128
-#define CLASS_MAX   32
+#define CLASS_MAX   64
 #define PROP_MAX    4
 #define EXTRA_MAX   32
 #define TEXT_MAX    64
 #define QMAX        64          /* posted messages per process */
 #define SEND_MAX    8           /* cross-process SendMessage in flight */
 #define TIMER_MAX   32
-#define MENU_MAX    48
-#define MITEM_MAX   16
+#define MENU_MAX    64
+#define MITEM_MAX   32
 #define MITEM_TEXT  32
 #define MENU_DEPTH  4
 #define COPYDATA_MAX 1024
 #define CLIP_MAX    16384
+#define CLIPBMP_MAX (640 * 480 / 2)    /* a 16-colour picture on the clipboard */
 
 enum wstate { WS_STATE_NORMAL, WS_STATE_MIN, WS_STATE_MAX };
+
+/* What needs painting: a few rectangles (screen coordinates). Far-apart
+ * changes stay apart; near ones, and the overflow, merge. */
+#define DIRTY_MAX 6
+struct dirty { int n; RECT r[DIRTY_MAX]; };
 
 struct wclass {
     char     name[24];
@@ -59,6 +65,8 @@ struct wclass {
     bool     transparent;       /* mouse goes through (STATIC, group boxes) */
     bool     noactivate;        /* top level that never activates (menus) */
     int      icon;
+    HCURSOR  cursor;
+    unsigned exstyle;           /* given to every window of the class */
 };
 
 struct wnd {
@@ -76,6 +84,9 @@ struct wnd {
     int            min_slot;
     char           text[TEXT_MAX];
     int32_t        userdata;
+    HCURSOR        cursor;                   /* its own shape (0: the class's) */
+    uint8_t        anchor;                   /* ANCHOR_*: follows the parent's edges */
+    int            cw0, ch0;                 /* the client size its children were placed for */
     uint8_t        extra[EXTRA_MAX];
     struct { char name[16]; void *value; } props[PROP_MAX];
     struct wnd    *focus_child;              /* top level: focus to restore */
@@ -84,7 +95,7 @@ struct wnd {
     bool           visible, enabled;
     bool           has_upd;                  /* top level: needs painting */
     void          *ctl;                      /* a control's data (its process's memory) */
-    RECT           upd;                      /* ... this (screen coordinates) */
+    struct dirty   upd;                      /* ... this */
 
     /* State for the built-in control classes */
     int            value, min, max, page, top, caret;
@@ -100,6 +111,10 @@ struct mitem {
     unsigned     id;
     struct menu *sub;
     char         text[MITEM_TEXT];
+    LPARAM       data;                       /* MF_OWNERDRAW: for WM_DRAWITEM */
+    const uint8_t *image;                    /* an icon beside it, or MF_BITMAP's picture */
+    int16_t      img_w, img_h;               /* (the menu's process's memory) */
+    int16_t      ow, oh;                     /* MF_OWNERDRAW: its measured size */
 };
 
 struct menu {
@@ -109,6 +124,8 @@ struct menu {
     bool         system;
     int          n;
     struct mitem items[MITEM_MAX];
+    char         banner[24];                 /* written up the left side (the Start menu) */
+    uint8_t      banner_bg;
 };
 
 struct menu_level {
@@ -136,6 +153,7 @@ struct pqueue {
     unsigned head, tail;
     bool     quit;
     int      quit_code;
+    uint32_t last_read;         /* GetTickCount when it last looked at its queue */
 };
 
 /* A SendMessage to another process's window, waiting for its reply */
@@ -154,10 +172,18 @@ struct sent {
 struct timer { struct wnd *w; int id; uint32_t interval, due; };
 
 /* Mouse and keyboard state, and the cursor */
+#define CUR_W 16                /* the largest cursor shape */
+#define CUR_H 19
+enum { CURSOR_ARROW, CURSOR_IBEAM, CURSOR_WAIT, CURSOR_CROSS, CURSOR_SIZENWSE, CURSOR_SIZENESW,
+       CURSOR_SIZEWE, CURSOR_SIZENS, CURSOR_SIZEALL, CURSOR_NO, CURSOR_COUNT };
+
 struct ui_input {
     bool        shift, ctrl, alt, alt_alone;
     int         cur_x, cur_y;
     bool        cur_on;
+    int         cur_shape, cur_shown;            /* CURSOR_*: wanted, and on the screen */
+    uint32_t    cur_key;                         /* the window and part it was set for */
+    uint8_t     cur_save[CUR_W * CUR_H * 4];   /* linear modes: what the cursor covers */
     uint8_t     last_buttons;
     uint32_t    last_click;
     struct wnd *last_click_wnd;
@@ -188,13 +214,17 @@ struct ui_shared {
     struct wnd    *frame_pressed_wnd;
     bool           background;               /* a DOS session has the screen */
     bool           desk_dirty;               /* uncovered desktop to paint */
-    RECT           desk;
+    struct dirty   desk;
     uint32_t       exits_seen;               /* GetProcessExitCount at last cleanup */
     struct wnd    *shell_hook;               /* RegisterShellHookWindow */
     struct wnd    *desktop;                  /* SetShellWindow: kept at the bottom */
     RECT           work;                     /* SPI_SETWORKAREA */
-    int            clip_len;                 /* the clipboard */
+    int            clip_len;                 /* the clipboard: text ... */
     char           clip[CLIP_MAX];
+    int            clipbmp_w, clipbmp_h;     /* ... or a picture, 2 pixels a byte (0: none) */
+    bool           clip_files, clip_cut;     /* clip holds file paths (cut: to be moved) */
+    int            clip_n;                   /* ... that many bytes */
+    uint8_t        clipbmp[CLIPBMP_MAX];
     int            scr_w, scr_h, bpp;        /* the display mode */
     uint32_t       mode_gen;                 /* ... changes counted (GetDisplayInfo gen) */
 };
@@ -218,6 +248,7 @@ void        wnd_screen_rect(struct wnd *w, RECT *r);         /* outer, screen */
 void        wnd_client_screen(struct wnd *w, int *x, int *y); /* client origin */
 struct wnd *wnd_child_at(struct wnd *w, int x, int y);      /* x,y in w's client */
 void        wnd_raise(struct wnd *top);
+void        wnd_lower(struct wnd *top);      /* Alt+Esc */
 void        wnd_activate(struct wnd *top);
 void        wnd_activate_next(struct wnd *gone);   /* after gone hides or goes */
 struct wnd *wnd_active(void);
@@ -230,10 +261,12 @@ void        ui_shell_notify(int code, struct wnd *w);   /* shell hook messages *
 void        ui_cleanup_dead(void);           /* windows of processes that ended */
 void        ui_forget_window(struct wnd *w); /* remove without messages */
 void        ui_reserve_input(int pid);       /* raw input for one process */
+void        ui_reflow(struct wnd *p);        /* anchored children follow a new client size */
 
 /* frame.c -- the non-client area of top-level windows */
-enum { HT_NOWHERE, HT_CLIENT, HT_CAPTION, HT_SYSMENU, HT_MINBUTTON, HT_MAXBUTTON,
-       HT_CLOSE, HT_TILE, HT_BORDER, HT_MENU };
+enum { HT_NOWHERE = HTNOWHERE, HT_CLIENT = HTCLIENT, HT_CAPTION = HTCAPTION,   /* Windows' numbers */
+       HT_SYSMENU = HTSYSMENU, HT_MENU = HTMENU, HT_MINBUTTON = HTMINBUTTON,
+       HT_MAXBUTTON = HTMAXBUTTON, HT_BORDER = HTBORDER, HT_CLOSE = HTCLOSE, HT_TILE = 30 };
 #define E_L 1
 #define E_R 2
 #define E_T 4
@@ -266,8 +299,12 @@ void  ui_present(int x0, int y0, int x1, int y1);  /* back buffer -> screen */
 void  ui_pump_input(void);                   /* raw events -> messages */
 void  ui_input_reset(void);
 void  ui_cursor(bool on);
+void  ui_cursor_refresh(void);               /* after the screen under it was presented */
 bool  ui_cursor_overlaps(int x0, int y0, int x1, int y1);
 void  ui_outline(bool on);                   /* the XOR drag outline */
+void  ui_set_cursor(int shape);              /* CURSOR_* */
+int   ui_edge_cursor(int edges);             /* E_* -> a resize shape */
+int   ui_cursor_index(HCURSOR h);            /* IDC_* -> CURSOR_*, -1 */
 void  ui_track_frame(struct wnd *w, int part, int x, int y);   /* WM_NCLBUTTONDOWN */
 
 /* drawing helpers for controls (paint.c) */
@@ -275,6 +312,9 @@ struct dc {
     struct wnd *w;
     int ox, oy;                              /* client origin on screen */
     int cx0, cy0, cx1, cy1;                  /* clip, screen coords */
+    uint8_t font;                            /* FONT_* */
+    bool has_fg, has_bg;                     /* SetTextColor / SetBkColor */
+    uint8_t fg, bg;
 };
 void  dc_apply(HDC dc);                      /* set ui_gfx's clip */
 
@@ -292,6 +332,103 @@ LRESULT combo_proc(HWND, unsigned, WPARAM, LPARAM);
 LRESULT combolist_proc(HWND, unsigned, WPARAM, LPARAM);  /* the dropped list */
 LRESULT tab_proc(HWND, unsigned, WPARAM, LPARAM);
 LRESULT updown_proc(HWND, unsigned, WPARAM, LPARAM);
+
+LRESULT treeview_proc(HWND, unsigned, WPARAM, LPARAM);
+LRESULT listview_proc(HWND, unsigned, WPARAM, LPARAM);
+LRESULT statusbar_proc(HWND, unsigned, WPARAM, LPARAM);
+LRESULT toolbar_proc(HWND, unsigned, WPARAM, LPARAM);
+LRESULT tooltip_proc(HWND, unsigned, WPARAM, LPARAM);
+LRESULT dialog_proc(HWND, unsigned, WPARAM, LPARAM);   /* "#32770": DialogBox, CreateDialog */
+
+/* Clip a DC's drawing to r (client coordinates) as well; restore with
+ * dc_unclip(dc, saved). */
+static inline void dc_clip(HDC dc, RECT r, RECT *saved)
+{
+    *saved = (RECT){ dc->cx0, dc->cy0, dc->cx1, dc->cy1 };
+    int x0 = dc->ox + r.left, y0 = dc->oy + r.top, x1 = dc->ox + r.right, y1 = dc->oy + r.bottom;
+    if (x0 > dc->cx0) dc->cx0 = x0;
+    if (y0 > dc->cy0) dc->cy0 = y0;
+    if (x1 < dc->cx1) dc->cx1 = x1;
+    if (y1 < dc->cy1) dc->cy1 = y1;
+    if (dc->cx1 < dc->cx0) dc->cx1 = dc->cx0;
+    if (dc->cy1 < dc->cy0) dc->cy1 = dc->cy0;
+}
+static inline void dc_unclip(HDC dc, const RECT *saved)
+{
+    dc->cx0 = saved->left; dc->cy0 = saved->top; dc->cx1 = saved->right; dc->cy1 = saved->bottom;
+}
+
+/* The window-text font (FONT_GUI): widths, and how many of s's first n
+ * characters fit in px pixels. */
+#define GUI_W(s) TextWidthFont(FONT_GUI, (s), -1)
+static inline int gui_fit(const char *s, int n, int px)
+{
+    int k = 0, w = 0;
+    while (k < n && s[k]) {
+        int cw = TextWidthFont(FONT_GUI, s + k, 1);
+        if (w + cw > px) break;
+        w += cw;
+        k++;
+    }
+    return k;
+}
+
+/* Text cut to fit maxw pixels of the window-text font, "..." at the end if cut. */
+static inline void fit_text(const char *s, int maxw, char *out, int size)
+{
+    int n = (int)strlen(s);
+    if (GUI_W(s) <= maxw) {
+        strncpy0(out, s, (size_t)size);
+        return;
+    }
+    int room = gui_fit(s, n, maxw - TextWidthFont(FONT_GUI, "...", 3));
+    if (room > size - 4)
+        room = size - 4;
+    if (room <= 0) {
+        out[0] = '\0';
+        return;
+    }
+    memcpy(out, s, (size_t)room);
+    memcpy(out + room, "...", 4);
+}
+
+/* WM_CTLCOLOR*: the parent (in this process) may change a control's
+ * text colour (SetTextColor on the DC) and background (returning
+ * CTLCOLOR_BG). fg and bg come in as the usual ones. */
+static inline void ctl_color(struct wnd *w, HDC dc, unsigned msg, uint8_t *fg, uint8_t *bg)
+{
+    if (!w->parent || !wnd_mine(w->parent))
+        return;
+    bool had = dc->has_fg;
+    uint8_t old = dc->fg;
+    dc->has_fg = false;
+    LRESULT r = SendMessage(w->parent, msg, (WPARAM)dc, (LPARAM)w);
+    if (r & 0x100) *bg = (uint8_t)r;
+    if (dc->has_fg) *fg = dc->fg;
+    dc->has_fg = had;
+    dc->fg = old;
+}
+
+/* An owner-drawn item: WM_DRAWITEM to the parent (in this process);
+ * false if there is nobody to draw it. */
+static inline bool owner_draw(struct wnd *w, HDC dc, unsigned type, unsigned item, unsigned action,
+                              unsigned state, RECT r, LPARAM data)
+{
+    if (!w->parent || !wnd_mine(w->parent))
+        return false;
+    DRAWITEMSTRUCT d = { type, (unsigned)w->id, item, action, state, w, dc, r, data };
+    SendMessage(w->parent, WM_DRAWITEM, (WPARAM)w->id, (LPARAM)&d);
+    return true;
+}
+
+/* A notification to the parent (WM_NOTIFY). */
+static inline LRESULT ui_notify(struct wnd *w, NMHDR *nm, int code)
+{
+    nm->hwndFrom = w;
+    nm->idFrom = (unsigned)w->id;
+    nm->code = code;
+    return w->parent ? SendMessage(w->parent, WM_NOTIFY, (WPARAM)w->id, (LPARAM)nm) : 0;
+}
 
 /* scroll bar geometry, shared with list boxes (scroll.c) */
 struct sbar { bool vert; int x, y, w, h; int value, min, max, page; };
@@ -322,6 +459,7 @@ void  menu_track_bar(struct wnd *w, int x, int y);   /* click on the bar */
 void  menu_track_sys(struct wnd *w);                 /* click on the system box */
 void  menu_keymenu(struct wnd *w, int ch);           /* SC_KEYMENU */
 void  menu_window_gone(struct wnd *w);
+int   menu_bar_rows(struct menu *m, int outer_w);    /* a wrapping menu bar's rows */
 void  menu_process_gone(int pid);
 
 /* kbd.c */

@@ -62,6 +62,10 @@ void gfx_hline(struct gfx *g, int x, int y, int w, uint8_t color);
 void gfx_vline(struct gfx *g, int x, int y, int h, uint8_t color);
 void gfx_rect(struct gfx *g, int x, int y, int w, int h, uint8_t color);
 void gfx_text(struct gfx *g, int x, int y, const char *s, uint8_t fg, uint8_t bg);
+#define GFX_FONT_FIXED 0                /* the 8x16 font */
+#define GFX_FONT_PROP  1                /* ... its glyphs trimmed: proportional */
+int  gfx_text_font(struct gfx *g, int font, int x, int y, const char *s, int n, uint8_t fg, uint8_t bg);
+int  gfx_text_width(const struct gfx *g, int font, const char *s, int n);
 
 /* 1-bit images, rows of up to 16 pixels, MSB = leftmost */
 void gfx_bitmap(struct gfx *g, int x, int y, const uint16_t *rows, int h, uint8_t color);
@@ -70,5 +74,13 @@ void gfx_blit8(struct gfx *g, int x, int y, int w, int h, const uint8_t *pixels,
 void gfx_xor_bitmap(struct gfx *g, int x, int y, const uint16_t *rows, int h);
 void gfx_xor_fill(struct gfx *g, int x, int y, int w, int h);
 void gfx_xor_frame(struct gfx *g, int x, int y, int w, int h, int thick);
+
+/* A sprite over a linear screen (the mouse cursor): what it covers is
+ * copied to save (w * h pixels) from src -- the screen, or a back buffer
+ * holding what the screen should show -- and put back from it. art rows:
+ * 'k' black, 'w' white, anything else transparent. Clipped to the screen. */
+void gfx_sprite_save(const struct gfx *src, int x, int y, int w, int h, uint8_t *save);
+void gfx_sprite_restore(struct gfx *g, int x, int y, int w, int h, const uint8_t *save);
+void gfx_sprite_draw(struct gfx *g, int x, int y, const char *const *art, int w, int h);
 
 #endif

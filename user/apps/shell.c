@@ -8,9 +8,20 @@
  *                 per program window (click to switch, again to minimize),
  *                 and the notification area: tray icons and a clock
  * Programs run as processes of their own, started with ShellExecute.
+ *
+ * The Programs menu is read from PROGRAMS.INI ("&Name=FILE.BIN,icon"; the
+ * shell writes the standard list there if there is none), the Start menu
+ * has large icons and a banner. Desktop icons can be dragged about (their
+ * places kept in OS1993.INI, with the background pattern). A taskbar
+ * button's right button gives its window's system menu; tray icons have
+ * tooltips. Close Program marks programs that have stopped reading their
+ * messages "Not responding", and asks a program to close (WM_CLOSE) before
+ * ending it.
  */
 #include "os1993.h"
 #include "shellpriv.h"
+#include <stdio.h>
+#include <string.h>
 
 #define BAR_H       28
 #define START_W     64
@@ -27,15 +38,71 @@ static HWND desktop, taskbar;
 
 struct program { const char *name, *file; int icon; };
 
-static const struct program programs[] = {
+static const struct program std_programs[] = {
     { "&Calculator",    "CALC.BIN",    ICON_CALC },
     { "&Paint",         "PAINT.BIN",   ICON_PAINT },
     { "C&lock",         "CLOCK.BIN",   ICON_CLOCK },
     { "&Notepad",       "NOTEPAD.BIN", ICON_NOTEPAD },
+    { "E&xplorer",      "EXPLORER.BIN", ICON_EXPLORER },
     { "Control &Demo",  "DEMO.BIN",    ICON_DEMO },
     { "&MS-DOS Prompt", "COMMAND.COM", ICON_DOS },
 };
-#define NPROGRAMS (int)(sizeof programs / sizeof programs[0])
+#define NSTD (int)(sizeof std_programs / sizeof std_programs[0])
+#define PROG_MAX 24
+#define PROGRAMS_INI "PROGRAMS.INI"
+#define SHELL_INI "OS1993.INI"
+
+struct entry { char name[32], file[64]; int icon; };
+static struct entry programs[PROG_MAX];
+static int nprograms;
+
+static const char *const icon_names[ICON_COUNT] = {
+    [ICON_APP] = "app", [ICON_CALC] = "calc", [ICON_PAINT] = "paint", [ICON_CLOCK] = "clock",
+    [ICON_DEMO] = "demo", [ICON_DOS] = "dos", [ICON_COMPUTER] = "computer", [ICON_INFO] = "info",
+    [ICON_NOTEPAD] = "notepad", [ICON_FOLDER] = "folder", [ICON_DOCUMENT] = "document",
+    [ICON_TEXT] = "text", [ICON_EXPLORER] = "explorer",
+};
+
+/* PROGRAMS.INI's [Programs]: "&Name=FILE[,icon]" lines, in menu order. */
+static void load_programs(void)
+{
+    char buf[2048];
+    if (!GetPrivateProfileSection("Programs", buf, sizeof buf, PROGRAMS_INI)) {
+        for (int i = 0; i < NSTD; i++) {            /* none yet: the standard list */
+            char v[96];
+            snprintf(v, sizeof v, "%s,%s", std_programs[i].file, icon_names[std_programs[i].icon]);
+            WritePrivateProfileString("Programs", std_programs[i].name, v, PROGRAMS_INI);
+        }
+        if (!GetPrivateProfileSection("Programs", buf, sizeof buf, PROGRAMS_INI)) {
+            nprograms = 0;                          /* (a read-only disk) */
+            for (int i = 0; i < NSTD && i < PROG_MAX; i++, nprograms++) {
+                strncpy0(programs[i].name, std_programs[i].name, sizeof programs[i].name);
+                strncpy0(programs[i].file, std_programs[i].file, sizeof programs[i].file);
+                programs[i].icon = std_programs[i].icon;
+            }
+            return;
+        }
+    }
+    nprograms = 0;
+    for (char *p = buf; *p && nprograms < PROG_MAX; p += strlen(p) + 1) {
+        char *eq = strchr(p, '=');
+        if (!eq) continue;
+        struct entry *e = &programs[nprograms++];
+        int nl = (int)(eq - p) < (int)sizeof e->name - 1 ? (int)(eq - p) : (int)sizeof e->name - 1;
+        memcpy(e->name, p, (size_t)nl);
+        e->name[nl] = '\0';
+        char *comma = strchr(eq + 1, ',');
+        int fl = comma ? (int)(comma - eq - 1) : (int)strlen(eq + 1);
+        if (fl > (int)sizeof e->file - 1) fl = (int)sizeof e->file - 1;
+        memcpy(e->file, eq + 1, (size_t)fl);
+        e->file[fl] = '\0';
+        e->icon = ICON_APP;
+        if (comma)
+            for (int k = 0; k < ICON_COUNT; k++)
+                if (icon_names[k] && !strcmp(icon_names[k], comma + 1)) e->icon = k;
+    }
+    DebugLog("programs: %d from %s", nprograms, PROGRAMS_INI);
+}
 
 static void plain_name(const char *s, char *out, int max)    /* without '&' */
 {
@@ -59,6 +126,23 @@ static void launch_args(const char *file, const char *name, const char *args)
 }
 
 static void launch(const char *file, const char *name) { launch_args(file, name, NULL); }
+
+/* Background patterns: 8x8, drawn in the dark accent over the desktop. */
+struct pattern { const char *name; uint8_t rows[8]; };
+static const struct pattern patterns[] = {
+    { "(None)",   { 0 } },
+    { "Checks",   { 0xCC, 0xCC, 0x33, 0x33, 0xCC, 0xCC, 0x33, 0x33 } },
+    { "Bricks",   { 0xFF, 0x80, 0x80, 0x80, 0xFF, 0x08, 0x08, 0x08 } },
+    { "Diamonds", { 0x10, 0x28, 0x44, 0x82, 0x44, 0x28, 0x10, 0x00 } },
+    { "Weave",    { 0x88, 0x54, 0x22, 0x45, 0x88, 0x15, 0x22, 0x51 } },
+    { "Dots",     { 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x01 } },
+    { "Zigzag",   { 0x80, 0x41, 0x22, 0x14, 0x08, 0x00, 0x00, 0x00 } },
+    { "Stripes",  { 0x11, 0x22, 0x44, 0x88, 0x11, 0x22, 0x44, 0x88 } },
+};
+#define NPATTERNS (int)(sizeof patterns / sizeof patterns[0])
+static int pattern;
+
+static int clampi(int v, int lo, int hi) { return v < lo ? lo : v > hi ? hi : v; }
 
 /* ---- the Run dialog ------------------------------------------------------------- */
 
@@ -126,7 +210,10 @@ static int ntask_pids;
 
 static void shut_down(void);
 
-struct find_title { int pid; char *out; };
+struct find_title { int pid; char *out; HWND found; };
+static HWND task_wnds[PROC_MAX];                        /* each process's main window */
+static int closing_pid;                                 /* asked to close; ended if it doesn't */
+static uint32_t closing_since;
 
 static bool title_of(HWND h, LPARAM l)                  /* a process's main window */
 {
@@ -136,6 +223,7 @@ static bool title_of(HWND h, LPARAM l)                  /* a process's main wind
         (style & WS_CAPTION) != WS_CAPTION)
         return true;
     GetWindowText(h, f->out, 40);
+    f->found = h;
     return false;
 }
 
@@ -149,13 +237,17 @@ static void fill_tasks(void)
         char text[48] = "";
         task_pids[i] = (int)p[i].pid;
         strncpy0(task_names[i], p[i].name, sizeof task_names[i]);
+        task_wnds[i] = NULL;
         if (p[i].flags & PROC_LEADER) {
             strncpy0(text, "Shell", sizeof text);
         } else {
-            struct find_title f = { (int)p[i].pid, text };
+            struct find_title f = { (int)p[i].pid, text, NULL };
             EnumWindows(title_of, (LPARAM)&f);
+            task_wnds[i] = f.found;
             if (!text[0])
                 strncpy0(text, p[i].name, sizeof text);
+            if (f.found && IsHungAppWindow(f.found))
+                strncpy0(text + strlen(text), " (Not responding)", sizeof text - strlen(text));
         }
         SendMessage(list, LB_ADDSTRING, 0, (LPARAM)text);
         DebugLog("task %s: %s", p[i].name, text);
@@ -189,6 +281,22 @@ static LRESULT task_proc(HWND h, unsigned msg, WPARAM wp, LPARAM lp)
                 shut_down();
                 break;
             }
+            HWND w = task_wnds[i];
+            if (w && IsWindow(w) && !IsHungAppWindow(w)) {  /* ask it first */
+                DebugLog("asking %s to close", task_names[i]);
+                PostMessage(w, WM_CLOSE, 0, 0);
+                closing_pid = task_pids[i];
+                closing_since = GetTickCount();
+                SetTimer(h, 2, 250);
+                break;
+            }
+            if (w && IsHungAppWindow(w)) {
+                char t[96];
+                snprintf(t, sizeof t, "%s is not responding.\nEnd it? Its unsaved work will be lost.",
+                         task_names[i]);
+                if (MessageBox(h, t, "Close Program", MB_YESNO | MB_ICONWARNING) != IDYES)
+                    break;
+            }
             DebugLog("end task %s", task_names[i]);
             TerminateProcess(task_pids[i]);
             SetTimer(h, 1, 300);                        /* the list, once it's gone */
@@ -204,11 +312,39 @@ static LRESULT task_proc(HWND h, unsigned msg, WPARAM wp, LPARAM lp)
         }
         return 0;
     case WM_TIMER:
+        if (wp == 2) {                                  /* gone yet? */
+            bool alive = false;
+            PROCESSENTRY p[PROC_MAX];
+            int n = EnumProcesses(p, PROC_MAX);
+            for (int k = 0; k < n; k++)
+                if ((int)p[k].pid == closing_pid) alive = true;
+            if (!alive) {
+                KillTimer(h, 2);
+                closing_pid = 0;
+                fill_tasks();
+            } else if (GetTickCount() - closing_since > 4000) {   /* still there: it may be asking */
+                KillTimer(h, 2);                         /* (save changes?) -- or stuck */
+                int pid = closing_pid;
+                closing_pid = 0;
+                bool hung = false;
+                for (int k = 0; k < ntask_pids; k++)
+                    if (task_pids[k] == pid && task_wnds[k] && IsHungAppWindow(task_wnds[k])) hung = true;
+                if (hung && MessageBox(h, "The program is not responding.\nEnd it? Its unsaved work will be "
+                                       "lost.", "Close Program", MB_YESNO | MB_ICONWARNING) == IDYES) {
+                    TerminateProcess(pid);
+                    SetTimer(h, 1, 300);
+                } else {
+                    fill_tasks();
+                }
+            }
+            return 0;
+        }
         KillTimer(h, 1);
         fill_tasks();
         return 0;
     case WM_DESTROY:
         task_box = NULL;
+        KillTimer(h, 2);
         return 0;
     }
     return DefWindowProc(h, msg, wp, lp);
@@ -233,6 +369,7 @@ static void close_program(void)
 #define ID_RES      400
 #define ID_DEPTH    401
 #define ID_KEEPTXT  410
+#define ID_PATTERN  402
 
 static HWND display_box;
 static DEVMODE res_list[16];                /* the sizes offered ... */
@@ -275,25 +412,17 @@ static void put_int(char *out, int v)
  * last). Its lines are kept as they were read and written back. */
 static char tz_lines[160];
 
+/* The mode (and the time zone read at start) into OS1993.INI, the other
+ * sections left as they are. */
 static void save_mode(const DEVMODE *dm)
 {
-    char text[352] = "[display]\r\nwidth=", num[12];
-    put_int(num, (int)dm->dmPelsWidth);  strncpy0(text + strlen(text), num, sizeof text - strlen(text));
-    strncpy0(text + strlen(text), "\r\nheight=", sizeof text - strlen(text));
-    put_int(num, (int)dm->dmPelsHeight); strncpy0(text + strlen(text), num, sizeof text - strlen(text));
-    strncpy0(text + strlen(text), "\r\nbits=", sizeof text - strlen(text));
-    put_int(num, (int)dm->dmBitsPerPel); strncpy0(text + strlen(text), num, sizeof text - strlen(text));
-    strncpy0(text + strlen(text), "\r\n", sizeof text - strlen(text));
-    if (tz_lines[0]) {
-        strncpy0(text + strlen(text), "[timezone]\r\n", sizeof text - strlen(text));
-        strncpy0(text + strlen(text), tz_lines, sizeof text - strlen(text));
-    }
-    HANDLE f = CreateFile("OS1993.INI", GENERIC_WRITE, CREATE_ALWAYS);
-    if (f != INVALID_HANDLE_VALUE) {
-        uint32_t done;
-        WriteFile(f, text, (uint32_t)strlen(text), &done);
-        CloseHandle(f);
-    }
+    char num[12];
+    put_int(num, (int)dm->dmPelsWidth);
+    WritePrivateProfileString("display", "width", num, SHELL_INI);
+    put_int(num, (int)dm->dmPelsHeight);
+    WritePrivateProfileString("display", "height", num, SHELL_INI);
+    put_int(num, (int)dm->dmBitsPerPel);
+    WritePrivateProfileString("display", "bits", num, SHELL_INI);
 }
 
 static int parse_int(const char **p)
@@ -472,9 +601,15 @@ static LRESULT display_proc(HWND h, unsigned msg, WPARAM wp, LPARAM lp)
         CreateWindow(WC_STATIC, "Colors:", WS_CHILD | WS_VISIBLE, 12, 66, 200, 16, h, 0, NULL);
         HWND dep = CreateWindow(WC_COMBOBOX, "", WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST,
                                 12, 84, 236, 24, h, ID_DEPTH, NULL);
+        CreateWindow(WC_STATIC, "Background pattern:", WS_CHILD | WS_VISIBLE, 12, 120, 200, 16, h, 0, NULL);
+        HWND pat = CreateWindow(WC_COMBOBOX, "", WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST,
+                                12, 138, 236, 24, h, ID_PATTERN, NULL);
+        for (int i = 0; i < NPATTERNS; i++)
+            SendMessage(pat, CB_ADDSTRING, 0, (LPARAM)patterns[i].name);
+        SendMessage(pat, CB_SETCURSEL, (WPARAM)pattern, 0);
         CreateWindow(WC_BUTTON, "OK", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
-                     70, 124, 84, 30, h, IDOK, NULL);
-        CreateWindow(WC_BUTTON, "Cancel", WS_CHILD | WS_VISIBLE | WS_TABSTOP, 164, 128, 84, 22, h, IDCANCEL, NULL);
+                     70, 178, 84, 30, h, IDOK, NULL);
+        CreateWindow(WC_BUTTON, "Cancel", WS_CHILD | WS_VISIBLE | WS_TABSTOP, 164, 182, 84, 22, h, IDCANCEL, NULL);
         DEVMODE cur, dm;
         EnumDisplaySettings(ENUM_CURRENT_SETTINGS, &cur);
         nres = ndepth = 0;
@@ -522,6 +657,13 @@ static LRESULT display_proc(HWND h, unsigned msg, WPARAM wp, LPARAM lp)
             if (r < 0 || d < 0)
                 break;
             int w = (int)res_list[r].dmPelsWidth, hh = (int)res_list[r].dmPelsHeight, bpp = depth_list[d];
+            int pt = (int)SendMessage(GetDlgItem(h, ID_PATTERN), CB_GETCURSEL, 0, 0);
+            if (pt >= 0 && pt != pattern) {             /* the pattern: at once, and kept */
+                pattern = pt;
+                WritePrivateProfileString("desktop", "pattern", patterns[pt].name, SHELL_INI);
+                InvalidateRect(desktop, NULL);
+                DebugLog("pattern %s", patterns[pt].name);
+            }
             if (!mode_exists(w, hh, bpp)) {
                 MessageBox(h, "This display can't show that many colors at that size.\n"
                            "Choose another combination.", "Display Properties", MB_OK | MB_ICONINFORMATION);
@@ -546,7 +688,7 @@ static void open_display(void)
         SetForegroundWindow(display_box);
         return;
     }
-    int w = 270, hh = 194;
+    int w = 270, hh = 248;
     display_box = CreateWindow("ShellDisplay", "Display Properties", WS_DIALOG | WS_VISIBLE,
                                (SCR_W() - w) / 2, (SCR_H() - hh) / 3, w, hh, NULL, 0, NULL);
     SetFocus(GetDlgItem(display_box, ID_RES));
@@ -567,7 +709,7 @@ static void layout(void)
 
 /* ---- the Start menu ------------------------------------------------------------- */
 
-enum { ID_PROGRAM = 100, ID_RUN = 200, ID_ABOUT, ID_SHUTDOWN, ID_DISPLAY };
+enum { ID_PROGRAM = 100, ID_RUN = 200, ID_ABOUT, ID_SHUTDOWN, ID_DISPLAY, ID_ARRANGE };
 
 static bool start_open;
 
@@ -581,11 +723,29 @@ static void shut_down(void)
     }
 }
 
+/* Icon pictures for menus: they must stay while a menu shows them. */
+static uint8_t big_px[ICON_COUNT][32 * 32], small_px[ICON_COUNT][16 * 16];
+static bool px_ready[ICON_COUNT];
+
+static const uint8_t *icon_px(int icon, int size)
+{
+    if (icon <= ICON_NONE || icon >= ICON_COUNT) icon = ICON_APP;
+    if (!px_ready[icon]) {
+        GetIconPixels(icon, 32, big_px[icon]);
+        GetIconPixels(icon, 16, small_px[icon]);
+        px_ready[icon] = true;
+    }
+    return size == 32 ? big_px[icon] : small_px[icon];
+}
+
 static void start_menu(void)
 {
+    load_programs();
     HMENU progs = CreatePopupMenu(), menu = CreatePopupMenu();
-    for (int i = 0; i < NPROGRAMS; i++)
+    for (int i = 0; i < nprograms; i++) {
         AppendMenu(progs, MF_STRING, ID_PROGRAM + i, programs[i].name);
+        SetMenuItemImage(progs, (unsigned)i, MF_BYPOSITION, icon_px(programs[i].icon, 16), 16);
+    }
     AppendMenu(menu, MF_POPUP, (uintptr_t)progs, "&Programs");
     AppendMenu(menu, MF_STRING, ID_RUN, "&Run...");
     AppendMenu(menu, MF_STRING, ID_DISPLAY, "&Display Settings...");
@@ -593,13 +753,17 @@ static void start_menu(void)
     AppendMenu(menu, MF_STRING, ID_ABOUT, "&About OS1993...");
     AppendMenu(menu, MF_SEPARATOR, 0, NULL);
     AppendMenu(menu, MF_STRING, ID_SHUTDOWN, "Sh&ut Down...");
+    static const int big[] = { ICON_FOLDER, ICON_APP, ICON_COMPUTER, 0, ICON_INFO, 0, ICON_SHUTDOWN };
+    for (int i = 0; i < 7; i++)
+        if (big[i]) SetMenuItemImage(menu, (unsigned)i, MF_BYPOSITION, icon_px(big[i], 32), 32);
+    SetMenuBanner(menu, "OS1993", C_ACCENT_DK);
     start_open = true;
     InvalidateRect(taskbar, NULL);
     int id = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_BOTTOMALIGN, 2, SCR_H() - BAR_H + 1, taskbar);
     DestroyMenu(menu);
     start_open = false;
     InvalidateRect(taskbar, NULL);
-    if (id >= ID_PROGRAM && id < ID_PROGRAM + NPROGRAMS)
+    if (id >= ID_PROGRAM && id < ID_PROGRAM + nprograms)
         launch(programs[id - ID_PROGRAM].file, programs[id - ID_PROGRAM].name);
     else if (id == ID_RUN)
         open_run();
@@ -704,6 +868,7 @@ static void taskbar_paint(HWND h)
 {
     PAINTSTRUCT ps;
     HDC dc = BeginPaint(h, &ps);
+    SelectFont(dc, FONT_GUI);
     RECT all = { 0, 0, SCR_W(), BAR_H };
     FillRect(dc, &all, C_FACE);
     DrawLine(dc, 0, 0, SCR_W(), false, C_GRAY4);
@@ -722,10 +887,9 @@ static void taskbar_paint(HWND h)
         DrawSmallIcon(dc, r.left + 4 + down, r.top + 3 + down, GetClassIcon(tasks[i]));
         char title[64];
         GetWindowText(tasks[i], title, sizeof title);
-        int room = (r.right - r.left - 28) / 8;
-        if (room < 0) room = 0;
-        if ((int)strlen(title) > room) title[room] = '\0';
-        TextOut(dc, r.left + 23 + down, r.top + 3 + down, title, C_BLACK, -1);
+        RECT tr = { r.left + 23 + down, r.top + 3 + down, r.right - 4, r.bottom - 2 };
+        SetTextColor(dc, C_BLACK);
+        DrawText(dc, title, -1, &tr, DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
     }
 
     RECT tr = { tray_left(), 3, SCR_W() - 4, BAR_H - 3 };   /* the notification area */
@@ -734,8 +898,28 @@ static void taskbar_paint(HWND h)
         DrawSmallIcon(dc, tr.left + 6 + i * 20, tr.top + 3, tray[i].icon);
     char clock[12];
     format_time(clock);
-    TextOut(dc, tr.right - 8 - 64, tr.top + 3, clock, C_BLACK, -1);
+    TextOut(dc, tr.right - 8 - GetTextWidth(dc, clock, -1), tr.top + 3, clock, C_BLACK, -1);
     EndPaint(h, &ps);
+}
+
+static HWND tips;                                       /* the tray icons' tooltips */
+
+static void tray_tips(void)
+{
+    if (!tips)
+        tips = CreateWindow(TOOLTIPS_CLASS, "", WS_POPUP, 0, 0, 0, 0, NULL, 0, NULL);
+    for (int i = 0; i < TRAY_MAX; i++) {
+        TOOLINFO ti = { sizeof ti, 0, taskbar, (unsigned)(i + 1), { 0, 0, 0, 0 }, NULL };
+        SendMessage(tips, TTM_DELTOOL, 0, (LPARAM)&ti);
+    }
+    int tl = tray_left();
+    for (int i = 0; i < ntray; i++) {
+        if (!tray[i].tip[0])
+            continue;
+        TOOLINFO ti = { sizeof ti, 0, taskbar, (unsigned)(i + 1),
+                        { tl + 6 + i * 20, 3, tl + 6 + i * 20 + 18, BAR_H - 3 }, tray[i].tip };
+        SendMessage(tips, TTM_ADDTOOL, 0, (LPARAM)&ti);
+    }
 }
 
 static void tray_message(const struct tray_msg *m)
@@ -760,7 +944,32 @@ static void tray_message(const struct tray_msg *m)
         if (m->nid.uFlags & NIF_ICON)    tray[i].icon = m->nid.hIcon;
         if (m->nid.uFlags & NIF_TIP)     strncpy0(tray[i].tip, m->nid.szTip, sizeof tray[i].tip);
     }
+    tray_tips();
     InvalidateRect(taskbar, NULL);
+}
+
+/* A taskbar button's right button: its window's system menu, the choice
+ * sent to the window (which may be another process's). */
+static void task_menu(HWND t, int x)
+{
+    bool min = IsIconic(t), max = IsZoomed(t);
+    unsigned style = (unsigned)GetWindowLong(t, GWL_STYLE);
+    HMENU m = CreatePopupMenu();
+    AppendMenu(m, MF_STRING | (min || max ? 0 : MF_GRAYED), SC_RESTORE, "&Restore");
+    AppendMenu(m, MF_STRING | (min || max ? MF_GRAYED : 0), SC_MOVE, "&Move");
+    AppendMenu(m, MF_STRING | (min || max || !(style & WS_THICKFRAME) ? MF_GRAYED : 0), SC_SIZE, "&Size");
+    AppendMenu(m, MF_STRING | (min || !(style & WS_MINIMIZEBOX) ? MF_GRAYED : 0), SC_MINIMIZE, "Mi&nimize");
+    AppendMenu(m, MF_STRING | (max || !(style & WS_MAXIMIZEBOX) ? MF_GRAYED : 0), SC_MAXIMIZE, "Ma&ximize");
+    AppendMenu(m, MF_SEPARATOR, 0, NULL);
+    AppendMenu(m, MF_STRING, SC_CLOSE, "&Close\tAlt+F4");
+    int id = TrackPopupMenu(m, TPM_RETURNCMD | TPM_BOTTOMALIGN, x, SCR_H() - BAR_H + 1, taskbar);
+    DestroyMenu(m);
+    if (!id || !IsWindow(t))
+        return;
+    if (id == SC_MOVE || id == SC_SIZE)
+        SetForegroundWindow(t);
+    PostMessage(t, WM_SYSCOMMAND, (WPARAM)id, 0);
+    DebugLog("taskbar menu %x", id);
 }
 
 static void taskbar_click(int x, int y, unsigned mouse_msg)
@@ -771,6 +980,10 @@ static void taskbar_click(int x, int y, unsigned mouse_msg)
     }
     for (int i = 0; i < ntasks; i++) {
         RECT r = task_rect(i);
+        if (PtInRect(&r, x, y) && mouse_msg == WM_RBUTTONUP) {
+            task_menu(tasks[i], r.left);
+            return;
+        }
         if (PtInRect(&r, x, y) && mouse_msg == WM_LBUTTONDOWN) {
             HWND t = tasks[i];
             if (t == GetForegroundWindow() && !IsIconic(t))
@@ -856,7 +1069,7 @@ static LRESULT taskbar_proc(HWND h, unsigned msg, WPARAM wp, LPARAM lp)
 struct desk_icon { const char *label; const char *file; int icon; };
 
 static const struct desk_icon icons[] = {
-    { "My Computer",    NULL,          ICON_COMPUTER },
+    { "My Computer",    "EXPLORER.BIN", ICON_COMPUTER },
     { "Calculator",     "CALC.BIN",    ICON_CALC },
     { "Paint",          "PAINT.BIN",   ICON_PAINT },
     { "Clock",          "CLOCK.BIN",   ICON_CLOCK },
@@ -867,8 +1080,45 @@ static const struct desk_icon icons[] = {
 #define NICONS (int)(sizeof icons / sizeof icons[0])
 
 static int selected = -1;
+static POINT icon_pos[NICONS];                          /* where each icon is (its cell's corner) */
+static bool dragging, drag_moved;
+static int drag_dx, drag_dy, drag_sx, drag_sy;
 
-static RECT cell(int i) { return (RECT){ 4, 6 + i * CELL_H, 4 + CELL_W, 6 + (i + 1) * CELL_H }; }
+
+static RECT cell(int i)
+{
+    return (RECT){ icon_pos[i].x, icon_pos[i].y, icon_pos[i].x + CELL_W, icon_pos[i].y + CELL_H };
+}
+
+static void load_desktop(void)
+{
+    char name[24];
+    GetPrivateProfileString("desktop", "pattern", "(None)", name, sizeof name, SHELL_INI);
+    pattern = 0;
+    for (int i = 0; i < NPATTERNS; i++)
+        if (!strcmp(patterns[i].name, name)) pattern = i;
+    for (int i = 0; i < NICONS; i++) {
+        char key[8], v[24];
+        snprintf(key, sizeof key, "icon%d", i);
+        icon_pos[i] = (POINT){ 4, 6 + i * CELL_H };
+        if (GetPrivateProfileString("desktop", key, "", v, sizeof v, SHELL_INI)) {
+            const char *p = v;
+            int x = parse_int(&p);
+            if (*p == ',') p++;
+            int y = parse_int(&p);
+            if (x >= 0 && y >= 0 && x < SCR_W() - 16 && y < SCR_H() - BAR_H - 16)
+                icon_pos[i] = (POINT){ x, y };
+        }
+    }
+}
+
+static void save_icon(int i)
+{
+    char key[8], v[24];
+    snprintf(key, sizeof key, "icon%d", i);
+    snprintf(v, sizeof v, "%d,%d", (int)icon_pos[i].x, (int)icon_pos[i].y);
+    WritePrivateProfileString("desktop", key, v, SHELL_INI);
+}
 
 static void open_icon(int i)
 {
@@ -882,7 +1132,7 @@ static void open_icon(int i)
 static void label_lines(const char *s, char *a, char *b)    /* wrap at a space */
 {
     int n = (int)strlen(s), split = -1;
-    if (n * 8 > CELL_W - 4)
+    if (TextWidthFont(FONT_GUI, s, n) > CELL_W - 4)
         for (int i = 0; i < n; i++)
             if (s[i] == ' ')
                 split = i;
@@ -912,6 +1162,14 @@ static void desktop_paint(HWND h)
                         (uint8_t)(170 - k * 90 / 255));
         }
     }
+    if (pattern) {                                      /* the pattern, tile by tile */
+        uint16_t rows[8];
+        for (int k = 0; k < 8; k++) rows[k] = (uint16_t)(patterns[pattern].rows[k] << 8);
+        for (int y = ps.rcPaint.top & ~7; y < ps.rcPaint.bottom; y += 8)
+            for (int x = ps.rcPaint.left & ~7; x < ps.rcPaint.right; x += 8)
+                DrawBitmap(dc, x, y, rows, 8, C_ACCENT_DK);
+    }
+    SelectFont(dc, FONT_GUI);
     for (int i = 0; i < NICONS; i++) {
         RECT c = cell(i);
         DrawIcon(dc, c.left + (CELL_W - 32) / 2, c.top + 2, icons[i].icon);
@@ -921,7 +1179,7 @@ static void desktop_paint(HWND h)
             const char *s = line ? b : a;
             if (!*s)
                 continue;
-            int w = TextWidth(s), x = c.left + (CELL_W - w) / 2, y = c.top + 36 + line * 14;
+            int w = GetTextWidth(dc, s, -1), x = c.left + (CELL_W - w) / 2, y = c.top + 36 + line * 14;
             bool sel = i == selected;
             if (sel) {
                 RECT r = { x - 2, y, x + w + 2, y + 15 };
@@ -944,7 +1202,7 @@ static void select_icon(HWND h, int i)
 
 static int icon_at(int x, int y)
 {
-    for (int i = 0; i < NICONS; i++) {
+    for (int i = NICONS - 1; i >= 0; i--) {
         RECT c = cell(i);
         if (PtInRect(&c, x, y))
             return i;
@@ -958,8 +1216,50 @@ static LRESULT desktop_proc(HWND h, unsigned msg, WPARAM wp, LPARAM lp)
     case WM_PAINT:
         desktop_paint(h);
         return 0;
-    case WM_LBUTTONDOWN:
-        select_icon(h, icon_at(GET_X_LPARAM(lp), GET_Y_LPARAM(lp)));
+    case WM_LBUTTONDOWN: {                              /* select; hold to drag it about */
+        int x = GET_X_LPARAM(lp), y = GET_Y_LPARAM(lp), i = icon_at(x, y);
+        select_icon(h, i);
+        if (i >= 0) {
+            dragging = true;
+            drag_moved = false;
+            drag_dx = x - icon_pos[i].x;
+            drag_dy = y - icon_pos[i].y;
+            drag_sx = x;
+            drag_sy = y;
+            SetCapture(h);
+        }
+        return 0;
+    }
+    case WM_MOUSEMOVE:
+        if (dragging && selected >= 0) {
+            int x = GET_X_LPARAM(lp), y = GET_Y_LPARAM(lp);
+            if (!drag_moved && (x - drag_sx) * (x - drag_sx) + (y - drag_sy) * (y - drag_sy) < 25)
+                return 0;
+            drag_moved = true;
+            RECT old = cell(selected);
+            int nx = clampi(x - drag_dx, 0, SCR_W() - CELL_W), ny = clampi(y - drag_dy, 0, SCR_H() - BAR_H - CELL_H);
+            icon_pos[selected] = (POINT){ nx, ny };
+            InvalidateRect(h, &old);
+            RECT r = cell(selected);
+            InvalidateRect(h, &r);
+        }
+        return 0;
+    case WM_LBUTTONUP:
+        if (dragging) {
+            dragging = false;
+            ReleaseCapture();
+            if (drag_moved && selected >= 0) {          /* onto an 8-pixel grid, and kept */
+                RECT old = cell(selected);
+                icon_pos[selected].x = (icon_pos[selected].x + 4) & ~7;
+                icon_pos[selected].y = (icon_pos[selected].y + 4) & ~7;
+                InvalidateRect(h, &old);
+                RECT r = cell(selected);
+                InvalidateRect(h, &r);
+                save_icon(selected);
+                DebugLog("icon %s moved to %d,%d", icons[selected].label, (int)icon_pos[selected].x,
+                         (int)icon_pos[selected].y);
+            }
+        }
         return 0;
     case WM_LBUTTONDBLCLK: {
         int i = icon_at(GET_X_LPARAM(lp), GET_Y_LPARAM(lp));
@@ -979,12 +1279,21 @@ static LRESULT desktop_proc(HWND h, unsigned msg, WPARAM wp, LPARAM lp)
         return 0;
     case WM_CONTEXTMENU: {
         HMENU m = CreatePopupMenu();
+        AppendMenu(m, MF_STRING, ID_ARRANGE, "&Line up Icons");
+        AppendMenu(m, MF_SEPARATOR, 0, NULL);
         AppendMenu(m, MF_STRING, ID_RUN, "&Run...");
         AppendMenu(m, MF_STRING, ID_ABOUT, "&About OS1993...");
         AppendMenu(m, MF_SEPARATOR, 0, NULL);
         AppendMenu(m, MF_STRING, ID_DISPLAY, "Propert&ies");
         int id = TrackPopupMenu(m, TPM_RETURNCMD, GET_X_LPARAM(lp), GET_Y_LPARAM(lp), h);
         DestroyMenu(m);
+        if (id == ID_ARRANGE) {                         /* back in a column */
+            for (int i = 0; i < NICONS; i++) {
+                icon_pos[i] = (POINT){ 4, 6 + i * CELL_H };
+                save_icon(i);
+            }
+            InvalidateRect(h, NULL);
+        }
         if (id == ID_RUN) open_run();
         if (id == ID_ABOUT) ShellAbout(h, "OS1993", NULL);
         if (id == ID_DISPLAY) open_display();
@@ -1021,6 +1330,7 @@ int main(void)
         DebugLog("display %dx%dx%d from OS1993.INI", (int)saved.dmPelsWidth, (int)saved.dmPelsHeight,
                  (int)saved.dmBitsPerPel);
 
+    load_desktop();
     desktop = CreateWindowEx(WS_EX_TOOLWINDOW, DESKTOP_CLASS, "Desktop", WS_POPUP,
                              0, 0, SCR_W(), SCR_H(), NULL, 0, NULL);
     SetShellWindow(desktop);

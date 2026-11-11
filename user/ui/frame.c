@@ -40,7 +40,7 @@ void frame_client(struct wnd *w, RECT *r)
         frame_outer(w, r);
         return;
     }
-    int top = w->y + CLIENT_TOP + (w->menu ? MENUBAR_H + 1 : 0);
+    int top = w->y + CLIENT_TOP + (w->menu ? menu_bar_rows(w->menu, w->w) * MENUBAR_H + 1 : 0);
     *r = (RECT){ w->x + FRAME, top, w->x + w->w - FRAME, w->y + w->h - FRAME };
 }
 
@@ -48,7 +48,8 @@ bool frame_menubar(struct wnd *w, RECT *r)
 {
     if (!frame_has(w) || !w->menu || w->state == WS_STATE_MIN)
         return false;
-    *r = (RECT){ w->x + FRAME, w->y + CLIENT_TOP, w->x + w->w - FRAME, w->y + CLIENT_TOP + MENUBAR_H };
+    *r = (RECT){ w->x + FRAME, w->y + CLIENT_TOP, w->x + w->w - FRAME,
+                 w->y + CLIENT_TOP + menu_bar_rows(w->menu, w->w) * MENUBAR_H };
     return true;
 }
 
@@ -127,6 +128,7 @@ int frame_hit(struct wnd *w, int x, int y, int *edges)
 
 static void notify_size(struct wnd *w)
 {
+    ui_reflow(w);
     RECT c;
     GetClientRect(w, &c);
     wnd_notify(w, WM_SIZE, 0, MAKELPARAM(c.right, c.bottom));
@@ -254,16 +256,14 @@ void frame_paint(struct wnd *w, bool active)
         }
 
     int reserve = tile ? BOX + 10 : 3 * BOX + 18;
-    int room = (tw_ - 2 * reserve) / 8;
     char title[TEXT_MAX];
-    int n = (int)strlen(w->text);
-    if (n > room) n = room < 0 ? 0 : room;
-    memcpy(title, w->text, (size_t)n);
-    title[n] = '\0';
-    int textw = n * 8, tx = t.left + (tw_ - textw) / 2;
+    fit_text(w->text, tw_ - 2 * reserve, title, sizeof title);
+    int n = (int)strlen(title);
+    int textw = gfx_text_width(g, GFX_FONT_PROP, title, n), tx = t.left + (tw_ - textw) / 2;
     if (n) {
         gfx_fill(g, tx - 6, t.top + 1, textw + 12, TITLE_H - 2, C_FACE);
-        gfx_text(g, tx, t.top + 2, title, active || tile ? C_BLACK : C_GRAY3, GFX_TRANSPARENT);
+        gfx_text_font(g, GFX_FONT_PROP, tx, t.top + 2, title, n, active || tile ? C_BLACK : C_GRAY3,
+                      GFX_TRANSPARENT);
     }
 
     bool pressed_here = frame_pressed_wnd == w;

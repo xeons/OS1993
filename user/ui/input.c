@@ -20,22 +20,230 @@ struct gfx ui_screen;
 
 /* ---- cursor and outline ------------------------------------------------------ */
 
-static const uint16_t arrow[16] = {
-    0x8000, 0xC000, 0xA000, 0x9000, 0x8800, 0x8400, 0x8200, 0x8100,
-    0x8080, 0x8040, 0x8780, 0x9400, 0xB400, 0xCA00, 0x0A00, 0x0400,
+/* Cursor shapes: 'k' black, 'w' white, anything else see-through. In
+ * linear (VESA) modes a shape is drawn solid over a saved copy of what it
+ * covers; in 16-colour mode its black pixels are XORed onto the screen
+ * (XOR in 256 colours would only swap palette entries). The resize arrows
+ * are made at first use from two drawn ones. */
+struct cursor { const char *rows[CUR_H]; int w, h, hx, hy; };
+
+static const char *const arrow_art[] = {
+    "k           ", "kk          ", "kwk         ", "kwwk        ", "kwwwk       ",
+    "kwwwwk      ", "kwwwwwk     ", "kwwwwwwk    ", "kwwwwwwwk   ", "kwwwwwwwwk  ",
+    "kwwwwwwwwwk ", "kwwwwwwkkkkk", "kwwwkwwk    ", "kwwk kwwk   ", "kwk  kwwk   ",
+    "kk    kwwk  ", "k     kwwk  ", "       kwwk ", "        kk  ",
 };
+static const char *const ibeam_art[] = {
+    "kkk kkk", "   k   ", "   k   ", "   k   ", "   k   ", "   k   ", "   k   ", "   k   ",
+    "   k   ", "   k   ", "   k   ", "   k   ", "   k   ", "   k   ", "   k   ", "kkk kkk",
+};
+static const char *const wait_art[] = {
+    "kkkkkkkkkkk", "kwwwwwwwwwk", " kkkkkkkkk ", " kwwwwwwwk ", " kwkwkwkwk ",
+    "  kwkwkwk  ", "   kwkwk   ", "    kwk    ", "    kwk    ", "   kwwwk   ",
+    "  kwwkwwk  ", " kwwkwkwwk ", " kwkwkwkwk ", " kkkkkkkkk ", "kwwwwwwwwwk",
+    "kkkkkkkkkkk",
+};
+static const char *const we_art[] = {
+    "   kk     kk   ", "  kwk     kwk  ", " kwwkkkkkkkwwk ", "kwwwwwwwwwwwwwk",
+    " kwwkkkkkkkwwk ", "  kwk     kwk  ", "   kk     kk   ",
+};
+static const char *const cross_art[] = {
+    "       k       ", "       k       ", "       k       ", "       k       ", "       k       ",
+    "       k       ", "               ", "kkkkkk   kkkkkk", "               ", "       k       ",
+    "       k       ", "       k       ", "       k       ", "       k       ", "       k       ",
+};
+static const char *const no_art[] = {
+    "    kkkkk    ", "  kkwwwwwkk  ", " kwwkkkkkwwk ", " kwkk   kkwk ", "kwkkwk   kwk ",
+    "kwk kwk   kwk", "kwk  kwk  kwk", "kwk   kwk kwk", " kwk   kwkkwk", " kwkk   kkwk ",
+    " kwwkkkkkwwk ", "  kkwwwwwkk  ", "    kkkkk    ",
+};
+
+static struct cursor cursors[CURSOR_COUNT];
+static char gen[4][CUR_H][CUR_W + 1];          /* SIZENS, NWSE, NESW, SIZEALL */
+
+static void set_shape(int id, const char *const *rows, int n, int hx, int hy)
+{
+    struct cursor *c = &cursors[id];
+    c->h = n;
+    c->w = (int)strlen(rows[0]);
+    for (int i = 0; i < n; i++) c->rows[i] = rows[i];
+    c->hx = hx;
+    c->hy = hy;
+}
+
+static void make_cursors(void)
+{
+    if (cursors[CURSOR_ARROW].h)
+        return;
+    set_shape(CURSOR_ARROW, arrow_art, 19, 0, 0);
+    set_shape(CURSOR_IBEAM, ibeam_art, 16, 3, 8);
+    set_shape(CURSOR_WAIT, wait_art, 16, 5, 8);
+    set_shape(CURSOR_SIZEWE, we_art, 7, 7, 3);
+    set_shape(CURSOR_CROSS, cross_art, 15, 7, 7);
+    set_shape(CURSOR_NO, no_art, 13, 6, 6);
+    const char *r[CUR_H];
+    for (int y = 0; y < 15; y++) {               /* NS: WE turned on its side */
+        for (int x = 0; x < 7; x++) gen[0][y][x] = we_art[x][y];
+        gen[0][y][7] = '\0';
+        r[y] = gen[0][y];
+    }
+    set_shape(CURSOR_SIZENS, r, 15, 3, 7);
+    for (int d = 0; d < 2; d++) {               /* the diagonals, 13 square */
+        char (*g)[CUR_W + 1] = gen[1 + d];
+        for (int y = 0; y < 13; y++) { memset(g[y], ' ', 13); g[y][13] = '\0'; }
+        for (int y = 0; y < 13; y++)
+            for (int x = 0; x < 13; x++) {
+                int a = x + y, b = (12 - x) + (12 - y);
+                char c = ' ';
+                if (a <= 5) c = (x == 0 || y == 0 || a == 5) ? 'k' : 'w';
+                else if (b <= 5) c = (x == 12 || y == 12 || b == 5) ? 'k' : 'w';
+                else if (x == y) c = 'w';
+                else if (x == y + 1 || y == x + 1) c = 'k';
+                g[y][d ? 12 - x : x] = c;
+            }
+        for (int y = 0; y < 13; y++) r[y] = g[y];
+        set_shape(d ? CURSOR_SIZENESW : CURSOR_SIZENWSE, r, 13, 6, 6);
+    }
+    char (*g)[CUR_W + 1] = gen[3];                /* SIZEALL: both arrows crossed */
+    for (int y = 0; y < 15; y++) {
+        for (int x = 0; x < 15; x++) {
+            char c = ' ';
+            if (y >= 4 && y < 11 && we_art[y - 4][x] != ' ') c = we_art[y - 4][x];
+            if (x >= 4 && x < 11 && we_art[x - 4][y] != ' ' && c != 'w') c = we_art[x - 4][y];
+            g[y][x] = c;
+        }
+        g[y][15] = '\0';
+        r[y] = g[y];
+    }
+    g[7][7] = 'w';
+    set_shape(CURSOR_SIZEALL, r, 15, 7, 7);
+}
+
+static bool sprite(void) { return ui_screen.bpp != 4; }
+
+static const struct cursor *drawn(void)
+{
+    make_cursors();
+    int id = IN.cur_shown >= 0 && IN.cur_shown < CURSOR_COUNT ? IN.cur_shown : CURSOR_ARROW;
+    return &cursors[id];
+}
+
+static void xor_shape(const struct cursor *c, int x, int y)
+{
+    uint16_t rows[CUR_H];
+    for (int i = 0; i < c->h; i++) {
+        rows[i] = 0;
+        for (int k = 0; k < c->w && k < 16; k++)
+            if (c->rows[i][k] == 'k') rows[i] |= (uint16_t)(0x8000u >> k);
+    }
+    gfx_xor_bitmap(&ui_screen, x, y, rows, c->h);
+}
 
 void ui_cursor(bool on)
 {
     if (S->background || on == IN.cur_on)
         return;
-    gfx_xor_bitmap(&ui_screen, IN.cur_x, IN.cur_y, arrow, 16);
+    if (on)
+        IN.cur_shown = IN.cur_shape;
+    const struct cursor *c = drawn();
+    int x = IN.cur_x - c->hx, y = IN.cur_y - c->hy;
+    if (!sprite()) {
+        xor_shape(c, x, y);
+    } else if (on) {
+        gfx_sprite_save(&ui_screen, x, y, c->w, c->h, IN.cur_save);
+        gfx_sprite_draw(&ui_screen, x, y, c->rows, c->w, c->h);
+    } else {
+        gfx_sprite_restore(&ui_screen, x, y, c->w, c->h, IN.cur_save);
+    }
     IN.cur_on = on;
+}
+
+/* After the screen under a shown cursor was copied from the back buffer:
+ * what it covers now comes from there, and it is drawn again at once (no
+ * moment without it, so no flicker). */
+void ui_cursor_refresh(void)
+{
+    if (S->background || !IN.cur_on || !sprite())
+        return;
+    const struct cursor *c = drawn();
+    int x = IN.cur_x - c->hx, y = IN.cur_y - c->hy;
+    gfx_sprite_save(&ui_gfx, x, y, c->w, c->h, IN.cur_save);
+    gfx_sprite_draw(&ui_screen, x, y, c->rows, c->w, c->h);
 }
 
 bool ui_cursor_overlaps(int x0, int y0, int x1, int y1)
 {
-    return IN.cur_on && IN.cur_x < x1 && IN.cur_x + 16 > x0 && IN.cur_y < y1 && IN.cur_y + 16 > y0;
+    if (!IN.cur_on)
+        return false;
+    const struct cursor *c = drawn();
+    int x = IN.cur_x - c->hx, y = IN.cur_y - c->hy;
+    return x < x1 && x + 16 > x0 && y < y1 && y + c->h > y0;
+}
+
+/* A new shape (CURSOR_*), at once. */
+void ui_set_cursor(int id)
+{
+    if (id < 0 || id >= CURSOR_COUNT || id == IN.cur_shape)
+        return;
+    bool on = IN.cur_on;
+    ui_cursor(false);
+    IN.cur_shape = id;
+    if (on)
+        ui_cursor(true);
+}
+
+int ui_edge_cursor(int edges)
+{
+    if ((edges & (E_L | E_T)) == (E_L | E_T) || (edges & (E_R | E_B)) == (E_R | E_B))
+        return CURSOR_SIZENWSE;
+    if ((edges & (E_R | E_T)) == (E_R | E_T) || (edges & (E_L | E_B)) == (E_L | E_B))
+        return CURSOR_SIZENESW;
+    if (edges & (E_L | E_R)) return CURSOR_SIZEWE;
+    if (edges & (E_T | E_B)) return CURSOR_SIZENS;
+    return CURSOR_ARROW;
+}
+
+static const int idc_ids[CURSOR_COUNT] = {
+    [CURSOR_ARROW] = IDC_ARROW, [CURSOR_IBEAM] = IDC_IBEAM, [CURSOR_WAIT] = IDC_WAIT,
+    [CURSOR_CROSS] = IDC_CROSS, [CURSOR_SIZENWSE] = IDC_SIZENWSE, [CURSOR_SIZENESW] = IDC_SIZENESW,
+    [CURSOR_SIZEWE] = IDC_SIZEWE, [CURSOR_SIZENS] = IDC_SIZENS, [CURSOR_SIZEALL] = IDC_SIZEALL,
+    [CURSOR_NO] = IDC_NO,
+};
+
+int ui_cursor_index(HCURSOR h)
+{
+    for (int i = 0; i < CURSOR_COUNT; i++)
+        if (idc_ids[i] == (int)h)
+            return i;
+    return -1;
+}
+
+HCURSOR LoadCursor(void *instance, int idc)
+{
+    (void)instance;
+    return ui_cursor_index(idc) >= 0 ? idc : 0;
+}
+
+/* Until the pointer moves into another window (or part of one); a program
+ * that wants a shape of its own over part of a window sets it on each
+ * WM_MOUSEMOVE there. */
+HCURSOR SetCursor(HCURSOR h)
+{
+    HCURSOR old = idc_ids[IN.cur_shape];
+    int i = ui_cursor_index(h);
+    if (i >= 0)
+        ui_set_cursor(i);
+    return old;
+}
+
+HCURSOR GetCursor(void) { return idc_ids[IN.cur_shape]; }
+
+bool GetCursorPos(POINT *p)
+{
+    if (!p) return false;
+    p->x = IN.cur_x;
+    p->y = IN.cur_y;
+    return true;
 }
 
 static void cursor_to(int x, int y)
@@ -53,9 +261,15 @@ void ui_outline(bool on)
     if (on == IN.outline_on)
         return;
     IN.outline_on = on;
-    if (!S->background)
-        gfx_xor_frame(&ui_screen, IN.outline.left, IN.outline.top,
-                      IN.outline.right - IN.outline.left, IN.outline.bottom - IN.outline.top, 2);
+    if (S->background)
+        return;
+    bool cur = IN.cur_on && sprite();                   /* the sprite stays on top */
+    if (cur)
+        ui_cursor(false);
+    gfx_xor_frame(&ui_screen, IN.outline.left, IN.outline.top,
+                  IN.outline.right - IN.outline.left, IN.outline.bottom - IN.outline.top, 2);
+    if (cur)
+        ui_cursor(true);
 }
 
 /* ---- keyboard --------------------------------------------------------------- */
@@ -104,6 +318,12 @@ static void key_event(int sc)
 
     if (!up && vk == VK_ESCAPE && IN.ctrl && wnd_from(S->shell_hook)) {
         PostMessage(S->shell_hook, WM_SYSCOMMAND, SC_TASKLIST, 0);    /* the Start menu */
+        return;
+    }
+    if (!up && vk == VK_ESCAPE && IN.alt && !IN.ctrl) {           /* Alt+Esc: next window */
+        IN.alt_alone = false;
+        if (S->active && !wnd_owned_popup(S->active))
+            wnd_lower(S->active);
         return;
     }
     struct wnd *target = wnd_from(S->focus);
@@ -192,6 +412,28 @@ static bool press(int x, int y)
     return t->pid != ui_pid;
 }
 
+/* The shape for where the pointer is, when it has moved into another
+ * window or part of one: the resize arrows on borders, the window's or its
+ * class's cursor in a client area. */
+static void default_cursor(int x, int y)
+{
+    int part, edges = 0, shape = CURSOR_ARROW;
+    struct wnd *t = window_at(x, y, &part, &edges), *c = NULL;
+    if (t && part == HT_CLIENT && t->enabled)
+        c = client_target(t, x, y);
+    uint32_t key = (uint32_t)(uintptr_t)(c ? c : t) ^ ((uint32_t)part << 24) ^ ((uint32_t)edges << 28);
+    if (key == IN.cur_key)
+        return;
+    IN.cur_key = key;
+    if (t && part == HT_BORDER && t->enabled && t->state == WS_STATE_NORMAL)
+        shape = ui_edge_cursor(edges);
+    else if (c) {
+        int i = ui_cursor_index(c->cursor ? c->cursor : c->cls->cursor);
+        if (i >= 0) shape = i;
+    }
+    ui_set_cursor(shape);
+}
+
 /* -> true if the rest of the input now belongs to another process */
 static bool mouse_event(int x, int y, uint8_t buttons)
 {
@@ -201,11 +443,14 @@ static bool mouse_event(int x, int y, uint8_t buttons)
     bool rup = !(buttons & MB_RIGHT) && (IN.last_buttons & MB_RIGHT);
     bool moved = x != IN.cur_x || y != IN.cur_y;
     IN.last_buttons = buttons;
-    unsigned keys = ((buttons & MB_LEFT) ? MK_LBUTTON : 0) | ((buttons & MB_RIGHT) ? MK_RBUTTON : 0);
+    unsigned keys = ((buttons & MB_LEFT) ? MK_LBUTTON : 0) | ((buttons & MB_RIGHT) ? MK_RBUTTON : 0) |
+                    (S->in.shift ? MK_SHIFT : 0) | (S->in.ctrl ? MK_CONTROL : 0);
     if (moved)
         cursor_to(x, y);
 
     struct wnd *cap = wnd_from(S->capture);
+    if (!cap)
+        default_cursor(x, y);
     if (cap) {                                  /* everything to the capture */
         if (moved) ui_post_mouse(cap, WM_MOUSEMOVE, x, y, keys);
         if (ldown) ui_post_mouse(cap, WM_LBUTTONDOWN, x, y, keys);
@@ -274,6 +519,7 @@ void ui_modal_end(void)
 {
     IN.modal_running = false;
     IN.modal_pid = 0;
+    IN.cur_key = 0;                             /* the shape for wherever it ended */
 }
 
 /* The next raw input event, translated, for a loop that owns the input
@@ -345,6 +591,7 @@ static void finish_size(struct wnd *w, RECT o)
     w->w = o.right - o.left;
     w->h = o.bottom - o.top;
     ui_invalidate_wnd(w);
+    ui_reflow(w);
     RECT c;
     GetClientRect(w, &c);
     SendMessage(w, WM_SIZE, 0, MAKELPARAM(c.right, c.bottom));
@@ -394,6 +641,7 @@ static void drag(struct wnd *w, bool size, int edges, int x, int y)
     RECT start;
     frame_outer(w, &start);
     ui_paint();
+    ui_set_cursor(size ? ui_edge_cursor(edges) : CURSOR_ARROW);
     IN.outline = start;
     ui_outline(true);
     for (;;) {
@@ -465,14 +713,17 @@ void ui_track_frame(struct wnd *w, int part, int x, int y)
     if (w->parent)
         return;
     ui_modal_begin();
-    switch (part) {
+    int given = part >> 8;                      /* edges from WM_NCHITTEST */
+    switch (part & 0xFF) {
     case HT_CAPTION:
         if (w->state == WS_STATE_NORMAL)
             drag(w, false, 0, x, y);
         break;
     case HT_BORDER: {
         int edges;
-        if (frame_hit(w, x, y, &edges) == HT_BORDER)
+        if (given && w->state == WS_STATE_NORMAL)
+            drag(w, true, given, x, y);
+        else if (frame_hit(w, x, y, &edges) == HT_BORDER)
             drag(w, true, edges, x, y);
         break;
     }

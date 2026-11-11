@@ -29,6 +29,15 @@ void     OutputDebugString(const char *s);
 void     DebugLog(const char *fmt, ...);        /* %s %d %u %x %c */
 uint32_t GetTickCount(void);                    /* milliseconds since boot */
 void     Sleep(uint32_t ms);                    /* 0: give up the time slice */
+bool     Beep(unsigned freq, unsigned ms);      /* the PC speaker; returns at once */
+
+/* INI files ("[section]", "key=value"), as in Win32; names in any case */
+int      GetPrivateProfileString(const char *section, const char *key, const char *def, char *out, int size,
+                                 const char *file);    /* key NULL: the keys, NUL-separated */
+int      GetPrivateProfileInt(const char *section, const char *key, int def, const char *file);
+int      GetPrivateProfileSection(const char *section, char *out, int size, const char *file);  /* k=v\0...\0 */
+bool     WritePrivateProfileString(const char *section, const char *key, const char *value,
+                                   const char *file);  /* value NULL: remove; key NULL: the section */
 const struct user_info *GetStartupInfo(void);
 int      StartDosSession(void);                 /* -> VM number, or -1 */
 
@@ -114,6 +123,15 @@ uint32_t GetTimeZoneInformation(TIME_ZONE_INFORMATION *tz);
 bool     SetTimeZoneInformation(const TIME_ZONE_INFORMATION *tz);
 bool     SetFileAttributes(const char *path, uint32_t attributes);
 uint32_t GetFullPathName(const char *path, uint32_t size, char *buf, char **file_part);
+#define DRIVE_UNKNOWN       0
+#define DRIVE_NO_ROOT_DIR   1
+#define DRIVE_REMOVABLE     2
+#define DRIVE_FIXED         3
+#define DRIVE_REMOTE        4
+uint32_t GetLogicalDrives(void);                        /* bit 0 = A: */
+unsigned GetDriveType(const char *root);                /* "C:\\" -> DRIVE_* */
+bool     GetVolumeInformation(const char *root, char *label, uint32_t label_size, uint32_t *serial,
+                              uint32_t *max_component, uint32_t *flags, char *fs_name, uint32_t fs_size);
 bool     GetDiskFreeSpace(const char *root, uint32_t *sectors_per_cluster, uint32_t *bytes_per_sector,
                           uint32_t *free_clusters, uint32_t *total_clusters);
 bool     CopyFile(const char *from, const char *to, bool fail_if_exists);
@@ -260,6 +278,7 @@ bool     HasMouse(void);
 typedef struct wnd  *HWND;
 typedef struct dc   *HDC;
 typedef struct menu *HMENU;
+typedef struct { int width, height; const uint8_t *pixels; } BITMAPIMAGE;  /* 1 byte/pixel, FFh clear */
 typedef struct accel_table *HACCEL;
 typedef uint32_t     WPARAM;
 typedef int32_t      LPARAM;
@@ -276,6 +295,20 @@ static inline bool PtInRect(const RECT *r, int x, int y)
     return x >= r->left && y >= r->top && x < r->right && y < r->bottom;
 }
 
+/* Cursors: the stock shapes (IDC_*); LoadCursor(NULL, IDC_...) gives the
+ * handle. */
+typedef int HCURSOR;
+#define IDC_ARROW       32512
+#define IDC_IBEAM       32513
+#define IDC_WAIT        32514
+#define IDC_CROSS       32515
+#define IDC_SIZENWSE    32642
+#define IDC_SIZENESW    32643
+#define IDC_SIZEWE      32644
+#define IDC_SIZENS      32645
+#define IDC_SIZEALL     32646
+#define IDC_NO          32648
+
 typedef struct {
     const char *name;
     WNDPROC     proc;
@@ -283,6 +316,7 @@ typedef struct {
     int         extra;          /* bytes for GetWindowLong(hwnd, 0..), max 32 */
     uint8_t     background;     /* colour the client area is cleared to */
     int         icon;           /* ICON_* (SHELL.DLL's stock icons), for the taskbar */
+    HCURSOR     cursor;         /* over the client area (0: the arrow) */
 } WNDCLASS;
 
 #define LOWORD(l)        ((uint16_t)((uint32_t)(l) & 0xFFFF))
@@ -292,6 +326,13 @@ typedef struct {
 #define MAKELPARAM(l, h) ((LPARAM)MAKELONG(l, h))
 #define GET_X_LPARAM(l)  ((int)(int16_t)LOWORD(l))
 #define GET_Y_LPARAM(l)  ((int)(int16_t)HIWORD(l))
+
+/* RGB colours, as in Win32 (0x00BBGGRR) */
+typedef uint32_t COLORREF;
+#define RGB(r, g, b)     ((COLORREF)((uint8_t)(r) | ((uint32_t)(uint8_t)(g) << 8) | ((uint32_t)(uint8_t)(b) << 16)))
+#define GetRValue(c)     ((uint8_t)(c))
+#define GetGValue(c)     ((uint8_t)((c) >> 8))
+#define GetBValue(c)     ((uint8_t)((c) >> 16))
 
 /* Colours (theme palette indices) */
 enum {
@@ -351,10 +392,47 @@ enum {
 #define WM_HSCROLL          0x0114
 #define WM_INITMENU         0x0116  /* wParam = menu bar or system menu */
 #define WM_INITMENUPOPUP    0x0117  /* wParam = menu, lParam = MAKELPARAM(pos, system) */
+#define WM_MENUSELECT       0x011F  /* wParam = MAKEWPARAM(id or submenu position, MF_* flags; 0xFFFF:
+                                       closed), lParam = the menu */
 #define WM_VSCROLL          0x0115
 #define WM_COPYDATA         0x004A  /* lParam = COPYDATASTRUCT *: copied across processes */
 #define WM_NCLBUTTONDOWN    0x00A1  /* wParam = HT* part, lParam = screen x,y */
 #define WM_NCLBUTTONDBLCLK  0x00A3
+#define WM_NCHITTEST        0x0084  /* lParam = screen x,y -> HT*: what part of the window it is */
+#define WM_DRAWITEM         0x002B  /* owner-drawn control or menu item: lParam = DRAWITEMSTRUCT * */
+#define WM_MEASUREITEM      0x002C  /* ... its size asked: lParam = MEASUREITEMSTRUCT * */
+#define WM_CTLCOLORMSGBOX   0x0132  /* wParam = HDC, lParam = the control: SetTextColor on the */
+#define WM_CTLCOLOREDIT     0x0133  /* DC picks the text's colour, returning CTLCOLOR_BG(c) the */
+#define WM_CTLCOLORLISTBOX  0x0134  /* background's; 0: the usual ones */
+#define WM_CTLCOLORBTN      0x0135
+#define WM_CTLCOLORDLG      0x0136
+#define WM_CTLCOLORSCROLLBAR 0x0137
+#define WM_CTLCOLORSTATIC   0x0138
+#define CTLCOLOR_BG(c)      ((LRESULT)(0x100 | (uint8_t)(c)))
+
+/* WM_NCHITTEST results (DefWindowProc: HTCLIENT). A window may answer
+ * HTCAPTION for part of its client area (dragging there moves it), a
+ * border code (sizes it), HTTRANSPARENT (the parent gets the mouse) or
+ * HTNOWHERE (nobody does). */
+#define HTERROR             (-2)
+#define HTTRANSPARENT       (-1)
+#define HTNOWHERE           0
+#define HTCLIENT            1
+#define HTCAPTION           2
+#define HTSYSMENU           3
+#define HTMENU              5
+#define HTMINBUTTON         8
+#define HTMAXBUTTON         9
+#define HTLEFT              10
+#define HTRIGHT             11
+#define HTTOP               12
+#define HTTOPLEFT           13
+#define HTTOPRIGHT          14
+#define HTBOTTOM            15
+#define HTBOTTOMLEFT        16
+#define HTBOTTOMRIGHT       17
+#define HTBORDER            18
+#define HTCLOSE             20
 #define WM_SHELLHOOK        0x0380  /* to the shell hook window: wParam HSHELL_*, lParam HWND */
 #define WM_MOUSEMOVE        0x0200
 #define WM_LBUTTONDOWN      0x0201
@@ -373,6 +451,8 @@ enum {
 #define WA_ACTIVE           1
 #define MK_LBUTTON          0x0001
 #define MK_RBUTTON          0x0002
+#define MK_SHIFT            0x0004
+#define MK_CONTROL          0x0008
 
 /* WM_SYSCOMMAND */
 #define SC_SIZE             0xF000
@@ -392,7 +472,10 @@ enum {
 #define MF_GRAYED           0x0001
 #define MF_DISABLED         0x0002
 #define MF_CHECKED          0x0008
+#define MF_BITMAP           0x0004  /* text is a BITMAPIMAGE *: the item is a picture */
 #define MF_POPUP            0x0010  /* id is the submenu's HMENU */
+#define MF_OWNERDRAW        0x0100  /* the owner draws it; text is its value (WM_DRAWITEM itemData) */
+#define MF_SYSMENU          0x2000  /* (WM_MENUSELECT) in the system menu */
 #define MFT_RADIOCHECK      0x0200  /* checked shows a dot, not a tick */
 #define MF_BYPOSITION       0x0400
 #define MF_SEPARATOR        0x0800
@@ -427,6 +510,7 @@ enum {
 #define VK_UP       0x26
 #define VK_RIGHT    0x27
 #define VK_DOWN     0x28
+#define VK_INSERT   0x2D
 #define VK_DELETE   0x2E
 #define VK_F1       0x70
 #define VK_F4       0x73
@@ -459,15 +543,24 @@ enum {
 #define BS_CHECKBOX         0x2
 #define BS_AUTOCHECKBOX     0x3
 #define BS_RADIOBUTTON      0x4
+#define BS_3STATE           0x5     /* checked, unchecked or indeterminate (grey) */
+#define BS_AUTO3STATE       0x6
 #define BS_GROUPBOX         0x7
 #define BS_AUTORADIOBUTTON  0x9
+#define BS_OWNERDRAW        0xB     /* the parent draws it (WM_DRAWITEM) */
+#define BS_PUSHLIKE         0x1000  /* a check box or radio button that looks like a push button */
 #define BS_TYPEMASK         0xF
 #define BM_GETCHECK         0x00F0
 #define BM_SETCHECK         0x00F1
+#define BM_GETSTATE         0x00F2
+#define BM_SETSTATE         0x00F3  /* wp: shown pushed in */
 #define BM_CLICK            0x00F5
 #define BN_CLICKED          0
 #define BST_UNCHECKED       0
 #define BST_CHECKED         1
+#define BST_INDETERMINATE   2
+#define BST_PUSHED          4
+#define BST_FOCUS           8
 
 /* Edit */
 #define EM_GETSEL           0x00B0  /* -> MAKELONG(start, end); also *(int *)wp, *(int *)lp */
@@ -482,23 +575,85 @@ enum {
 #define EM_CANUNDO          0x00C6
 #define EM_UNDO             0x00C7
 #define EM_LINEFROMCHAR     0x00C9  /* wp = character (-1: the caret) -> its line */
+#define EM_EMPTYUNDOBUFFER  0x00CD
+#define EM_REDO             (WM_USER + 84)   /* (RichEdit's) step forward again: Ctrl+Y */
+#define EM_CANREDO          (WM_USER + 85)
 #define ES_MULTILINE        0x0004  /* lines (Enter starts one), tabs, scrolling */
 #define ES_AUTOHSCROLL      0x0080  /* (multi-line) scroll sideways; without it or
                                        WS_HSCROLL, words wrap at the width */
+#define ES_UPPERCASE        0x0008
+#define ES_LOWERCASE        0x0010
+#define ES_PASSWORD         0x0020  /* shows stars; won't copy */
+#define ES_NOHIDESEL        0x0100  /* the selection shows without the focus */
 #define ES_READONLY         0x0800
+#define ES_NUMBER           0x2000  /* digits only */
+#define EM_SETREADONLY      0x00CF
+#define EM_GETLIMITTEXT     0x00D5
 #define EN_CHANGE           0x0300
 
-/* List box */
+/* Static: text (wrapped at spaces unless SS_LEFTNOWORDWRAP/SS_SIMPLE; '&'
+ * underlines the next character) or a shape. */
+#define SS_LEFT             0x00
+#define SS_CENTER           0x01
+#define SS_RIGHT            0x02
+#define SS_BLACKRECT        0x04
+#define SS_GRAYRECT         0x05
+#define SS_WHITERECT        0x06
+#define SS_BLACKFRAME       0x07
+#define SS_GRAYFRAME        0x08
+#define SS_WHITEFRAME       0x09
+#define SS_SIMPLE           0x0B
+#define SS_LEFTNOWORDWRAP   0x0C
+#define SS_OWNERDRAW        0x0D
+#define SS_ETCHEDHORZ       0x10
+#define SS_ETCHEDVERT       0x11
+#define SS_ETCHEDFRAME      0x12
+#define SS_TYPEMASK         0x1F
+#define SS_NOPREFIX         0x80
+#define SS_CENTERIMAGE      0x200   /* centred vertically (one line) */
+#define SS_SUNKEN           0x1000
+#define SS_ENDELLIPSIS      0x4000
+
+/* List box. Items keep a string (copied into the owner's heap) and a value. */
 #define LBS_NOTIFY          0x0001
-#define LB_ADDSTRING        0x0180
+#define LBS_SORT            0x0002
+#define LBS_MULTIPLESEL     0x0008  /* a click toggles an item */
+#define LBS_OWNERDRAWFIXED  0x0010  /* the parent draws the rows (WM_DRAWITEM) */
+#define LBS_HASSTRINGS      0x0040  /* (owner-drawn) strings kept all the same */
+#define LBS_EXTENDEDSEL     0x0800  /* Shift: a range, Ctrl: one more */
+#define LB_ADDSTRING        0x0180  /* lp = text (owner-drawn without strings: the value) -> index */
+#define LB_INSERTSTRING     0x0181  /* wp = index (-1: the end) */
+#define LB_DELETESTRING     0x0182  /* -> items left */
+#define LB_SELITEMRANGEEX   0x0183
 #define LB_RESETCONTENT     0x0184
+#define LB_SETSEL           0x0185  /* (multi) wp = on?, lp = index (-1: all) */
 #define LB_SETCURSEL        0x0186
+#define LB_GETSEL           0x0187
 #define LB_GETCURSEL        0x0188
-#define LB_GETTEXT          0x0189
+#define LB_GETTEXT          0x0189  /* wp = index, lp = buffer (LB_GETTEXTLEN + 1) */
+#define LB_GETTEXTLEN       0x018A
 #define LB_GETCOUNT         0x018B
+#define LB_SELECTSTRING     0x018C  /* wp = start after, lp = prefix -> index */
+#define LB_GETTOPINDEX      0x018E
+#define LB_FINDSTRING       0x018F  /* wp = start after (-1: all), lp = prefix -> index */
+#define LB_GETSELCOUNT      0x0190
+#define LB_GETSELITEMS      0x0191  /* wp = room, lp = int[] -> how many */
+#define LB_SETTOPINDEX      0x0197
+#define LB_GETITEMRECT      0x0198
+#define LB_GETITEMDATA      0x0199
+#define LB_SETITEMDATA      0x019A
+#define LB_SELITEMRANGE     0x019B  /* wp = on?, lp = MAKELPARAM(first, last) */
+#define LB_SETCARETINDEX    0x019E
+#define LB_GETCARETINDEX    0x019F
+#define LB_SETITEMHEIGHT    0x01A0  /* lp = pixels */
+#define LB_GETITEMHEIGHT    0x01A1
+#define LB_FINDSTRINGEXACT  0x01A2
 #define LBN_SELCHANGE       1
 #define LBN_DBLCLK          2
+#define LBN_SETFOCUS        4
+#define LBN_KILLFOCUS       5
 #define LB_ERR              (-1)
+#define LB_ERRSPACE         (-2)
 
 /* Scroll bar */
 #define SBS_HORZ            0x0
@@ -521,9 +676,13 @@ enum {
 /* Combo box. The window's height is the closed box's (Windows counts the
  * list too); the list drops below it, sized to at most 8 rows. Item
  * strings are copied into the owning process's heap. CB_SHOWDROPDOWN 1
- * returns once the list has closed again (the list runs a modal loop). */
+ * returns at once; the list opens when the message loop next runs. */
 #define CBS_DROPDOWN        0x0002      /* an editable field and the arrow */
+#define CBS_SIMPLE          0x0001      /* a field with the list always shown below it */
 #define CBS_DROPDOWNLIST    0x0003      /* a box showing the selection and the arrow */
+#define CBS_OWNERDRAWFIXED  0x0010      /* the parent draws the items (WM_DRAWITEM) */
+#define CBS_SORT            0x0100
+#define CBS_NOAUTOCOMPLETE  0x8000      /* (OS1993) an editable box doesn't complete what's typed */
 #define CB_ADDSTRING        0x0143      /* lp = text -> index */
 #define CB_DELETESTRING     0x0144      /* wp = index -> items left */
 #define CB_GETCOUNT         0x0146
@@ -536,20 +695,34 @@ enum {
 #define CB_SETCURSEL        0x014E      /* wp = index (-1: none) */
 #define CB_SHOWDROPDOWN     0x014F      /* wp = 1 opens the list, 0 closes it */
 #define CB_GETDROPPEDSTATE  0x0157
+#define CB_GETEDITSEL       0x0140      /* as EM_GETSEL, the field's */
+#define CB_LIMITTEXT        0x0141
+#define CB_SETEDITSEL       0x0142      /* lp = MAKELPARAM(start, end) */
+#define CB_SELECTSTRING     0x014D      /* wp = start after, lp = prefix -> index (selected) */
+#define CB_GETITEMDATA      0x0150
+#define CB_SETITEMDATA      0x0151      /* wp = index, lp = value */
 #define CB_FINDSTRINGEXACT  0x0158      /* as CB_FINDSTRING, the whole text (any case) */
 #define CBN_SELCHANGE       1
+#define CBN_DBLCLK          2           /* CBS_SIMPLE */
+#define CBN_SELENDOK        9           /* the list closed with a choice */
+#define CBN_SELENDCANCEL    10          /* ... without one */
 #define CBN_EDITCHANGE      5           /* CBS_DROPDOWN: the text was typed */
 #define CBN_DROPDOWN        7
 #define CBN_CLOSEUP         8
 #define CB_ERR              (-1)
 
 /* Tab control. Tabs along the top; the program shows the page itself
- * (on TCN_SELCHANGE: hide one set of controls, show another). Windows
- * notifies with WM_NOTIFY, which OS1993 doesn't have: here it is
- * WM_COMMAND with HIWORD(wParam) = TCN_* and lParam = the tab control;
- * returning nonzero to TCN_SELCHANGING keeps the current tab. TCIF_TEXT
- * and TCIF_PARAM are the item fields there are; texts keep 31 characters. */
+ * (on TCN_SELCHANGE: hide one set of controls, show another). It notifies
+ * with WM_NOTIFY (NMHDR code TCN_*) and then, as it did before WM_NOTIFY,
+ * with WM_COMMAND (HIWORD(wParam) = TCN_*, lParam = the tab control);
+ * nonzero from either to TCN_SELCHANGING keeps the current tab. Texts
+ * keep 31 characters. TCS_MULTILINE wraps tabs that don't fit onto more
+ * rows; otherwise arrows scroll them. Ctrl+Tab in a dialog goes to the
+ * next tab. */
+#define TCS_MULTILINE       0x0200
 #define TCM_FIRST           0x1300
+#define TCM_GETIMAGELIST    (TCM_FIRST + 2)
+#define TCM_SETIMAGELIST    (TCM_FIRST + 3)     /* lp = HIMAGELIST -> the old one */
 #define TCM_GETITEMCOUNT    (TCM_FIRST + 4)
 #define TCM_GETITEM         (TCM_FIRST + 5)     /* wp = index, lp = TCITEM * */
 #define TCM_SETITEM         (TCM_FIRST + 6)
@@ -560,9 +733,11 @@ enum {
 #define TCM_GETCURSEL       (TCM_FIRST + 11)
 #define TCM_SETCURSEL       (TCM_FIRST + 12)    /* no notification -> the previous one */
 #define TCM_ADJUSTRECT      (TCM_FIRST + 40)    /* lp = RECT *; wp 0: window -> page, 1: back */
+#define TCM_GETROWCOUNT     (TCM_FIRST + 44)
 #define TCM_GETCURFOCUS     (TCM_FIRST + 47)
 #define TCM_SETCURFOCUS     (TCM_FIRST + 48)    /* as a click: notifies */
 #define TCIF_TEXT           0x0001
+#define TCIF_IMAGE          0x0002
 #define TCIF_PARAM          0x0008
 #define TCN_SELCHANGE       0xFDD9      /* Windows' -551, as a 16-bit WM_COMMAND code */
 #define TCN_SELCHANGING     0xFDD8      /* -552 */
@@ -571,7 +746,7 @@ typedef struct {
     unsigned    dwState, dwStateMask;   /* (unused) */
     char       *pszText;
     int         cchTextMax;             /* TCM_GETITEM: the buffer's size */
-    int         iImage;                 /* (unused) */
+    int         iImage;                 /* TCIF_IMAGE: in the image list (-1 none) */
     LPARAM      lParam;
 } TCITEM;
 
@@ -586,18 +761,396 @@ typedef struct {
 #define UDS_AUTOBUDDY       0x0010      /* the buddy is the sibling created before it */
 #define UDS_ARROWKEYS       0x0020      /* Up/Down in the buddy step it */
 #define UDS_HORZ            0x0040      /* arrows side by side */
+#define UDS_NOTHOUSANDS     0x0080      /* no "," every three digits */
 #define UDM_SETRANGE        (WM_USER + 101)     /* lp = MAKELPARAM(max, min) */
 #define UDM_GETRANGE        (WM_USER + 102)     /* -> MAKELONG(max, min) */
 #define UDM_SETPOS          (WM_USER + 103)     /* lp = position -> the old one */
 #define UDM_GETPOS          (WM_USER + 104)     /* -> MAKELONG(position, error) */
 #define UDM_SETBUDDY        (WM_USER + 105)     /* wp = HWND -> the old buddy */
 #define UDM_GETBUDDY        (WM_USER + 106)
+#define UDM_SETACCEL        (WM_USER + 107)     /* wp = count, lp = UDACCEL[] */
+#define UDM_GETACCEL        (WM_USER + 108)
+#define UDM_SETBASE         (WM_USER + 109)     /* wp = 10 or 16 */
+#define UDM_GETBASE         (WM_USER + 110)
+#define UDM_SETRANGE32      (WM_USER + 111)     /* wp = min, lp = max */
+#define UDM_GETRANGE32      (WM_USER + 112)     /* wp, lp = int * */
+#define UDM_SETPOS32        (WM_USER + 113)     /* lp = position */
+#define UDM_GETPOS32        (WM_USER + 114)     /* lp = int * (error) -> position */
+#define UDN_DELTAPOS        (-722)              /* WM_NOTIFY, NMUPDOWN: nonzero stops the step */
+typedef struct { unsigned nSec, nInc; } UDACCEL;
+
+/* WM_NOTIFY: a control tells its parent something, lParam = NMHDR * (or a
+ * bigger structure starting with one), wParam = its id. The pointer is the
+ * control's process's memory: the parent must be in the same process (as
+ * a dialog's controls always are). */
+#define WM_NOTIFY           0x004E
+typedef struct { int x, y; } POINT;
+typedef struct { HWND hwndFrom; unsigned idFrom; int code; } NMHDR;
+typedef struct { NMHDR hdr; int iPos, iDelta; } NMUPDOWN;
+#define NM_CLICK            (-2)
+#define NM_DBLCLK           (-3)
+#define NM_RETURN           (-4)
+#define NM_RCLICK           (-5)
+#define NM_SETFOCUS         (-7)
+#define NM_KILLFOCUS        (-8)
+
+/* Common control placement: status bars and toolbars put themselves along
+ * the parent's bottom / top edge (on creation and on WM_SIZE, which the
+ * parent passes on) unless CCS_NOPARENTALIGN. */
+#define CCS_NOPARENTALIGN   0x0008
+
+/* Status bar: sunken parts with a line of text each. SB_SETTEXT's wParam
+ * is the part | SBT_*; a text starting "\t" is centred, "\t\t" right-aligned. */
+#define STATUSCLASSNAME     "msctls_statusbar32"
+#define SBARS_SIZEGRIP      0x0100      /* a grip in the corner sizes the window */
+#define SB_SETTEXT          (WM_USER + 1)   /* wp = part | SBT_*, lp = text */
+#define SB_GETTEXT          (WM_USER + 2)   /* wp = part, lp = buffer -> MAKELONG(len, SBT_*) */
+#define SB_GETTEXTLENGTH    (WM_USER + 3)
+#define SB_SETPARTS         (WM_USER + 4)   /* wp = count, lp = int[] right edges (-1: the end) */
+#define SB_GETPARTS         (WM_USER + 6)
+#define SB_GETRECT          (WM_USER + 10)
+#define SB_SIMPLE           (WM_USER + 9)   /* wp: one part across (menu help) */
+#define SB_ISSIMPLE         (WM_USER + 14)
+#define SB_SIMPLEID         0xFF            /* SB_SETTEXT's part for the simple text */
+#define SBT_OWNERDRAW       0x1000          /* lp is the value for WM_DRAWITEM */
+#define SBT_NOBORDERS       0x0100
+#define SBT_POPOUT          0x0200
+HWND    CreateStatusWindow(unsigned style, const char *text, HWND parent, int id);
+
+/* Toolbar: picture buttons from an image list (TB_SETIMAGELIST) across
+ * the top; a click sends the parent WM_COMMAND with the button's id. */
+#define TOOLBARCLASSNAME    "ToolbarWindow32"
+#define TBSTYLE_BUTTON      0x00
+#define TBSTYLE_SEP         0x01
+#define TBSTYLE_CHECK       0x02        /* stays in until clicked again */
+#define TBSTYLE_GROUP       0x04
+#define TBSTYLE_CHECKGROUP  (TBSTYLE_GROUP | TBSTYLE_CHECK)   /* one of its neighbours */
+#define TBSTYLE_TOOLTIPS    0x0100      /* (window style) tooltips from iString */
+#define TBSTYLE_FLAT        0x0800      /* (window style) flat until pointed at */
+#define TBSTATE_CHECKED     0x01
+#define TBSTATE_PRESSED     0x02
+#define TBSTATE_ENABLED     0x04
+#define TBSTATE_HIDDEN      0x08
+typedef struct {
+    int      iBitmap;                   /* image list index (-1 none) */
+    int      idCommand;
+    uint8_t  fsState, fsStyle;
+    uint32_t dwData;
+    intptr_t iString;                   /* the tooltip: a char * (or 0) */
+} TBBUTTON;
+#define TB_ENABLEBUTTON     (WM_USER + 1)   /* wp = id, lp = MAKELONG(on, 0) */
+#define TB_CHECKBUTTON      (WM_USER + 2)
+#define TB_PRESSBUTTON      (WM_USER + 3)
+#define TB_HIDEBUTTON       (WM_USER + 4)
+#define TB_ISBUTTONENABLED  (WM_USER + 9)
+#define TB_ISBUTTONCHECKED  (WM_USER + 10)
+#define TB_ISBUTTONPRESSED  (WM_USER + 11)
+#define TB_ISBUTTONHIDDEN   (WM_USER + 12)
+#define TB_SETSTATE         (WM_USER + 17)
+#define TB_GETSTATE         (WM_USER + 18)
+#define TB_ADDBUTTONS       (WM_USER + 20)  /* wp = count, lp = TBBUTTON[] */
+#define TB_INSERTBUTTON     (WM_USER + 21)  /* wp = index, lp = TBBUTTON * */
+#define TB_DELETEBUTTON     (WM_USER + 22)
+#define TB_BUTTONCOUNT      (WM_USER + 24)
+#define TB_GETITEMRECT      (WM_USER + 29)
+#define TB_SETBUTTONSIZE    (WM_USER + 31)  /* lp = MAKELONG(w, h) */
+#define TB_AUTOSIZE         (WM_USER + 33)
+#define TB_GETTOOLTIPS      (WM_USER + 35)
+#define TB_SETIMAGELIST     (WM_USER + 48)  /* lp = HIMAGELIST -> the old one */
+
+/* Tooltips: a tool is part of a window (rect, in its client coordinates)
+ * or all of it (TTF_IDISHWND, uId = the HWND). The text shows by the
+ * pointer when it rests on the tool. */
+#define TOOLTIPS_CLASS      "tooltips_class32"
+#define TTF_IDISHWND        0x0001
+#define TTF_SUBCLASS        0x0010      /* (not needed: tooltips watch the pointer themselves) */
+#define LPSTR_TEXTCALLBACK  ((char *)-1)    /* ask the window: TTN_GETDISPINFO */
+typedef struct {
+    unsigned cbSize, uFlags;
+    HWND     hwnd;
+    unsigned uId;
+    RECT     rect;
+    char    *lpszText;
+} TOOLINFO;
+typedef struct { NMHDR hdr; char *lpszText; char szText[80]; int hinst; unsigned uFlags; } NMTTDISPINFO;
+#define TTN_GETDISPINFO     (-520)
+#define TTM_ACTIVATE        (WM_USER + 1)   /* wp: on */
+#define TTM_NEWTOOLRECT     (WM_USER + 6)
+#define TTM_RELAYEVENT      (WM_USER + 7)
+#define TTM_SETTOOLINFO     (WM_USER + 9)
+#define TTM_GETTOOLCOUNT    (WM_USER + 13)
+#define TTM_POP             (WM_USER + 28)
+#define TTM_ADDTOOL         (WM_USER + 50)  /* lp = TOOLINFO * */
+#define TTM_DELTOOL         (WM_USER + 51)
+#define TTM_UPDATETIPTEXT   (WM_USER + 57)
+bool    ScreenToClient(HWND hwnd, POINT *pt);
+bool    ClientToScreen(HWND hwnd, POINT *pt);
+HWND    WindowFromPoint(POINT pt);          /* the deepest visible window there */
+
+/* Image lists: pictures of one size (16x16 small icons, 32x32 large ones)
+ * for tree and list views, one byte per pixel in the theme's colours, FFh
+ * transparent. In the process's own heap. SHELL.DLL's ImageList_AddIcon
+ * adds a stock icon. */
+typedef struct imagelist *HIMAGELIST;
+#define ILD_NORMAL          0x0000
+#define ILD_SELECTED        0x0004      /* blended with the selection colour */
+#define ILD_DISABLED        0x0100      /* grey, embossed (a disabled button's) */
+#define ILD_BLEND25         0x0002      /* faded with white (cut items) */
+HIMAGELIST ImageList_Create(int cx, int cy, unsigned flags, int initial, int grow);
+bool       ImageList_Destroy(HIMAGELIST il);
+int        ImageList_AddPixels(HIMAGELIST il, const uint8_t *pixels);   /* cx * cy bytes -> index */
+int        ImageList_GetImageCount(HIMAGELIST il);
+bool       ImageList_GetIconSize(HIMAGELIST il, int *cx, int *cy);
+bool       ImageList_Draw(HIMAGELIST il, int i, HDC dc, int x, int y, unsigned style);
+
+/* Tree view: items under items, expanded and collapsed with the +/- boxes
+ * (TVS_HASBUTTONS), joined by dotted lines (TVS_HASLINES), each with an
+ * image and a selected image from its image list. Items live in the
+ * owning process's heap; an HTREEITEM is a pointer to one. cChildren = 1
+ * gives an item a + box before it has children: the program fills them in
+ * when it hears TVN_ITEMEXPANDING (nonzero keeps it collapsed). Keys: the
+ * arrows (Left closes or goes up, Right opens or goes down), Home, End,
+ * PgUp, PgDn, Enter (NM_RETURN), '+', '-', '*' (all below), and a letter
+ * goes to the next item starting with it. */
+#define WC_TREEVIEW         "SysTreeView32"
+#define TVS_HASBUTTONS      0x0001
+#define TVS_HASLINES        0x0002
+#define TVS_LINESATROOT     0x0004
+#define TVS_SHOWSELALWAYS   0x0020      /* the selection stays (grey) without the focus */
+#define TVS_EDITLABELS      0x0008      /* F2 (or TVM_EDITLABEL) edits a label in place */
+#define TVS_CHECKBOXES      0x0100      /* a check box before each item: state image 1 / 2 */
+typedef struct tree_item *HTREEITEM;
+#define TVI_ROOT            ((HTREEITEM)(uintptr_t)0xFFFF0000u)
+#define TVI_FIRST           ((HTREEITEM)(uintptr_t)0xFFFF0001u)
+#define TVI_LAST            ((HTREEITEM)(uintptr_t)0xFFFF0002u)
+#define TVI_SORT            ((HTREEITEM)(uintptr_t)0xFFFF0003u)
+#define TVIF_TEXT           0x0001
+#define TVIF_IMAGE          0x0002
+#define TVIF_PARAM          0x0004
+#define TVIF_STATE          0x0008
+#define TVIF_HANDLE         0x0010
+#define TVIF_SELECTEDIMAGE  0x0020
+#define TVIF_CHILDREN       0x0040
+#define TVIS_SELECTED       0x0002
+#define TVIS_BOLD           0x0010
+#define TVIS_EXPANDED       0x0020
+#define TVIS_DROPHILITED    0x0008      /* a drop target under a drag (TVGN_DROPHILITE) */
+#define TVIS_STATEIMAGEMASK 0xF000
+typedef struct {
+    unsigned  mask;                     /* TVIF_* */
+    HTREEITEM hItem;
+    unsigned  state, stateMask;         /* TVIS_* */
+    char     *pszText;
+    int       cchTextMax;               /* TVM_GETITEM: the buffer's size */
+    int       iImage, iSelectedImage;
+    int       cChildren;                /* 1: it has (or will have) children */
+    LPARAM    lParam;
+} TVITEM;
+typedef struct { HTREEITEM hParent, hInsertAfter; TVITEM item; } TVINSERTSTRUCT;
+typedef struct { POINT pt; unsigned flags; HTREEITEM hItem; } TVHITTESTINFO;
+#define TVHT_NOWHERE        0x0001
+#define TVHT_ONITEMICON     0x0002
+#define TVHT_ONITEMLABEL    0x0004
+#define TVHT_ONITEM         (TVHT_ONITEMICON | TVHT_ONITEMLABEL)
+#define TVHT_ONITEMINDENT   0x0008
+#define TVHT_ONITEMBUTTON   0x0010
+#define TVHT_ONITEMSTATEICON 0x0040
+#define TV_FIRST            0x1100
+#define TVM_INSERTITEM      (TV_FIRST + 0)      /* lp = TVINSERTSTRUCT * -> HTREEITEM */
+#define TVM_DELETEITEM      (TV_FIRST + 1)      /* lp = item (TVI_ROOT: all), with its children */
+#define TVM_EXPAND          (TV_FIRST + 2)      /* wp = TVE_*, lp = item */
+#define TVM_GETITEMRECT     (TV_FIRST + 4)      /* wp = text only, lp = RECT * holding the item */
+#define TVM_GETCOUNT        (TV_FIRST + 5)
+#define TVM_GETIMAGELIST    (TV_FIRST + 8)
+#define TVM_SETIMAGELIST    (TV_FIRST + 9)      /* lp = HIMAGELIST -> the old one */
+#define TVM_GETNEXTITEM     (TV_FIRST + 10)     /* wp = TVGN_*, lp = item */
+#define TVM_SELECTITEM      (TV_FIRST + 11)     /* wp = TVGN_CARET, lp = item (NULL: none) */
+#define TVM_GETITEM         (TV_FIRST + 12)     /* lp = TVITEM * (hItem set) */
+#define TVM_SETITEM         (TV_FIRST + 13)
+#define TVM_HITTEST         (TV_FIRST + 17)     /* lp = TVHITTESTINFO * -> item */
+#define TVM_SORTCHILDREN    (TV_FIRST + 19)     /* lp = item: by text, any case */
+#define TVM_ENSUREVISIBLE   (TV_FIRST + 20)     /* lp = item: its parents opened, scrolled to */
+#define TVM_EDITLABEL       (TV_FIRST + 14)     /* lp = item -> the edit control */
+#define TVM_ENDEDITLABELNOW (TV_FIRST + 22)     /* wp = cancel */
+#define TVM_GETITEMSTATE    (TV_FIRST + 39)     /* wp = item, lp = mask */
+#define TreeView_GetCheckState(h, it) ((((unsigned)SendMessage((h), TVM_GETITEMSTATE, (WPARAM)(it), TVIS_STATEIMAGEMASK)) >> 12) == 2)
+#define TVE_COLLAPSE        0x0001
+#define TVE_EXPAND          0x0002
+#define TVE_TOGGLE          0x0003
+#define TVE_COLLAPSERESET   0x8000              /* ... and its children deleted */
+#define TVGN_ROOT           0x0000
+#define TVGN_NEXT           0x0001
+#define TVGN_PREVIOUS       0x0002
+#define TVGN_PARENT         0x0003
+#define TVGN_CHILD          0x0004
+#define TVGN_FIRSTVISIBLE   0x0005
+#define TVGN_NEXTVISIBLE    0x0006
+#define TVGN_PREVIOUSVISIBLE 0x0007
+#define TVGN_CARET          0x0009
+#define TVGN_DROPHILITE     0x0008      /* (TVM_SELECTITEM) the drop target, NULL: none */
+#define TVC_UNKNOWN         0x0000
+#define TVC_BYMOUSE         0x0001
+#define TVC_BYKEYBOARD      0x0002
+#define TVN_SELCHANGING     (-401)      /* nonzero keeps the old selection */
+#define TVN_SELCHANGED      (-402)
+#define TVN_ITEMEXPANDING   (-405)      /* nonzero: it doesn't open (or close) */
+#define TVN_ITEMEXPANDED    (-406)
+#define TVN_DELETEITEM      (-409)      /* itemOld: the item going (its lParam to free) */
+#define TVN_KEYDOWN         (-412)
+#define TVN_BEGINDRAG       (-407)      /* NMTREEVIEW itemNew, ptDrag: an item dragged */
+#define TVN_BEGINLABELEDIT  (-410)      /* NMTVDISPINFO; nonzero: no editing */
+#define TVN_ENDLABELEDIT    (-411)      /* NMTVDISPINFO, item.pszText NULL if cancelled; nonzero keeps it */
+typedef struct {
+    NMHDR    hdr;
+    unsigned action;                    /* TVC_*, or TVE_* for expanding */
+    TVITEM   itemOld, itemNew;          /* hItem, state, lParam filled */
+    POINT    ptDrag;
+} NMTREEVIEW;
+typedef struct { NMHDR hdr; TVITEM item; } NMTVDISPINFO;
+#define HTREEITEM_OF(nm) (((NMTREEVIEW *)(nm))->itemNew.hItem)
+
+/* List view: items with an image, a label and sub-items, shown four ways
+ * (the LVS_TYPEMASK part of the style, changed with SetWindowLong or
+ * LVM_SETVIEW): large icons in a grid, labels wrapped below; small icons
+ * in rows; a list in columns, scrolled sideways; and details, a row each
+ * under column headers (click: LVN_COLUMNCLICK; drag an edge to resize).
+ * Several items may be selected (Ctrl, Shift) unless LVS_SINGLESEL. Keys:
+ * the arrows in the view's directions, Home, End, PgUp, PgDn, Space,
+ * Enter (NM_RETURN, LVN_ITEMACTIVATE), F2 edits the label (LVS_EDITLABELS:
+ * LVN_BEGINLABELEDIT, then LVN_ENDLABELEDIT with the new text, nonzero
+ * keeps it), a letter goes to the next label starting with it; every key
+ * is offered as LVN_KEYDOWN first. */
+#define WC_LISTVIEW         "SysListView32"
+#define LVS_ICON            0x0000
+#define LVS_REPORT          0x0001
+#define LVS_SMALLICON       0x0002
+#define LVS_LIST            0x0003
+#define LVS_TYPEMASK        0x0003
+#define LVS_SINGLESEL       0x0004
+#define LVS_SHOWSELALWAYS   0x0008
+#define LVS_EDITLABELS      0x0200
+#define LVS_OWNERDATA       0x1000  /* a virtual list: LVM_SETITEMCOUNT, texts from LVN_GETDISPINFO */
+#define LVS_NOCOLUMNHEADER  0x4000
+#define LV_VIEW_ICON        0
+#define LV_VIEW_DETAILS     1
+#define LV_VIEW_SMALLICON   2
+#define LV_VIEW_LIST        3
+#define LVIF_TEXT           0x0001
+#define LVIF_IMAGE          0x0002
+#define LVIF_PARAM          0x0004
+#define LVIF_STATE          0x0008
+#define LVIS_FOCUSED        0x0001
+#define LVIS_SELECTED       0x0002
+#define LVIS_CUT            0x0004  /* drawn faded (cut, waiting to be pasted) */
+#define LVIS_DROPHILITED    0x0008  /* a drop target under a drag */
+#define LVIS_STATEIMAGEMASK 0xF000  /* LVS_EX_CHECKBOXES: 1 unchecked, 2 checked */
+#define INDEXTOSTATEIMAGEMASK(i) ((unsigned)(i) << 12)
+#define LVHT_ONITEMSTATEICON 0x0008
+#define LVCFMT_JUSTIFYMASK  0x0003
+#define LVCFMT_SORTDOWN     0x0200  /* an arrow in the header (as the header's HDF_SORT*) */
+#define LVCFMT_SORTUP       0x0400
+#define LVS_EX_GRIDLINES    0x0001
+#define LVS_EX_CHECKBOXES   0x0004
+#define LVS_EX_FULLROWSELECT 0x0020
+#define LVNI_ALL            0x0000
+#define LVNI_FOCUSED        0x0001
+#define LVNI_SELECTED       0x0002
+#define LVSIL_NORMAL        0
+#define LVSIL_SMALL         1
+#define LVCF_FMT            0x0001
+#define LVCF_WIDTH          0x0002
+#define LVCF_TEXT           0x0004
+#define LVCF_SUBITEM        0x0008
+#define LVCFMT_LEFT         0
+#define LVCFMT_RIGHT        1
+#define LVCFMT_CENTER       2
+#define LVIR_BOUNDS         0
+#define LVIR_ICON           1
+#define LVIR_LABEL          2
+#define LVHT_NOWHERE        0x0001
+#define LVHT_ONITEMICON     0x0002
+#define LVHT_ONITEMLABEL    0x0004
+#define LVHT_ONITEM         (LVHT_ONITEMICON | LVHT_ONITEMLABEL)
+typedef struct {
+    unsigned mask;                      /* LVIF_* */
+    int      iItem, iSubItem;
+    unsigned state, stateMask;          /* LVIS_* */
+    char    *pszText;
+    int      cchTextMax;
+    int      iImage;
+    LPARAM   lParam;
+} LVITEM;
+typedef struct {
+    unsigned mask;                      /* LVCF_* */
+    int      fmt;                       /* LVCFMT_* */
+    int      cx;
+    char    *pszText;
+    int      cchTextMax;
+    int      iSubItem;
+} LVCOLUMN;
+typedef struct { POINT pt; unsigned flags; int iItem, iSubItem; } LVHITTESTINFO;
+typedef int (*PFNLVCOMPARE)(LPARAM a, LPARAM b, LPARAM sort);
+#define LVM_FIRST           0x1000
+#define LVM_GETIMAGELIST    (LVM_FIRST + 2)     /* wp = LVSIL_* */
+#define LVM_SETIMAGELIST    (LVM_FIRST + 3)     /* wp = LVSIL_*, lp = HIMAGELIST -> the old one */
+#define LVM_GETITEMCOUNT    (LVM_FIRST + 4)
+#define LVM_GETITEM         (LVM_FIRST + 5)     /* lp = LVITEM * (iItem, iSubItem set) */
+#define LVM_SETITEM         (LVM_FIRST + 6)
+#define LVM_INSERTITEM      (LVM_FIRST + 7)     /* lp = LVITEM * -> index */
+#define LVM_DELETEITEM      (LVM_FIRST + 8)     /* wp = index */
+#define LVM_DELETEALLITEMS  (LVM_FIRST + 9)
+#define LVM_GETNEXTITEM     (LVM_FIRST + 12)    /* wp = after (-1: from the start), lp = LVNI_* */
+#define LVM_GETITEMRECT     (LVM_FIRST + 14)    /* wp = index, lp = RECT * (left = LVIR_*) */
+#define LVM_HITTEST         (LVM_FIRST + 18)    /* lp = LVHITTESTINFO * -> index or -1 */
+#define LVM_ENSUREVISIBLE   (LVM_FIRST + 19)    /* wp = index */
+#define LVM_EDITLABEL       (LVM_FIRST + 23)    /* wp = index -> the edit control */
+#define LVM_GETCOLUMN       (LVM_FIRST + 25)    /* wp = index, lp = LVCOLUMN * */
+#define LVM_SETCOLUMN       (LVM_FIRST + 26)
+#define LVM_INSERTCOLUMN    (LVM_FIRST + 27)    /* wp = index, lp = LVCOLUMN * -> index */
+#define LVM_DELETECOLUMN    (LVM_FIRST + 28)
+#define LVM_GETCOLUMNWIDTH  (LVM_FIRST + 29)
+#define LVM_SETCOLUMNWIDTH  (LVM_FIRST + 30)    /* wp = index, lp = width */
+#define LVM_SETITEMSTATE    (LVM_FIRST + 43)    /* wp = index (-1: all), lp = LVITEM * (state, stateMask) */
+#define LVM_GETITEMSTATE    (LVM_FIRST + 44)    /* wp = index, lp = mask */
+#define LVM_GETITEMTEXT     (LVM_FIRST + 45)    /* wp = index, lp = LVITEM * (iSubItem, pszText, cchTextMax) */
+#define LVM_SETITEMTEXT     (LVM_FIRST + 46)    /* wp = index, lp = LVITEM * (iSubItem, pszText) */
+#define LVM_SORTITEMS       (LVM_FIRST + 48)    /* wp = sort, lp = PFNLVCOMPARE (lParams compared) */
+#define LVM_GETSELECTEDCOUNT (LVM_FIRST + 50)
+#define LVM_SETVIEW         (LVM_FIRST + 142)   /* wp = LV_VIEW_* */
+#define LVM_GETVIEW         (LVM_FIRST + 143)
+#define LVM_ARRANGE         (LVM_FIRST + 22)    /* icon views: back on the grid */
+#define LVM_SETITEMPOSITION (LVM_FIRST + 15)    /* wp = index, lp = MAKELPARAM(x, y): icon views */
+#define LVM_GETITEMPOSITION (LVM_FIRST + 16)    /* wp = index, lp = POINT * */
+#define LVM_SETITEMCOUNT    (LVM_FIRST + 47)    /* LVS_OWNERDATA: wp = how many */
+#define LVM_SETEXTENDEDLISTVIEWSTYLE (LVM_FIRST + 54)   /* wp = mask (0: all), lp = LVS_EX_* */
+#define LVM_GETEXTENDEDLISTVIEWSTYLE (LVM_FIRST + 55)
+#define LVN_BEGINDRAG       (-109)      /* NMLISTVIEW: items dragged; nonzero: the parent takes it over */
+#define LVN_GETDISPINFO     (-150)      /* LVS_OWNERDATA: NMLVDISPINFO, fill in item.pszText, iImage */
+#define ListView_GetCheckState(h, i) ((((unsigned)SendMessage((h), LVM_GETITEMSTATE, (i), LVIS_STATEIMAGEMASK)) >> 12) == 2)
+#define LVN_ITEMCHANGED     (-101)
+#define LVN_DELETEITEM      (-103)
+#define LVN_COLUMNCLICK     (-108)
+#define LVN_ITEMACTIVATE    (-114)
+#define LVN_KEYDOWN         (-155)      /* NMLVKEYDOWN */
+#define LVN_BEGINLABELEDIT  (-175)      /* NMLVDISPINFO; nonzero: no editing */
+#define LVN_ENDLABELEDIT    (-176)      /* NMLVDISPINFO, item.pszText NULL if cancelled; nonzero keeps it */
+typedef struct {
+    NMHDR    hdr;
+    int      iItem, iSubItem;
+    unsigned uNewState, uOldState, uChanged;
+    POINT    ptAction;
+    LPARAM   lParam;
+} NMLISTVIEW;
+typedef NMLISTVIEW NMITEMACTIVATE;
+typedef struct { NMHDR hdr; uint16_t wVKey; unsigned flags; } NMLVKEYDOWN;
+typedef struct { NMHDR hdr; LVITEM item; } NMLVDISPINFO;
 
 /* ShowWindow */
 #define SW_HIDE             0
 #define SW_SHOWNORMAL       1
 #define SW_SHOWMINIMIZED    2
 #define SW_SHOWMAXIMIZED    3
+#define SW_SHOWNOACTIVATE   4
 #define SW_SHOW             5
 #define SW_RESTORE          9
 #define SW_MINIMIZE         6
@@ -640,6 +1193,14 @@ HWND    GetParent(HWND hwnd);
 HWND    GetDlgItem(HWND parent, int id);
 int     GetDlgCtrlID(HWND hwnd);
 bool    MoveWindow(HWND hwnd, int x, int y, int w, int h, bool repaint);
+/* Anchors: a child keeps its distance from the parent's edges it is
+ * anchored to as the parent is resized (left and right: it stretches). */
+#define ANCHOR_LEFT         0x01
+#define ANCHOR_TOP          0x02
+#define ANCHOR_RIGHT        0x04
+#define ANCHOR_BOTTOM       0x08
+#define ANCHOR_ALL          0x0F
+bool    SetWindowAnchor(HWND hwnd, unsigned anchors);
 bool    ShowWindow(HWND hwnd, int cmd);
 bool    EnableWindow(HWND hwnd, bool enable);
 bool    IsWindowEnabled(HWND hwnd);
@@ -673,6 +1234,38 @@ bool    PostMessage(HWND hwnd, unsigned msg, WPARAM w, LPARAM l);
 void    PostQuitMessage(int code);
 LRESULT DefWindowProc(HWND hwnd, unsigned msg, WPARAM w, LPARAM l);
 LRESULT CallWindowProc(WNDPROC proc, HWND hwnd, unsigned msg, WPARAM w, LPARAM l);
+/* Dialog templates: a dialog and its controls from a table. The DLGPROC
+ * gets each message first and returns nonzero if it dealt with it; then
+ * WM_CLOSE means Cancel and an OK or Cancel it didn't take ends the dialog.
+ * WM_INITDIALOG (wParam = the first tab stop, lParam = init) comes once
+ * the controls exist; nonzero gives the first tab stop the focus. Sizes in
+ * pixels; the template's w and h are the client area's (with a caption);
+ * x = CW_USEDEFAULT centres it on the owner. */
+#define WM_INITDIALOG       0x0110
+#define CW_USEDEFAULT       ((int)0x80000000)
+typedef intptr_t (*DLGPROC)(HWND, unsigned, WPARAM, LPARAM);
+typedef struct {
+    const char *cls, *text;
+    unsigned    style, exstyle;             /* WS_CHILD | WS_VISIBLE are added */
+    int         x, y, w, h, id;
+} DLGITEM;
+typedef struct {
+    const char    *title;
+    unsigned       style, exstyle;          /* 0: WS_DIALOG */
+    int            x, y, w, h;
+    int            nitems;
+    const DLGITEM *items;
+    int            id;                      /* (WS_CHILD dialogs: a page in another window) */
+} DLGTEMPLATE;
+int     DialogBox(const DLGTEMPLATE *t, HWND owner, DLGPROC proc, LPARAM init);    /* modal -> EndDialog's */
+HWND    CreateDialog(const DLGTEMPLATE *t, HWND owner, DLGPROC proc, LPARAM init); /* modeless */
+bool    EndDialog(HWND dlg, int result);
+LRESULT DefDlgProc(HWND dlg, unsigned msg, WPARAM wp, LPARAM lp);
+LRESULT SendDlgItemMessage(HWND dlg, int id, unsigned msg, WPARAM wp, LPARAM lp);
+bool    SetDlgItemInt(HWND dlg, int id, int value, bool is_signed);
+int     GetDlgItemInt(HWND dlg, int id, bool *ok, bool is_signed);
+HWND    GetNextDlgGroupItem(HWND dlg, HWND ctl, bool prev);   /* arrows in a group */
+HWND    GetNextDlgTabItem(HWND dlg, HWND ctl, bool prev);
 bool    IsDialogMessage(HWND dlg, const MSG *msg);
 int     SetTimer(HWND hwnd, int id, uint32_t ms);
 bool    KillTimer(HWND hwnd, int id);
@@ -701,12 +1294,74 @@ void    DrawLineEx(HDC dc, int x0, int y0, int x1, int y1, uint8_t color);
 void    DrawEllipse(HDC dc, const RECT *r, uint8_t color, bool filled);
 void    DrawPixels(HDC dc, int x, int y, int w, int h, const uint8_t *pixels, int stride);  /* 1 byte/pixel, FFh transparent */
 
+/* Fonts: FONT_FIXED is the 8x16 VGA font every DC starts with (edit
+ * controls keep it); FONT_GUI is the window-text font, the same glyphs
+ * set proportionally (labels, buttons, menus, lists). */
+#define FONT_FIXED          0
+#define FONT_GUI            1
+int     SelectFont(HDC dc, int font);               /* -> the old one */
+int     GetTextWidth(HDC dc, const char *s, int n); /* in the DC's font; n -1: all */
+int     TextWidthFont(int font, const char *s, int n);
+int     SetTextColor(HDC dc, int color);            /* DrawText's (-1: black) -> the old one */
+int     SetBkColor(HDC dc, int color);              /* DrawText fills behind (-1: doesn't) */
+
+/* DrawText: text in a rectangle, in the DC's font and colours. '&' marks
+ * the next character as the mnemonic (underlined; "&&" is an '&'). */
+#define DT_LEFT             0x0000
+#define DT_CENTER           0x0001
+#define DT_RIGHT            0x0002
+#define DT_VCENTER          0x0004  /* (DT_SINGLELINE) */
+#define DT_BOTTOM           0x0008  /* (DT_SINGLELINE) */
+#define DT_WORDBREAK        0x0010  /* wrap at spaces to the width */
+#define DT_SINGLELINE       0x0020
+#define DT_EXPANDTABS       0x0040
+#define DT_NOCLIP           0x0100
+#define DT_CALCRECT         0x0400  /* only measure: r gets the size */
+#define DT_NOPREFIX         0x0800  /* '&' is just a character */
+#define DT_HIDEPREFIX       0x00100000  /* no underline (the '&' still goes) */
+#define DT_END_ELLIPSIS     0x8000  /* cut with "..." */
+int     DrawText(HDC dc, const char *s, int n, RECT *r, unsigned flags);   /* -> height */
+
+/* Owner drawing (WM_DRAWITEM, WM_MEASUREITEM): BS_OWNERDRAW buttons,
+ * SS_OWNERDRAW statics, LBS_OWNERDRAWFIXED list boxes, CBS_OWNERDRAWFIXED
+ * combo boxes and MF_OWNERDRAW menu items are drawn by their parent (the
+ * menu's owner), in the same process. hDC is the control's own; rcItem is
+ * in its coordinates. */
+#define ODT_MENU            1
+#define ODT_LISTBOX         2
+#define ODT_COMBOBOX        3
+#define ODT_BUTTON          4
+#define ODT_STATIC          5
+#define ODA_DRAWENTIRE      0x0001
+#define ODA_SELECT          0x0002
+#define ODA_FOCUS           0x0004
+#define ODS_SELECTED        0x0001
+#define ODS_GRAYED          0x0002
+#define ODS_DISABLED        0x0004
+#define ODS_CHECKED         0x0008
+#define ODS_FOCUS           0x0010
+#define ODS_COMBOBOXEDIT    0x1000
+typedef struct {
+    unsigned CtlType, CtlID, itemID, itemAction, itemState;
+    HWND     hwndItem;                  /* the control (menus: the HMENU, cast) */
+    HDC      hDC;
+    RECT     rcItem;
+    LPARAM   itemData;
+} DRAWITEMSTRUCT;
+typedef struct {
+    unsigned CtlType, CtlID, itemID;
+    unsigned itemWidth, itemHeight;     /* filled in by the parent */
+    LPARAM   itemData;
+} MEASUREITEMSTRUCT;
+
 /* Windows of every process (the shell's view) */
 bool    EnumWindows(WNDENUMPROC proc, LPARAM l);    /* top-level, top first */
 HWND    FindWindow(const char *cls, const char *title);   /* either may be NULL */
 int     GetWindowProcessId(HWND hwnd);
 bool    IsWindowVisible(HWND hwnd);
 bool    IsIconic(HWND hwnd);                        /* minimized */
+bool    IsZoomed(HWND hwnd);                        /* maximized */
+bool    IsHungAppWindow(HWND hwnd);                 /* its program hasn't read its messages for 5 s */
 HWND    GetForegroundWindow(void);
 bool    SetForegroundWindow(HWND hwnd);
 bool    RegisterShellHookWindow(HWND hwnd);         /* gets WM_SHELLHOOK */
@@ -725,12 +1380,27 @@ typedef struct { uint32_t dmPelsWidth, dmPelsHeight, dmBitsPerPel; } DEVMODE;
 int     GetSystemMetrics(int index);
 bool    EnumDisplaySettings(int index, DEVMODE *dm);        /* index 0..: the modes */
 int     ChangeDisplaySettings(const DEVMODE *dm, unsigned flags);
+COLORREF GetThemeColor(int index);                  /* a theme colour's RGB */
 void    FillRectRGB(HDC dc, const RECT *r, uint8_t red, uint8_t green, uint8_t blue);
 
-/* The clipboard: text, shared by every process */
+/* The clipboard: text or a picture, shared by every process */
 bool    SetClipboardText(const char *text, int len);        /* len -1: up to the NUL */
 int     GetClipboardText(char *buf, int max);               /* -> length copied */
+#define CF_TEXT             1
+#define CF_BITMAP           2
+#define CF_FILES            3       /* Explorer's: file paths (as CF_HDROP) */
+bool    SetClipboardFiles(const char *paths, bool cut);    /* "a\0b\0\0", full paths */
+int     GetClipboardFiles(char *out, int size, bool *cut); /* -> bytes (with the last NUL) */
+void    EmptyClipboard(void);
+bool    SetClipboardBitmap(int w, int h, const uint8_t *pixels);   /* theme colours, 1 byte a pixel; up to 640x480 */
+bool    GetClipboardBitmap(int *w, int *h, uint8_t *out, int room);
+bool    IsClipboardFormatAvailable(unsigned format);
 int     GetClipboardTextLength(void);
+HCURSOR LoadCursor(void *instance, int idc);         /* instance NULL: IDC_* */
+HCURSOR SetCursor(HCURSOR cursor);                  /* -> the old one */
+HCURSOR GetCursor(void);
+bool    GetCursorPos(POINT *pt);                    /* screen coordinates */
+HCURSOR SetWindowCursor(HWND hwnd, HCURSOR cursor); /* its own shape (0: the class's) */
 int     GetClassIcon(HWND hwnd);                    /* WNDCLASS.icon */
 
 /* ===================================================================== */
@@ -776,8 +1446,10 @@ bool    Shell_NotifyIcon(unsigned msg, const NOTIFYICONDATA *data);
 
 /* Stock icons: 32x32 (desktop) and 16x16 (taskbar, menus) */
 enum { ICON_NONE, ICON_APP, ICON_CALC, ICON_PAINT, ICON_CLOCK, ICON_DEMO, ICON_DOS,
-       ICON_COMPUTER, ICON_INFO, ICON_SHUTDOWN, ICON_NOTEPAD, ICON_COUNT };
+       ICON_COMPUTER, ICON_INFO, ICON_SHUTDOWN, ICON_NOTEPAD, ICON_FOLDER, ICON_FOLDER_OPEN,
+       ICON_DRIVE, ICON_FLOPPY, ICON_DOCUMENT, ICON_TEXT, ICON_EXPLORER, ICON_COUNT };
 void    DrawIcon(HDC dc, int x, int y, int icon);
+bool    GetIconPixels(int icon, int size, uint8_t *out);   /* 16 or 32 square, 1 byte a pixel, FFh clear */
 
 /* The Open and Save As dialogs */
 #define OFN_OVERWRITEPROMPT 0x0002      /* Save: ask before replacing a file */
@@ -790,6 +1462,10 @@ typedef struct {
     const char *title;                  /* NULL: "Open" / "Save As" */
     const char *defext;                 /* "BMP": added to a name without one */
     uint32_t    flags;
+    const char *types;                  /* the "Files of type" list, as Windows' lpstrFilter:
+                                           "Bitmaps (*.BMP)\0*.BMP\0All files\0*.*\0" (and
+                                           a final \0); NULL: just filter */
+    int         type_index;             /* in/out: which (1 the first; 0 as 1) */
 } OPENFILENAME;
 bool    GetOpenFileName(OPENFILENAME *ofn);
 
@@ -814,7 +1490,23 @@ typedef struct {
 HWND    FindText(FINDREPLACE *fr);
 HWND    ReplaceText(FINDREPLACE *fr);
 bool    GetSaveFileName(OPENFILENAME *ofn);
+
+/* The colour dialog: the theme's 16 colours, 16 custom ones (cc->custom,
+ * kept by the program; white slots are free) and RGB sliders. rgb is
+ * the answer; index the theme colour nearest it. */
+#define CC_RGBINIT          0x0001  /* start at rgb (else at theme colour index) */
+#define CC_FULLOPEN         0x0002  /* with the sliders showing */
+#define CC_PREVENTFULLOPEN  0x0004
+typedef struct {
+    HWND      owner;
+    COLORREF  rgb;
+    int       index;
+    COLORREF *custom;                   /* 16, or NULL */
+    uint32_t  flags;
+} CHOOSECOLOR;
+bool    ChooseColor(CHOOSECOLOR *cc);
 void    DrawSmallIcon(HDC dc, int x, int y, int icon);
+int     ImageList_AddIcon(HIMAGELIST il, int icon);  /* a stock icon, at the list's size -> index */
 
 /* Menus. Item text marks its mnemonic with '&' and may carry a
  * right-aligned accelerator after a tab: "E&xit\tAlt+F4". Choosing an item
@@ -830,6 +1522,15 @@ int     GetMenuItemCount(HMENU menu);
 int     CheckMenuItem(HMENU menu, unsigned item, unsigned flags);   /* -> old, or -1 */
 int     EnableMenuItem(HMENU menu, unsigned item, unsigned flags);  /* -> old, or -1 */
 bool    CheckMenuRadioItem(HMENU menu, unsigned first, unsigned last, unsigned check, unsigned flags);
+bool    InsertMenu(HMENU menu, unsigned item, unsigned flags, uintptr_t id, const char *text);  /* before item */
+bool    DeleteMenu(HMENU menu, unsigned item, unsigned flags);   /* a submenu is destroyed */
+bool    RemoveMenu(HMENU menu, unsigned item, unsigned flags);   /* ... kept */
+bool    ModifyMenu(HMENU menu, unsigned item, unsigned flags, uintptr_t id, const char *text);
+unsigned GetMenuItemID(HMENU menu, int pos);                     /* -1: a submenu or none */
+int     GetMenuString(HMENU menu, unsigned item, char *buf, int max, unsigned flags);
+int     GetMenuState(HMENU menu, unsigned item, unsigned flags); /* MF_* (-1: none) */
+bool    SetMenuItemImage(HMENU menu, unsigned item, unsigned flags, const uint8_t *pixels, int size);
+bool    SetMenuBanner(HMENU menu, const char *text, uint8_t bg); /* up the left side */
 HMENU   GetSystemMenu(HWND hwnd, bool revert);
 int     TrackPopupMenu(HMENU menu, unsigned flags, int x, int y, HWND owner);
 bool    DrawMenuBar(HWND hwnd);
@@ -866,6 +1567,10 @@ int     TranslateAccelerator(HWND hwnd, HACCEL table, MSG *msg);
 #define MB_DEFBUTTON2       0x0100
 #define MB_DEFBUTTON3       0x0200
 #define MB_DEFMASK          0x0F00
+#define MB_SYSTEMMODAL      0x1000  /* every program's windows wait; the box stays on top */
+#define MB_TASKMODAL        0x2000  /* every window of this program waits */
+#define MB_TOPMOST          0x40000
+bool    MessageBeep(unsigned type);                 /* MB_ICON*: the PC speaker */
 int     MessageBox(HWND owner, const char *text, const char *caption, unsigned type);  /* -> IDOK... */
 
 /* Small runtime helpers (each module has its own copy: user/lib/lib.c) */

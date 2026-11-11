@@ -38,8 +38,8 @@ def main():
         check("task SHELL.BIN: Shell" in log and "task CALC.BIN: Calculator" in log and
               "task NOTEPAD.BIN: Untitled - Notepad" in log, "it lists the programs by window title")
         m.key("down"); m.key("ret")                     # Calculator, End Task
-        check(m.wait_log("GUI: end task CALC.BIN") and m.wait_log("USER: CALC.BIN exited with code -1"),
-              "End Task ends the chosen program")
+        check(m.wait_log("GUI: asking CALC.BIN to close") and m.wait_log("USER: CALC.BIN exited with code 0"),
+              "End Task asks the chosen program to close (WM_CLOSE), and it does")
         m.key("esc")
         check(m.wait_log("GUI: closed Close Program"), "Esc closes the dialog")
         check(STUCK not in m.log(), "the shell answered, so the VMM didn't step in")

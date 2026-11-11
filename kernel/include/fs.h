@@ -125,6 +125,7 @@ void redir_restore(void);               /* DOS's own drives back (shutdown) */
 void redir_vm_end(struct vm *vm);       /* close what a VM left open */
 int  redir_cds_path(int drive, char *out);  /* DOS's current directory on a drive (0 = A:) */
 int  redir_current_drive(void);
+uint32_t redir_drives(void);            /* DOS's drives and ours: bit 0 = A: */
 int  redir_handle_node(uint16_t handle, struct fnode **n);    /* a DOS handle of the caller -> our file */
 int  redir_search_new(struct vm *vm, uint32_t *stamp);        /* a slot for a search in progress */
 struct fs_find *redir_search(int slot, uint32_t stamp);

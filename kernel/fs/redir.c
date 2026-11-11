@@ -335,6 +335,17 @@ void redir_vm_end(struct vm *vm)
 
 int redir_current_drive(void) { return rd.on ? *at(rd.sda + 0x16) : -1; }
 
+uint32_t redir_drives(void)
+{
+    uint32_t mask = 0;
+    for (int d = 0; d < 26; d++) {
+        bool dos = rd.on && d < rd.lastdrive && (rd16(cds_of(d) + CDS_FLAGS) & (CDS_PHYSICAL | CDS_NETWORK));
+        if (dos || fs_volume((char)('A' + d)))
+            mask |= 1u << d;
+    }
+    return mask;
+}
+
 int redir_cds_path(int d, char *out)
 {
     if (!rd.on || d < 0 || d >= rd.lastdrive)

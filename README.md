@@ -37,6 +37,7 @@ are for later stages.
 | `make qemu-shell` | the shell and its programs as processes: Start menu by mouse and Ctrl+Esc, desktop icons, Calculator, Paint, Clock, taskbar buttons, Run, Shut Down |
 | `make qemu-msgbox` | keyboard accelerators per window, message boxes: modality, default button, Tab, Yes/No letters, Esc, Alt+F4 |
 | `make qemu-menu` | menu bar, system menu and right-click menus by mouse and keyboard (mnemonics, F10, Alt+Space, keyboard Move) |
+| `make qemu-explorer` | Explorer, the tree view and the list view: the address field, the four views, a folder made and named in place, opened, filled, deleted with its contents; the tree by keyboard, letters jumping to names, Enter opening a file in Notepad, sorting by menu and by a header click, double-clicking a folder |
 | `make qemu-controls` | combo boxes (drop-down list with a scroll bar, editable, a list that opens upwards), the tab control and up-downs (buddy edit, auto-repeat, wrap) by mouse and keyboard |
 | `make qemu-wm`   | drives the window manager through QEMU's mouse and keyboard: every control, activate/move/resize/minimize/maximize/close, palette after a DOS session |
 | `make qemu-vga`  | the VDD: the GUI's desktop must come back pixel-identical after a text DOS session (except its animated progress bar) |
@@ -639,32 +640,70 @@ process that created it, and only that process runs its window procedure.
 ## The shell and its programs
 
 - **SHELL.BIN** (`user/apps/shell.c`), in the style of Windows 95: a
-  desktop with icons (double-click or Enter opens; right click for Run and
-  About); a taskbar with the **Start** button and menu (Programs, Run...,
-  About, Shut Down...; also Ctrl+Esc), a button per program window (click
-  to switch, again to minimize), and the notification area with tray icons
-  and a clock. A Run dialog starts any program by name. Shut Down asks,
-  then ends the session.
+  desktop with icons (double-click or Enter opens; drag them about, their
+  places kept in OS1993.INI; right click for Line up Icons, Run, About and
+  Properties) over an optional background pattern; a taskbar with the
+  **Start** button and menu (large icons and a vertical banner; Programs,
+  read from PROGRAMS.INI, Run..., Display Settings..., About, Shut
+  Down...; also Ctrl+Esc), a button per program window (click to switch,
+  again to minimize, right button for the window's system menu), and the
+  notification area with tray icons (and their tooltips) and a clock. A
+  Run dialog starts any program by name. Ctrl+Alt+Del's Close Program
+  marks programs that stopped reading their messages "Not responding";
+  End Task asks a program to close (WM_CLOSE) before ending it. Shut Down
+  asks, then ends the session.
 - **CALC.BIN**: the standard calculator: the four operations, square root,
   percent, reciprocal, sign, memory, by mouse or keyboard. Without an FPU
   or libgcc, it computes in 64-bit fixed point (six decimals, twelve
-  digits) with its own division.
-- **PAINT.BIN**: a 400×280 canvas, pencil, brush, eraser, flood fill,
-  line, rectangle, filled rectangle and ellipse (rubber-banded), a 16-colour
-  palette (left button foreground, right button background). Open, Save and
-  Save As (Ctrl+O, Ctrl+S) through the file dialogs: it writes 16-colour
-  BMP files and opens 16- and 256-colour ones (colours mapped to the
-  nearest of the 16); it asks before discarding changes.
-- **The file dialogs** (SHELL.DLL): the folder, a file name field (its
-  text selected, so typing replaces it), and a list of subfolders and
-  matching files; double-click or type a folder name to move, a pattern
-  to filter. Save As asks before replacing a file; Open checks it exists.
+  digits) with its own division. View > Scientific adds sin, cos, tan
+  (degrees or radians), ln, log, e^x, x^y, x², x³, n!, pi, Int, Mod, And,
+  Or, Xor, Not and hex/octal/binary for whole numbers, computed with nine
+  decimals inside by series after reducing the argument.
+- **PAINT.BIN**: a canvas (400×280 to start, up to 1024×768 with Image >
+  Attributes), pencil, brush, eraser, flood fill, line, rectangle, filled
+  rectangle, ellipse (rubber-banded) and select, a 16-colour palette (left
+  button foreground, right button background). A selection drags about and
+  goes through the clipboard as a picture (Cut, Copy, Paste, Delete,
+  Select All); View > Zoom magnifies 2-8 times with scroll bars; Edit >
+  Undo takes back the last change. Open, Save and Save As (Ctrl+O, Ctrl+S)
+  through the file dialogs: it writes 16-colour BMP files and opens 16- and
+  256-colour ones (colours mapped to the nearest of the 16); it asks before
+  discarding changes.
+- **The file dialogs** (SHELL.DLL): "Look in" (the drives, with their
+  labels), the folder, a file name field (its text selected, so typing
+  replaces it), a list of subfolders and matching files, and "Files of
+  type" (the program's filters); double-click or type a folder name to
+  move, a pattern to filter. Names keep their case and length where the
+  file system has them (8.3 names on FAT in capitals, as DOS keeps them).
+  Save As asks before replacing a file; Open checks it exists. **The
+  colour dialog** (`ChooseColor`): the 16 theme colours, 16 custom ones,
+  and red/green/blue sliders with a preview.
 - **NOTEPAD.BIN**: a text editor on the multi-line edit control: File
-  (New, Open, Save, Save As; plain text with CR LF line ends, up to 32 KB),
-  Edit (Undo, Cut, Copy, Paste, Delete, Select All, Time/Date, Word Wrap),
-  Search (Find, Find Next F3, Replace; match case, whole words, up/down,
-  Replace All as one undoable edit), and the usual question about unsaved
-  changes. `NOTEPAD.BIN name.txt` opens a file.
+  (New, Open, Save, Save As, Print; plain text with CR LF line ends, up to
+  512 KB), Edit (Undo, Cut, Copy, Paste, Delete, Select All, Time/Date,
+  Word Wrap), Search (Find, Find Next F3, Replace; match case, whole words,
+  up/down, Replace All as one undoable edit), View (a status bar with the
+  caret's line and column), and the usual question about unsaved changes.
+  Print lays the text out in pages (header, page numbers, form feeds) and,
+  there being no printer driver, writes them to a .PRN file.
+  `NOTEPAD.BIN name.txt` opens a file.
+- **EXPLORER.BIN**: the file explorer: My Computer, its drives (with
+  their labels: `GetLogicalDrives`, `GetVolumeInformation`) and their
+  folders in a tree on the left, filled in as they are opened; the folder
+  chosen on the right in a list view, in any of its four views (details:
+  name, size, type, modified; a header click sorts, an arrow showing how);
+  a toolbar (Back, Forward, Up, Cut, Copy, Paste, Delete, Properties, the
+  views; tooltips) and an address field; a status bar (objects, their size,
+  free space); the bar between the panes moves. Cut or Copy and Paste move
+  or copy files and folders (cut ones fade until pasted); items dragged
+  onto a folder or drive in either pane move there, or are copied (another
+  drive, or Ctrl). File types (name, icon, the program that opens them)
+  come from FILETYPES.INI. Enter or a double-click opens a folder or
+  drive, runs a program, or opens a file in Notepad; Backspace goes up and
+  selects the folder it came from; Tab switches panes; Delete deletes
+  (folders with what they hold, after asking); F2 renames in place; File >
+  New Folder makes one and lets you name it; Properties counts a folder's
+  files; F5 reads it again. The desktop's My Computer opens it.
 - **CLOCK.BIN**: analog (scales with the window; sine table) or digital
   (seven segments and the date), seconds on or off, from the RTC.
 - **DEMO.BIN**: the Control Demo (Programs, Controls and About windows),
@@ -741,8 +780,13 @@ Windows 95 set of window controls and widgets.
   own other windows (`CreateWindow` with a parent but no `WS_CHILD`);
   owned windows go when their owner does.
 - **Controls**, one class per file: `BUTTON` (push button with
-  default-button ring, check box, radio button group, group box), `STATIC`,
-  `EDIT` (caret, Home/End/Delete), `LISTBOX` with its own scroll bar,
+  default-button ring, check box, three-state box, radio button group,
+  group box, owner-drawn, push-like), `STATIC` (text wrapped at spaces,
+  aligned, '&' mnemonics; frames, etched lines, owner-drawn), `EDIT`
+  (selection by mouse, Shift and double-click, sideways scrolling, a
+  blinking caret, undo; password, number, case styles), `LISTBOX` with its
+  own scroll bar (item data, sorting, multiple and extended selection,
+  owner-drawn rows, type-ahead),
   `SCROLLBAR` (proportional thumb; the parent moves it, as in Windows),
   `TRACKBAR` and `PROGRESS`. `EDIT` with `ES_MULTILINE` is a text editor
   control: up to 32 KB in its process's heap, tabs, scrolling with
@@ -753,8 +797,28 @@ Windows 95 set of window controls and widgets.
   the **clipboard** (shared by every process: `SetClipboardText`,
   `GetClipboardText`), undo of the last run of typing, and the `EM_*`
   messages (`EM_GETSEL`, `EM_REPLACESEL`, `EM_GETMODIFY`, `EM_LINEINDEX`...).
-  Single-line edits copy, cut and paste too. Every control draws inside its own rectangle,
-  focus and default rings included.
+  The multi-line edit keeps an undo history (Ctrl+Z steps back a run of
+  typing at a time, Ctrl+Y forward), blinks its caret, and scrolls while
+  a selection is dragged past its edges. The clipboard also carries
+  pictures (`SetClipboardBitmap`) and Explorer's files (`CF_FILES`).
+  Every control draws inside its own rectangle, focus and default rings
+  included. Parents can colour controls (`WM_CTLCOLOR*`) or draw them
+  (`WM_DRAWITEM`, `WM_MEASUREITEM`); a window's `WM_NCHITTEST` answer can
+  make part of its client area a caption or a border; anchored children
+  follow the parent's edges (`SetWindowAnchor`).
+- **Window text** is in a proportional font (`FONT_GUI`: the VGA glyphs,
+  each trimmed to its inked columns) -- captions, menus, buttons, labels,
+  lists, tabs -- with `DrawText` (alignment, word wrap, ellipses, '&'
+  underlines), `SetTextColor`/`SetBkColor`; edit controls keep the 8×16
+  fixed font. **Dialog templates**: `DialogBox` and `CreateDialog` build a
+  dialog and its controls from a table, with a `DLGPROC` and
+  `WM_INITDIALOG`/`EndDialog`; `IsDialogMessage` adds Alt+letter
+  mnemonics, arrow keys within a group and Ctrl+Tab between tabs.
+- **Status bar, toolbar, tooltips** (`statusbar.c`, `toolbar.c`,
+  `tooltip.c`): status bars of parts with a size grip, toolbars of
+  picture buttons (check groups, flat hot-tracking, tooltips), and
+  tooltips that watch the pointer themselves -- no relaying of mouse
+  messages -- and show a tool's text after a short rest.
 - **Combo boxes, tabs, up-downs** (`user/ui/combo.c`, `tab.c`,
   `updown.c`), with Win32's message numbers. `COMBOBOX` comes as
   `CBS_DROPDOWNLIST` (a pop-up button showing the selection) and
@@ -766,13 +830,54 @@ Windows 95 set of window controls and widgets.
   it is closed. Strings live in the owning process's heap (`CB_ADDSTRING`,
   `CB_GETLBTEXT`, `CB_FINDSTRINGEXACT`..., `CBN_SELCHANGE`, `CBN_DROPDOWN`,
   `CBN_CLOSEUP`, `CBN_EDITCHANGE`). Unlike Windows, the window's height is
-  the closed box's. `TABCONTROL` draws Platinum tabs, the selected one
-  joined to its page (`TCM_INSERTITEM` with a `TCITEM`, `TCM_ADJUSTRECT`,
-  Left/Right); as there is no `WM_NOTIFY`, `TCN_SELCHANGING` and
-  `TCN_SELCHANGE` come as `WM_COMMAND`. `UPDOWN` steps a position with
-  auto-repeat and reports `WM_VSCROLL SB_THUMBPOSITION`; a buddy edit can
-  show it (`UDS_SETBUDDYINT`) and lend it its arrow keys
+  the closed box's. `CBS_SIMPLE` shows the list always, editable boxes
+  complete what is typed from the items, `CBS_OWNERDRAWFIXED` items are the
+  parent's to draw, and `CB_SHOWDROPDOWN` returns at once.
+  `TABCONTROL` draws Platinum tabs, the selected one joined to its page
+  (`TCM_INSERTITEM` with a `TCITEM`, `TCM_ADJUSTRECT`, Left/Right), icons
+  from an image list, rows that wrap (`TCS_MULTILINE`) or arrows that
+  scroll; `TCN_SELCHANGING` and `TCN_SELCHANGE` come as `WM_NOTIFY` and
+  as `WM_COMMAND`. `UPDOWN` steps a position with auto-repeat that speeds
+  up, asks the parent first (`UDN_DELTAPOS`) and reports `WM_VSCROLL
+  SB_THUMBPOSITION`; a buddy edit can show it (`UDS_SETBUDDYINT`, with
+  thousands separators, or in hex) and lend it its arrow keys
   (`UDS_ARROWKEYS`).
+  The **tree view** (`WC_TREEVIEW`) shows items under items, a row each
+  while their parents are open, with +/- boxes, dotted lines, an image and
+  a selected image; items given `cChildren = 1` get a box before they have
+  children, so a program fills them in when it hears `TVN_ITEMEXPANDING`.
+  Keys as in Windows (Left closes or goes up, Right opens or goes down,
+  `+`, `-`, `*`, a letter jumps to the next name with it); scroll bars
+  both ways when needed (`TVM_INSERTITEM` with `TVI_SORT`, `TVM_EXPAND`,
+  `TVM_GETNEXTITEM`, `TVM_SELECTITEM`, `TVM_HITTEST`, `TVM_ENSUREVISIBLE`,
+  `TVM_SORTCHILDREN`...). The **list view** (`WC_LISTVIEW`) shows items
+  with an image, a label and sub-items four ways: large icons in a grid
+  (labels wrapped under them, all of the label for the focused item),
+  small icons in rows, a list in columns scrolled sideways, and details
+  under column headers that can be clicked (`LVN_COLUMNCLICK`) and resized
+  by dragging their edges; `LVM_SETVIEW` (or the style) switches. Several
+  items may be selected (Ctrl, Shift, Ctrl+Space); the arrow keys follow
+  the view; labels are edited in place (F2, `LVM_EDITLABEL`:
+  `LVN_BEGINLABELEDIT`, `LVN_ENDLABELEDIT`); `LVM_SORTITEMS` takes a
+  comparison of `lParam`s (a stable merge sort). Both draw from **image
+  lists** (`ImageList_Create`, `ImageList_AddPixels`, `ImageList_Draw`
+  with `ILD_SELECTED`; SHELL.DLL's `ImageList_AddIcon` adds a stock icon)
+  and tell their parent through **`WM_NOTIFY`** (`NMHDR`, `NMTREEVIEW`,
+  `NMLISTVIEW`, `NMLVDISPINFO`, `NMLVKEYDOWN`). Both take check boxes
+  (`TVS_CHECKBOXES`, `LVS_EX_CHECKBOXES`) and report drags
+  (`TVN_BEGINDRAG`, `LVN_BEGINDRAG`; drop targets highlighted with
+  `TVGN_DROPHILITE`, `LVIS_DROPHILITED`); the tree edits labels too. The
+  list view adds grid lines and full-row selection, sort arrows in the
+  header, a marquee over empty space, icons placed and dragged anywhere
+  (`LVM_SETITEMPOSITION`, `LVM_ARRANGE`), faded cut items, and virtual
+  lists (`LVS_OWNERDATA`: `LVM_SETITEMCOUNT`, `LVN_GETDISPINFO`).
+- **Menus** take owner-drawn items, pictures and icons beside items, a
+  banner up the side (`SetMenuBanner`), `InsertMenu`/`DeleteMenu`/
+  `ModifyMenu`, tell the owner `WM_MENUSELECT`, and a menu bar too wide for
+  its window wraps onto more rows. Message boxes can be task- or
+  system-modal and beep through the PC speaker (`MessageBeep`, `Beep`).
+  Update regions are lists of rectangles, so far-apart changes repaint
+  apart.
 - **Background behaviour.** When a DOS session takes the screen, the GUI is
   told (`EV_FOCUS`) and stops drawing. Its VGA port accesses are trapped and
   emulated (writes dropped, reads FFh) instead of reaching the hardware
@@ -812,8 +917,12 @@ and up-downs. Esc closes the demo.
   `vmport`; the scripted tests turn it off to drive the relative path, and
   `make qemu-absmouse` covers the absolute one.
 
-The GUI draws an XOR arrow cursor (drawing it twice erases it, so it needs
-no save-under), and the demo window can be dragged by its title bar.
+The GUI draws its cursor as an XOR image in 16-colour mode (drawing it
+twice erases it, so it needs no save-under) and, in the VESA modes, as a
+solid white-and-black sprite over a saved copy of what it covers. The
+shape follows the pointer: resize arrows over borders, an I-beam over
+edits, a class's or window's own cursor elsewhere, or what a program sets
+(`LoadCursor`, `SetCursor`: wait, cross, move, no-entry...).
 
 ## VGA
 

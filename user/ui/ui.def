@@ -32,6 +32,31 @@ EXPORTS
     ReleaseCapture
     GetCapture
     GetKeyState
+    IsZoomed
+    IsHungAppWindow
+    SetClipboardBitmap
+    SetClipboardFiles
+    GetClipboardFiles
+    EmptyClipboard
+    GetClipboardBitmap
+    IsClipboardFormatAvailable
+    SetWindowAnchor
+    GetThemeColor
+    WindowFromPoint
+    ScreenToClient
+    ClientToScreen
+    CreateStatusWindow
+    SelectFont
+    GetTextWidth
+    TextWidthFont
+    SetTextColor
+    SetBkColor
+    DrawText
+    LoadCursor
+    SetCursor
+    GetCursor
+    GetCursorPos
+    SetWindowCursor
     GetMessage
     PeekMessage
     TranslateMessage
@@ -42,6 +67,15 @@ EXPORTS
     DefWindowProc
     CallWindowProc
     IsDialogMessage
+    DialogBox
+    CreateDialog
+    EndDialog
+    DefDlgProc
+    SendDlgItemMessage
+    SetDlgItemInt
+    GetDlgItemInt
+    GetNextDlgGroupItem
+    GetNextDlgTabItem
     SetTimer
     KillTimer
     CheckDlgButton
@@ -71,6 +105,15 @@ EXPORTS
     CheckMenuItem
     EnableMenuItem
     CheckMenuRadioItem
+    InsertMenu
+    DeleteMenu
+    RemoveMenu
+    ModifyMenu
+    GetMenuItemID
+    GetMenuString
+    GetMenuState
+    SetMenuItemImage
+    SetMenuBanner
     GetSystemMenu
     TrackPopupMenu
     DrawMenuBar
@@ -78,6 +121,7 @@ EXPORTS
     DestroyAcceleratorTable
     TranslateAccelerator
     MessageBox
+    MessageBeep
     CreateWindowEx
     UpdateWindow
     DrawLineEx
@@ -102,3 +146,9 @@ EXPORTS
     EnumDisplaySettings
     ChangeDisplaySettings
     FillRectRGB
+    ImageList_Create
+    ImageList_Destroy
+    ImageList_AddPixels
+    ImageList_GetImageCount
+    ImageList_GetIconSize
+    ImageList_Draw

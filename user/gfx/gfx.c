@@ -16,6 +16,7 @@
 #include "io.h"
 
 #include <stdbool.h>
+#include <string.h>
 
 static inline void gc(uint8_t i, uint8_t v) { outb(0x3CE, i); outb(0x3CF, v); }
 
@@ -406,6 +407,55 @@ void gfx_bitmap(struct gfx *g, int x, int y, const uint16_t *rows, int h, uint8_
     blit_rows(g, x, y, rows, h, color, 0x00);
 }
 
+static void sprite_rows(const struct gfx *g, int x, int y, int w, int h, uint8_t *save, bool restore)
+{
+    int bpp = g->bpp / 8;
+    for (int r = 0; r < h; r++) {
+        int row = y + r;
+        if (row < 0 || row >= g->height)
+            continue;
+        for (int c = 0; c < w; c++) {
+            int col = x + c;
+            if (col < 0 || col >= g->width)
+                continue;
+            uint8_t *p = g->base + (uint32_t)row * g->pitch + (uint32_t)col * (uint32_t)bpp;
+            uint8_t *s = save + ((uint32_t)r * (uint32_t)w + (uint32_t)c) * (uint32_t)bpp;
+            for (int k = 0; k < bpp; k++)
+                if (restore) p[k] = s[k]; else s[k] = p[k];
+        }
+    }
+}
+
+void gfx_sprite_save(const struct gfx *src, int x, int y, int w, int h, uint8_t *save)
+{
+    if (src->bpp != 4)
+        sprite_rows(src, x, y, w, h, save, false);
+}
+
+void gfx_sprite_restore(struct gfx *g, int x, int y, int w, int h, const uint8_t *save)
+{
+    if (g->bpp != 4)
+        sprite_rows(g, x, y, w, h, (uint8_t *)save, true);
+}
+
+void gfx_sprite_draw(struct gfx *g, int x, int y, const char *const *art, int w, int h)
+{
+    if (g->bpp == 4)
+        return;
+    for (int r = 0; r < h; r++)
+        for (int c = 0; c < w && art[r][c]; c++) {
+            int row = y + r, col = x + c;
+            char a = art[r][c];
+            if ((a != 'k' && a != 'w') || row < 0 || row >= g->height || col < 0 || col >= g->width)
+                continue;
+            uint32_t v = g->pal[a == 'k' ? 0 : 8];      /* the theme's black and white */
+            uint8_t *p = g->base + (uint32_t)row * g->pitch;
+            if (g->bpp == 8)       p[col] = (uint8_t)v;
+            else if (g->bpp == 16) ((uint16_t *)p)[col] = (uint16_t)v;
+            else                   ((uint32_t *)p)[col] = v;
+        }
+}
+
 void gfx_xor_bitmap(struct gfx *g, int x, int y, const uint16_t *rows, int h)
 {
     blit_rows(g, x, y, rows, h, 0x0F, 0x18);
@@ -426,6 +476,73 @@ void gfx_text(struct gfx *g, int x, int y, const char *s, uint8_t fg, uint8_t bg
             rows[r] = (uint16_t)(glyph[r] << 8);
         blit_rows(g, x, y, rows, 16, fg, 0x00);
     }
+}
+
+/* The proportional font: each 8x16 glyph trimmed to its inked columns,
+ * one blank column after it (space: 4 pixels). The widths are worked out
+ * once from whatever font the gfx has. */
+static const uint8_t *prop_font;
+static uint8_t prop_lead[256], prop_adv[256];
+
+static void prop_init(const uint8_t *font)
+{
+    if (prop_font == font)
+        return;
+    for (int c = 0; c < 256; c++) {
+        uint8_t ink = 0;
+        for (int r = 0; r < 16; r++)
+            ink |= font[c * 16 + r];
+        if (!ink || c == ' ') {
+            prop_lead[c] = 0;
+            prop_adv[c] = c == ' ' || !ink ? 4 : 8;
+            continue;
+        }
+        int lead = 0, last = 7;
+        while (!(ink & (0x80 >> lead))) lead++;
+        while (!(ink & (0x80 >> last))) last--;
+        prop_lead[c] = (uint8_t)lead;
+        prop_adv[c] = (uint8_t)(last - lead + 2);
+    }
+    prop_font = font;
+}
+
+int gfx_text_width(const struct gfx *g, int font, const char *s, int n)
+{
+    if (n < 0)
+        n = (int)strlen(s);
+    if (font == GFX_FONT_FIXED)
+        return n * 8;
+    prop_init(g->font);
+    int w = 0;
+    for (int i = 0; i < n; i++)
+        w += prop_adv[(uint8_t)s[i]];
+    return w;
+}
+
+/* n characters of s (n < 0: all) in a font; -> the x after them. */
+int gfx_text_font(struct gfx *g, int font, int x, int y, const char *s, int n, uint8_t fg, uint8_t bg)
+{
+    if (n < 0)
+        n = (int)strlen(s);
+    if (font == GFX_FONT_PROP)
+        prop_init(g->font);
+    for (int i = 0; i < n; i++) {
+        uint8_t c = (uint8_t)s[i];
+        int adv = font == GFX_FONT_PROP ? prop_adv[c] : 8, lead = font == GFX_FONT_PROP ? prop_lead[c] : 0;
+        if (x >= g->cx1)
+            break;
+        if (x + adv > g->cx0) {
+            if (bg != GFX_TRANSPARENT)
+                gfx_fill(g, x, y, adv, 16, bg);
+            const uint8_t *glyph = g->font + c * 16;
+            uint16_t rows[16];
+            for (int r = 0; r < 16; r++)
+                rows[r] = (uint16_t)((glyph[r] << lead) << 8);
+            blit_rows(g, x, y, rows, 16, fg, 0x00);
+        }
+        x += adv;
+    }
+    return x;
 }
 
 /* Copy w x h pixels (one byte each, a colour index) to x,y through the

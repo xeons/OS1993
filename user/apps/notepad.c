@@ -3,19 +3,29 @@
  *
  * A multi-line EDIT control filling the window, with File (New, Open,
  * Save, Save As), Edit (Undo, Cut, Copy, Paste, Delete, Select All,
- * Time/Date, Word Wrap), Search (Find, Find Next, Replace) and Help menus. Files are plain text with CR LF line ends
- * (DOS's), up to 32 KB; the control keeps LF only, so CRs go on the way
- * out. NOTEPAD.BIN name.txt opens a file at start.
+ * Time/Date, Word Wrap), Search (Find, Find Next, Replace), View (Status
+ * Bar: the caret's line and column) and Help menus. Files are plain text
+ * with CR LF line ends (DOS's), up to 512 KB; the control keeps LF only, so
+ * CRs go on the way out. File > Print lays the text out in pages (a
+ * header, the page number at the foot, a form feed after each) and, with
+ * no printer to send it to, writes them to a .PRN file. NOTEPAD.BIN
+ * name.txt opens a file at start.
  */
 #include "os1993.h"
+#include <stdio.h>
+#include <string.h>
 
 enum { ID_EDIT = 1, ID_NEW = 100, ID_OPEN, ID_SAVE, ID_SAVEAS, ID_EXIT, ID_UNDO, ID_CUT, ID_COPY,
        ID_PASTE, ID_DELETE, ID_SELALL, ID_TIMEDATE, ID_ABOUT, ID_WRAP, ID_FIND, ID_FINDNEXT,
-       ID_REPLACE };
+       ID_REPLACE, ID_STATUS, ID_STATUSBAR, ID_PRINT, ID_COPIES, ID_COPYSPIN, ID_HEADER };
 
-#define MAX_FILE 32767
+#define MAX_FILE  (512 * 1024)
+#define PAGE_ROWS 60                        /* text lines on a printed page */
+#define PAGE_COLS 80
 
-static HWND np, edit;
+static HWND np, edit, status;
+static bool status_on;
+static HMENU view_menu;
 static HMENU edit_menu;
 static char file_path[128];
 static HWND find_dlg;                       /* Find or Replace, while open */
@@ -58,7 +68,7 @@ static bool load(const char *path)
     uint32_t size = GetFileSize(f), got = 0;
     if (size > MAX_FILE) {
         CloseHandle(f);
-        complain("This file is too large for Notepad (32 KB at most):\n", path);
+        complain("This file is too large for Notepad (512 KB at most):\n", path);
         return false;
     }
     char *text = LocalAlloc(0, size + 1);
@@ -119,7 +129,8 @@ static bool save_as(void)
 {
     char path[128];
     strncpy0(path, file_path[0] ? file_path : "untitled.txt", sizeof path);
-    OPENFILENAME ofn = { np, "*.TXT", path, sizeof path, NULL, "TXT", OFN_OVERWRITEPROMPT };
+    OPENFILENAME ofn = { np, "*.TXT", path, sizeof path, NULL, "TXT", OFN_OVERWRITEPROMPT,
+                         "Text documents (*.TXT)\0*.TXT\0All files (*.*)\0*.*\0", 1 };
     return GetSaveFileName(&ofn) && save(path);
 }
 
@@ -269,6 +280,175 @@ static void open_find(bool replace)
     find_dlg = replace ? ReplaceText(&fr) : FindText(&fr);
 }
 
+/* ---- the status bar --------------------------------------------------------------- */
+
+static void show_status(void)
+{
+    if (!status_on)
+        return;
+    int a, z;
+    SendMessage(edit, EM_GETSEL, (WPARAM)&a, (LPARAM)&z);
+    int line = (int)SendMessage(edit, EM_LINEFROMCHAR, (WPARAM)z, 0);
+    int col = z - (int)SendMessage(edit, EM_LINEINDEX, (WPARAM)line, 0);
+    char t[48];
+    snprintf(t, sizeof t, "\t\tLn %d, Col %d  ", line + 1, col + 1);
+    char old[48] = "";
+    SendMessage(status, SB_GETTEXT, 1, (LPARAM)old);
+    if (strcmp(old, t))
+        SendMessage(status, SB_SETTEXT, 1, (LPARAM)t);
+}
+
+static void layout(void)
+{
+    RECT c;
+    GetClientRect(np, &c);
+    int sh = 0;
+    if (status_on) {
+        SendMessage(status, WM_SIZE, 0, 0);
+        RECT r;
+        GetWindowRect(status, &r);
+        sh = r.bottom - r.top;
+        int parts[2] = { c.right - 150, -1 };
+        SendMessage(status, SB_SETPARTS, 2, (LPARAM)parts);
+    }
+    MoveWindow(edit, 0, 0, c.right, c.bottom - sh, true);
+}
+
+static void set_status(bool on)
+{
+    status_on = on;
+    ShowWindow(status, on ? SW_SHOW : SW_HIDE);
+    CheckMenuItem(view_menu, ID_STATUSBAR, on ? MF_CHECKED : MF_UNCHECKED);
+    layout();
+    show_status();
+}
+
+/* ---- printing ------------------------------------------------------------------------ */
+
+static const DLGITEM print_items[] = {
+    { WC_STATIC, "Printer:", 0, 0, 12, 12, 70, 16, 0 },
+    { WC_STATIC, "None installed: the pages go to a file.", SS_LEFTNOWORDWRAP, 0, 84, 12, 260, 16, 0 },
+    { WC_STATIC, "&Copies:", 0, 0, 12, 44, 70, 16, 0 },
+    { WC_EDIT, "1", WS_TABSTOP | ES_NUMBER, 0, 84, 38, 50, 28, ID_COPIES },
+    { WC_UPDOWN, "", UDS_AUTOBUDDY | UDS_SETBUDDYINT | UDS_ALIGNRIGHT | UDS_ARROWKEYS, 0, 0, 0, 16, 22, ID_COPYSPIN },
+    { WC_BUTTON, "&Header and page numbers", WS_TABSTOP | BS_AUTOCHECKBOX, 0, 12, 74, 240, 20, ID_HEADER },
+    { WC_BUTTON, "OK", WS_TABSTOP | BS_DEFPUSHBUTTON, 0, 158, 104, 84, 30, IDOK },
+    { WC_BUTTON, "Cancel", WS_TABSTOP, 0, 252, 108, 76, 22, IDCANCEL },
+};
+static const DLGTEMPLATE print_dlg = { "Print", 0, 0, CW_USEDEFAULT, 0, 340, 144,
+                                       sizeof print_items / sizeof print_items[0], print_items, 0 };
+static int copies = 1;
+static bool headers = true;
+
+static intptr_t print_proc(HWND h, unsigned msg, WPARAM wp, LPARAM lp)
+{
+    (void)lp;
+    if (msg == WM_INITDIALOG) {
+        SendDlgItemMessage(h, ID_COPYSPIN, UDM_SETRANGE32, 1, 99);
+        SendDlgItemMessage(h, ID_COPYSPIN, UDM_SETPOS32, 0, copies);
+        CheckDlgButton(h, ID_HEADER, headers);
+        return 1;
+    }
+    if (msg == WM_COMMAND && LOWORD(wp) == IDOK) {
+        bool ok;
+        int n = GetDlgItemInt(h, ID_COPIES, &ok, false);
+        copies = ok && n >= 1 && n <= 99 ? n : 1;
+        headers = IsDlgButtonChecked(h, ID_HEADER) != 0;
+        EndDialog(h, IDOK);
+        return 1;
+    }
+    return 0;
+}
+
+/* Text laid out on pages: lines wrapped at PAGE_COLS, tabs expanded. */
+static char *paginate(const char *t, int len, const char *title, int *out_len, int *pages)
+{
+    int cap = len * 2 + 4096, n = 0, page = 0, row = 0;
+    char *o = LocalAlloc(0, (uint32_t)cap);
+    if (!o) return NULL;
+    #define EMIT(c) do { if (n < cap - 1) o[n++] = (c); } while (0)
+    #define EMITS(s) do { for (const char *q_ = (s); *q_; q_++) EMIT(*q_); } while (0)
+    int i = 0;
+    while (i <= len) {
+        if (row == 0) {                         /* a new page */
+            page++;
+            if (headers) {
+                int pad = (PAGE_COLS - (int)strlen(title)) / 2;
+                for (int k = 0; k < pad; k++) EMIT(' ');
+                EMITS(title);
+                EMITS("\r\n\r\n");
+            }
+        }
+        int col = 0;                            /* one printed line */
+        while (i < len && t[i] != '\n' && col < PAGE_COLS) {
+            if (t[i] == '\t') {
+                do { EMIT(' '); col++; } while (col % 8 && col < PAGE_COLS);
+            } else {
+                EMIT(t[i]);
+                col++;
+            }
+            i++;
+        }
+        if (i < len && t[i] == '\n') i++;
+        else if (i >= len) i = len + 1;
+        EMITS("\r\n");
+        if (++row == PAGE_ROWS || i > len) {     /* the foot of the page */
+            if (headers) {
+                for (; row < PAGE_ROWS; row++) EMITS("\r\n");
+                char foot[24];
+                snprintf(foot, sizeof foot, "Page %d", page);
+                int pad = (PAGE_COLS - (int)strlen(foot)) / 2;
+                EMITS("\r\n");
+                for (int k = 0; k < pad; k++) EMIT(' ');
+                EMITS(foot);
+                EMITS("\r\n");
+            }
+            EMIT('\f');
+            row = 0;
+        }
+    }
+    #undef EMIT
+    #undef EMITS
+    *out_len = n;
+    *pages = page;
+    return o;
+}
+
+static void print(void)
+{
+    if (DialogBox(&print_dlg, np, print_proc, 0) != IDOK)
+        return;
+    char path[128];
+    strncpy0(path, file_path[0] ? base_name(file_path) : "untitled", sizeof path);
+    char *dot = strrchr(path, '.');
+    if (dot) *dot = '\0';
+    strncpy0(path + strlen(path), ".prn", sizeof path - strlen(path));
+    OPENFILENAME ofn = { np, "*.PRN", path, sizeof path, "Print to File", "PRN", OFN_OVERWRITEPROMPT,
+                         "Printer files (*.PRN)\0*.PRN\0All files (*.*)\0*.*\0", 1 };
+    if (!GetSaveFileName(&ofn))
+        return;
+    int len;
+    char *t = text_copy(&len);
+    if (!t) return;
+    int n, pages;
+    char *out = paginate(t, len, file_path[0] ? base_name(file_path) : "Untitled", &n, &pages);
+    LocalFree(t);
+    if (!out) return;
+    HANDLE f = CreateFile(path, GENERIC_WRITE, CREATE_ALWAYS);
+    bool ok = f != INVALID_HANDLE_VALUE;
+    for (int k = 0; ok && k < copies; k++) {
+        uint32_t done = 0;
+        ok = WriteFile(f, out, (uint32_t)n, &done) && done == (uint32_t)n;
+    }
+    if (f != INVALID_HANDLE_VALUE) CloseHandle(f);
+    LocalFree(out);
+    if (!ok) {
+        complain("Cannot print to ", path);
+        return;
+    }
+    DebugLog("notepad printed %d page(s) x %d to %s", pages, copies, path);
+}
+
 static void set_wrap(bool on)
 {
     unsigned style = (unsigned)GetWindowLong(edit, GWL_STYLE);
@@ -325,7 +505,8 @@ static void command(int id)
         if (!may_discard())
             break;
         char path[128] = "";
-        OPENFILENAME ofn = { np, "*.TXT", path, sizeof path, NULL, "TXT", OFN_FILEMUSTEXIST };
+        OPENFILENAME ofn = { np, "*.TXT", path, sizeof path, NULL, "TXT", OFN_FILEMUSTEXIST,
+                         "Text documents (*.TXT)\0*.TXT\0All files (*.*)\0*.*\0", 1 };
         if (GetOpenFileName(&ofn))
             load(path);
         break;
@@ -348,6 +529,8 @@ static void command(int id)
         else open_find(false);
         break;
     case ID_ABOUT:    ShellAbout(np, "Notepad", NULL); break;
+    case ID_STATUSBAR: set_status(!status_on); break;
+    case ID_PRINT:    print(); break;
     }
 }
 
@@ -357,9 +540,16 @@ static LRESULT np_proc(HWND h, unsigned msg, WPARAM wp, LPARAM lp)
     case WM_CREATE:
         edit = CreateWindow(WC_EDIT, "", WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_HSCROLL |
                             ES_MULTILINE, 0, 0, 100, 100, h, ID_EDIT, NULL);
+        status = CreateStatusWindow(SBARS_SIZEGRIP, "", h, ID_STATUS);
+        if (status) ShowWindow(status, SW_HIDE);
+        SendMessage(edit, EM_LIMITTEXT, MAX_FILE, 0);
+        SetTimer(h, 1, 250);
         return edit ? 0 : -1;
     case WM_SIZE:
-        MoveWindow(edit, 0, 0, LOWORD(lp), HIWORD(lp), true);
+        if (edit) layout();
+        return 0;
+    case WM_TIMER:
+        show_status();
         return 0;
     case WM_ACTIVATE:
         if (LOWORD(wp) != WA_INACTIVE)
@@ -427,7 +617,11 @@ int main(void)
     AppendMenu(edit_menu, MF_STRING, ID_TIMEDATE, "Time/&Date\tF5");
     AppendMenu(edit_menu, MF_SEPARATOR, 0, NULL);
     AppendMenu(edit_menu, MF_STRING, ID_WRAP, "&Word Wrap");
+    InsertMenu(file, 5, MF_BYPOSITION | MF_STRING, ID_PRINT, "&Print...\tCtrl+P");
+    InsertMenu(file, 6, MF_BYPOSITION | MF_SEPARATOR, 0, NULL);
     HMENU search = CreatePopupMenu();
+    view_menu = CreatePopupMenu();
+    AppendMenu(view_menu, MF_STRING, ID_STATUSBAR, "&Status Bar");
     AppendMenu(search, MF_STRING, ID_FIND, "&Find...\tCtrl+F");
     AppendMenu(search, MF_STRING, ID_FINDNEXT, "Find &Next\tF3");
     AppendMenu(search, MF_STRING, ID_REPLACE, "&Replace...\tCtrl+H");
@@ -435,6 +629,7 @@ int main(void)
     AppendMenu(bar, MF_POPUP, (uintptr_t)file, "&File");
     AppendMenu(bar, MF_POPUP, (uintptr_t)edit_menu, "&Edit");
     AppendMenu(bar, MF_POPUP, (uintptr_t)search, "&Search");
+    AppendMenu(bar, MF_POPUP, (uintptr_t)view_menu, "&View");
     AppendMenu(bar, MF_POPUP, (uintptr_t)help, "&Help");
     np = CreateWindow("NotepadWindow", "Untitled - Notepad", WS_OVERLAPPEDWINDOW, 70, 40, 480, 340,
                       NULL, 0, NULL);
@@ -445,9 +640,9 @@ int main(void)
         { FVIRTKEY | FCONTROL, 'N', ID_NEW }, { FVIRTKEY | FCONTROL, 'O', ID_OPEN },
         { FVIRTKEY | FCONTROL, 'S', ID_SAVE }, { FVIRTKEY, VK_F1 + 4, ID_TIMEDATE },
         { FVIRTKEY | FCONTROL, 'F', ID_FIND }, { FVIRTKEY, VK_F1 + 2, ID_FINDNEXT },
-        { FVIRTKEY | FCONTROL, 'H', ID_REPLACE },
+        { FVIRTKEY | FCONTROL, 'H', ID_REPLACE }, { FVIRTKEY | FCONTROL, 'P', ID_PRINT },
     };
-    HACCEL acc = CreateAcceleratorTable(keys, 7);
+    HACCEL acc = CreateAcceleratorTable(keys, sizeof keys / sizeof keys[0]);
     const char *arg = GetStartupInfo()->args;
     if (arg[0])
         load(arg);

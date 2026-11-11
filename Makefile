@@ -18,6 +18,7 @@
 #   make qemu-shell the shell and its programs, each a process
 #   make qemu-files file access: Paint's Open/Save, the file dialogs, the disk
 #   make qemu-notepad  Notepad and the multi-line edit control, the clipboard
+#   make qemu-explorer Explorer, the tree view and the list view (its four views)
 #   make qemu-tasklist Ctrl+Alt+Del: Close Program, and the VMM's screen for a hung GUI
 #   make qemu-vesa     the VBE display driver: higher resolutions and colour depths
 #   make qemu-crt      the C runtime (CRT.DLL, libcrt.a) and its protections
@@ -81,20 +82,20 @@ CRT_OBJ   := $(U)/hdr/CRT.DLL.o $(CRT_CODE) $(SSP) $(U)/gen/crt_exports.o $(U)/g
 WSOCK_OBJ := $(U)/hdr/WSOCK.DLL.o $(U)/net/wsock.o $(U)/gen/wsock_exports.o $(U)/gen/krnl_imports.o $(SSP) $(LIBCRT)
 
 # DLLs: header, code, export table, import libraries of what they call
-KRNL_OBJ  := $(U)/hdr/KERNEL.DLL.o $(U)/krnl/krnl.o $(U)/krnl/thread.o $(U)/krnl/heap.o \
+KRNL_OBJ  := $(U)/hdr/KERNEL.DLL.o $(U)/krnl/krnl.o $(U)/krnl/thread.o $(U)/krnl/heap.o $(U)/krnl/profile.o \
              $(U)/gen/krnl_exports.o $(SSP) $(LIBCRT)
 GFX_OBJ   := $(U)/hdr/GFX.DLL.o $(U)/gfx/gfx.o $(U)/gen/gfx_exports.o $(SSP) $(LIBCRT)
 UI_SRC    := wnd queue input frame paint display menu accel msgbox dialog button static edit medit listbox \
-             scroll trackbar combo tab updown kbd theme
+             scroll trackbar combo tab updown kbd theme imagelist treeview listview statusbar toolbar tooltip
 UI_OBJ    := $(U)/hdr/UI.DLL.o $(patsubst %,$(U)/ui/%.o,$(UI_SRC)) \
              $(U)/gen/ui_exports.o $(U)/gen/gfx_imports.o $(U)/gen/krnl_imports.o $(SSP) $(LIBCRT)
-SHELL_OBJ := $(U)/hdr/SHELL.DLL.o $(U)/shell/shell.o $(U)/shell/icons.o $(U)/shell/filedlg.o $(U)/shell/findrepl.o \
+SHELL_OBJ := $(U)/hdr/SHELL.DLL.o $(U)/shell/shell.o $(U)/shell/icons.o $(U)/shell/filedlg.o $(U)/shell/colordlg.o $(U)/shell/findrepl.o \
              $(U)/shell/console.o $(U)/gen/shell_exports.o \
              $(U)/gen/ui_imports.o $(U)/gen/krnl_imports.o $(SSP) $(LIBCRT)
 
 # Programs: user/apps/<name>.c, each a process of its own, sharing CRT.DLL.
 # CRTSTAT.BIN is CRTTEST.BIN with the C runtime linked in (libcrt.a).
-APPS      := SHELL DEMO CALC PAINT CLOCK NOTEPAD HANG CRTTEST THRTEST PING IPCONFIG NETTEST FSTEST
+APPS      := SHELL DEMO CALC PAINT CLOCK NOTEPAD EXPLORER HANG CRTTEST THRTEST PING IPCONFIG NETTEST FSTEST
 APP_LIBS  := $(U)/lib/crt0.o $(U)/gen/krnl_imports.o $(U)/gen/ui_imports.o \
              $(U)/gen/shell_imports.o $(U)/gen/crt_imports.o $(U)/gen/wsock_imports.o $(SSP)
 app_obj    = $(U)/hdr/$(1).BIN.o $(U)/apps/$(shell echo $(1) | tr A-Z a-z).o $(APP_LIBS)
@@ -112,7 +113,7 @@ KERNEL_ASM := $(wildcard kernel/*.asm)
 KERNEL_OBJ := $(patsubst kernel/%.asm,$(BUILD)/kernel/%.o,$(KERNEL_ASM)) \
               $(patsubst kernel/%.c,$(BUILD)/kernel/%.o,$(KERNEL_C))
 
-.PHONY: all run test check486 qemu qemu-test qemu-emm386 qemu-sessions qemu-vga qemu-wm qemu-absmouse qemu-menu qemu-controls qemu-msgbox qemu-shell qemu-files qemu-notepad qemu-tasklist qemu-vesa qemu-crt qemu-threads qemu-net qemu-fat clean
+.PHONY: all run test check486 qemu qemu-test qemu-emm386 qemu-sessions qemu-vga qemu-wm qemu-absmouse qemu-menu qemu-controls qemu-msgbox qemu-shell qemu-files qemu-notepad qemu-explorer qemu-tasklist qemu-vesa qemu-crt qemu-threads qemu-net qemu-fat clean
 
 all: $(BUILD)/OS1993.COM $(BUILD)/VMM.BIN $(MODULES)
 
@@ -315,6 +316,9 @@ qemu-files: all
 
 qemu-notepad: all
 	@tools/qemu-notepad-test.py
+
+qemu-explorer: all
+	@tools/qemu-explorer-test.py
 
 qemu-tasklist: all
 	@tools/qemu-tasklist-test.py

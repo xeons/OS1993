@@ -206,7 +206,7 @@ class Machine:
 
     def type(self, text):
         for ch in text:
-            self.key(KEYS.get(ch, ch))
+            self.key("shift-" + ch.lower() if ch.isupper() else KEYS.get(ch, ch))
 
     def log(self):
         try:

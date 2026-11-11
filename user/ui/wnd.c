@@ -118,6 +118,7 @@ bool RegisterClass(const WNDCLASS *wc)
     c->extra = wc->extra;
     c->background = wc->background;
     c->icon = wc->icon;
+    c->cursor = wc->cursor;
     return true;
 }
 
@@ -135,7 +136,9 @@ void ui_init_classes(void)
 {
     builtin(WC_BUTTON, button_proc, false);
     builtin(WC_STATIC, static_proc, true);
-    builtin(WC_EDIT, edit_proc, false)->style |= CS_DBLCLKS;
+    struct wclass *ec = builtin(WC_EDIT, edit_proc, false);
+    ec->style |= CS_DBLCLKS;
+    ec->cursor = IDC_IBEAM;
     builtin(WC_LISTBOX, listbox_proc, false)->style |= CS_DBLCLKS;
     builtin(WC_SCROLLBAR, scrollbar_proc, false);
     builtin(WC_TRACKBAR, trackbar_proc, false);
@@ -143,6 +146,14 @@ void ui_init_classes(void)
     builtin(WC_COMBOBOX, combo_proc, false);
     builtin(WC_TABCONTROL, tab_proc, false);
     builtin(WC_UPDOWN, updown_proc, false);
+    builtin(WC_TREEVIEW, treeview_proc, false)->style |= CS_DBLCLKS;
+    builtin(WC_LISTVIEW, listview_proc, false)->style |= CS_DBLCLKS;
+    builtin(STATUSCLASSNAME, statusbar_proc, false);
+    builtin(TOOLBARCLASSNAME, toolbar_proc, false)->style |= CS_DBLCLKS;
+    struct wclass *tc = builtin(TOOLTIPS_CLASS, tooltip_proc, false);
+    tc->noactivate = true;
+    tc->exstyle = WS_EX_TOPMOST | WS_EX_TOOLWINDOW;
+    builtin("#32770", dialog_proc, false);
     builtin("#MENU", menu_popup_proc, false)->noactivate = true;   /* menus never activate */
     builtin("#COMBOLBOX", combolist_proc, false)->noactivate = true;   /* nor combo lists */
     builtin("#MSGBOX", msgbox_proc, false);
@@ -247,6 +258,40 @@ static void tops_remove(struct wnd *w)
     S->ntops--;
 }
 
+/* Alt+Esc: t (and the windows it owns) to the bottom of its band; the
+ * next window up becomes active. */
+void wnd_lower(struct wnd *t)
+{
+    if (!t || t->parent || t == S->desktop)
+        return;
+    struct wnd *move[WND_MAX];
+    int n = 0;
+    move[n++] = t;
+    for (int k = 0; k < S->ntops; k++)
+        if (S->tops[k]->owner == t)
+            move[n++] = S->tops[k];
+    for (int m = n - 1; m >= 0; m--) {          /* owned ones stay above it */
+        tops_remove(move[m]);
+        int i = 0;
+        while (i < S->ntops && band(S->tops[i]) < band(move[m]))
+            i++;
+        for (int k = S->ntops; k > i; k--)
+            S->tops[k] = S->tops[k - 1];
+        S->tops[i] = move[m];
+        S->ntops++;
+        ui_invalidate_wnd(move[m]);
+    }
+    for (int i = S->ntops - 1; i >= 0; i--) {
+        struct wnd *c = S->tops[i];
+        if (c->visible && c->enabled && c->state != WS_STATE_MIN && c != S->desktop &&
+            !(c->exstyle & (WS_EX_NOACTIVATE | WS_EX_TOPMOST))) {
+            if (c != t)
+                wnd_activate(c);                /* already the top: no raise */
+            return;
+        }
+    }
+}
+
 void wnd_raise(struct wnd *t)
 {
     int i = 0;
@@ -309,7 +354,7 @@ HWND CreateWindowEx(unsigned exstyle, const char *cls, const char *text, unsigne
     n->cls = c;
     n->proc = c->proc;
     n->style = style;
-    n->exstyle = exstyle | (c->noactivate ? WS_EX_NOACTIVATE : 0);
+    n->exstyle = exstyle | (c->noactivate ? WS_EX_NOACTIVATE : 0) | c->exstyle;
     n->id = id;
     n->x = x; n->y = y; n->w = w; n->h = h;
     n->visible = (style & WS_VISIBLE) != 0;
@@ -327,6 +372,10 @@ HWND CreateWindowEx(unsigned exstyle, const char *cls, const char *text, unsigne
     } else {
         tops_insert(n);
     }
+    RECT cr;
+    GetClientRect(n, &cr);
+    n->cw0 = cr.right;
+    n->ch0 = cr.bottom;
 
     if (SendMessage(n, WM_CREATE, 0, (LPARAM)param) == -1) {
         DestroyWindow(n);
@@ -460,6 +509,7 @@ bool MoveWindow(HWND h, int x, int y, int w, int hh, bool repaint)
     if (n->visible) ui_invalidate_wnd(n);
     n->x = x; n->y = y; n->w = w; n->h = hh;
     if (n->visible && repaint) ui_invalidate_wnd(n);
+    ui_reflow(n);
     RECT c;
     GetClientRect(n, &c);
     wnd_notify(n, WM_SIZE, 0, MAKELPARAM(c.right, c.bottom));
@@ -726,7 +776,7 @@ HWND SetCapture(HWND h)
     return old;
 }
 
-bool ReleaseCapture(void) { S->capture = NULL; return true; }
+bool ReleaseCapture(void) { S->capture = NULL; S->in.cur_key = 0; return true; }
 HWND GetCapture(void)     { return S->capture; }
 
 /* ---- the shell's view ------------------------------------------------------ */
@@ -780,7 +830,84 @@ bool SetClipboardText(const char *text, int len)
     memcpy(S->clip, text, (size_t)len);
     S->clip[len] = '\0';
     S->clip_len = len;
+    S->clipbmp_w = S->clipbmp_h = 0;            /* one thing at a time */
+    S->clip_files = false;
     return true;
+}
+
+/* Files (full paths, each NUL-ended, a NUL after the last) copied or cut
+ * by Explorer, to be pasted somewhere else. */
+bool SetClipboardFiles(const char *paths, bool cut)
+{
+    if (!paths) return false;
+    int n = 0;
+    while (paths[n]) n += (int)strlen(paths + n) + 1;
+    if (n + 1 > CLIP_MAX) return false;
+    memcpy(S->clip, paths, (size_t)n + 1);
+    S->clip_len = 0;                            /* (not text) */
+    S->clipbmp_w = S->clipbmp_h = 0;
+    S->clip_files = true;
+    S->clip_cut = cut;
+    S->clip_n = n + 1;
+    return true;
+}
+
+int GetClipboardFiles(char *out, int size, bool *cut)
+{
+    if (!S->clip_files) return 0;
+    if (cut) *cut = S->clip_cut;
+    if (out && size >= S->clip_n) memcpy(out, S->clip, (size_t)S->clip_n);
+    return S->clip_n;
+}
+
+void EmptyClipboard(void)
+{
+    S->clip_len = 0;
+    S->clip[0] = '\0';
+    S->clipbmp_w = S->clipbmp_h = 0;
+    S->clip_files = false;
+}
+
+/* A picture in the theme's 16 colours, one byte a pixel (FFh: white). */
+bool SetClipboardBitmap(int w, int h, const uint8_t *pixels)
+{
+    if (!pixels || w <= 0 || h <= 0 || (w + 1) / 2 * h > CLIPBMP_MAX)
+        return false;
+    int row = (w + 1) / 2;
+    for (int y = 0; y < h; y++)
+        for (int x = 0; x < w; x += 2) {
+            uint8_t a = pixels[y * w + x], b = x + 1 < w ? pixels[y * w + x + 1] : 0;
+            S->clipbmp[y * row + x / 2] = (uint8_t)((a & 15) << 4 | (b & 15));
+        }
+    S->clipbmp_w = w;
+    S->clipbmp_h = h;
+    S->clip_len = 0;
+    S->clip[0] = '\0';
+    S->clip_files = false;
+    return true;
+}
+
+/* -> true if there is one; its size; the pixels if out has room (w * h). */
+bool GetClipboardBitmap(int *w, int *h, uint8_t *out, int room)
+{
+    if (!S->clipbmp_w)
+        return false;
+    if (w) *w = S->clipbmp_w;
+    if (h) *h = S->clipbmp_h;
+    int bw = S->clipbmp_w, bh = S->clipbmp_h, row = (bw + 1) / 2;
+    if (out && room >= bw * bh)
+        for (int y = 0; y < bh; y++)
+            for (int x = 0; x < bw; x++) {
+                uint8_t v = S->clipbmp[y * row + x / 2];
+                out[y * bw + x] = x & 1 ? v & 15 : v >> 4;
+            }
+    return true;
+}
+
+bool IsClipboardFormatAvailable(unsigned format)
+{
+    return format == CF_TEXT ? S->clip_len > 0 : format == CF_BITMAP ? S->clipbmp_w > 0 :
+           format == CF_FILES ? S->clip_files : false;
 }
 
 int GetClipboardText(char *buf, int max)
@@ -842,6 +969,8 @@ LRESULT DefWindowProc(HWND h, unsigned msg, WPARAM wp, LPARAM lp)
     case WM_CLOSE:
         DestroyWindow(h);
         return 0;
+    case WM_NCHITTEST:
+        return HTCLIENT;
     case WM_NCLBUTTONDOWN:                     /* a click on the frame */
         ui_track_frame(w, (int)wp, GET_X_LPARAM(lp), GET_Y_LPARAM(lp));
         return 0;
@@ -896,4 +1025,100 @@ LRESULT DefWindowProc(HWND h, unsigned msg, WPARAM wp, LPARAM lp)
     }
     }
     return 0;
+}
+
+HCURSOR SetWindowCursor(HWND h, HCURSOR cursor)
+{
+    struct wnd *w = wnd_from(h);
+    if (!w) return 0;
+    HCURSOR old = w->cursor;
+    w->cursor = cursor;
+    S->in.cur_key = 0;                          /* look again at the next move */
+    return old;
+}
+
+HWND WindowFromPoint(POINT p)
+{
+    for (int i = S->ntops - 1; i >= 0; i--) {
+        struct wnd *t = S->tops[i];
+        if (!t->visible || !frame_shown(t) || t->cls->proc == tooltip_proc)
+            continue;
+        RECT o, c;
+        frame_outer(t, &o);
+        if (!rect_contains(&o, p.x, p.y))
+            continue;
+        frame_client(t, &c);
+        if (t->state == WS_STATE_MIN || !rect_contains(&c, p.x, p.y))
+            return t;
+        int cx, cy;
+        wnd_client_screen(t, &cx, &cy);
+        return wnd_child_at(t, p.x - cx, p.y - cy);
+    }
+    return NULL;
+}
+
+HWND CreateStatusWindow(unsigned style, const char *text, HWND parent, int id)
+{
+    return CreateWindow(STATUSCLASSNAME, text ? text : "", style | WS_CHILD, 0, 0, 0, 0, parent, id, NULL);
+}
+
+/* Children with anchors keep their distance from the parent's edges they
+ * are anchored to: right (or bottom) alone moves them, left and right (top
+ * and bottom) together stretch them. */
+void ui_reflow(struct wnd *p)
+{
+    RECT c;
+    GetClientRect(p, &c);
+    int dw = c.right - p->cw0, dh = c.bottom - p->ch0;
+    p->cw0 = c.right;
+    p->ch0 = c.bottom;
+    if (!dw && !dh)
+        return;
+    for (struct wnd *k = p->first; k; k = k->next) {
+        unsigned a = k->anchor;
+        if (!(a & (ANCHOR_RIGHT | ANCHOR_BOTTOM)))
+            continue;
+        int x = k->x, y = k->y, w = k->w, h = k->h;
+        if (a & ANCHOR_RIGHT) { if (a & ANCHOR_LEFT) w += dw; else x += dw; }
+        if (a & ANCHOR_BOTTOM) { if (a & ANCHOR_TOP) h += dh; else y += dh; }
+        if (w < 0) w = 0;
+        if (h < 0) h = 0;
+        MoveWindow(k, x, y, w, h, true);
+    }
+}
+
+bool SetWindowAnchor(HWND h, unsigned anchors)
+{
+    struct wnd *w = wnd_from(h);
+    if (!w || !w->parent) return false;
+    w->anchor = (uint8_t)anchors;
+    return true;
+}
+
+bool ScreenToClient(HWND h, POINT *p)
+{
+    struct wnd *w = wnd_from(h);
+    if (!w || !p) return false;
+    int ox, oy;
+    wnd_client_screen(w, &ox, &oy);
+    p->x -= ox;
+    p->y -= oy;
+    return true;
+}
+
+bool ClientToScreen(HWND h, POINT *p)
+{
+    struct wnd *w = wnd_from(h);
+    if (!w || !p) return false;
+    int ox, oy;
+    wnd_client_screen(w, &ox, &oy);
+    p->x += ox;
+    p->y += oy;
+    return true;
+}
+
+bool IsZoomed(HWND h)
+{
+    struct wnd *w = wnd_from(h);
+    return w && w->state == WS_STATE_MAX;
 }

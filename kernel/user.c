@@ -30,6 +30,7 @@
 #include "mm.h"
 #include "sched.h"
 #include "user.h"
+void speaker_beep(unsigned hz, unsigned ms);   /* timer.c */
 #include "random.h"
 #include "net.h"
 #include "fs.h"
@@ -1526,6 +1527,10 @@ void syscall_dispatch(struct regs *r)
     }
     case SYS_TICKS:
         r->eax = timer_ticks();
+        break;
+    case SYS_BEEP:
+        speaker_beep(r->ebx, r->ecx > 5000 ? 5000 : r->ecx);
+        r->eax = 0;
         break;
     case SYS_RANDOM:
         if (r->ecx > 256 || !user_writable(r->ebx, r->ecx)) {

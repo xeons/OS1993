@@ -7,8 +7,11 @@ EXPORTS
     Shell_NotifyIcon
     DrawIcon
     DrawSmallIcon
+    GetIconPixels
+    ImageList_AddIcon
     GetOpenFileName
     GetSaveFileName
+    ChooseColor
     FindText
     ReplaceText
     ConsoleWrite

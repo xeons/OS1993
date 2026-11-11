@@ -9,6 +9,10 @@
  * and pressed by Enter -- rightmost. Esc and the close box mean Cancel
  * (OK in an OK-only box); Yes/No/Abort/Retry/Ignore answer to their
  * initial letters too. Icons: stop sign, caution triangle, note, question.
+ *
+ * MB_TASKMODAL disables every window of the program, MB_SYSTEMMODAL every
+ * window of every program, and keeps the box above them all (MB_TOPMOST
+ * just the latter). The box beeps as it opens, the tone by its icon.
  */
 #include "uipriv.h"
 
@@ -117,12 +121,14 @@ static void paint_icon(HDC dc, int x, int y, unsigned icon)
 
 static void wrap(struct mbox *mb, const char *s)
 {
-    int cols = WRAP_W / 8;
     mb->nlines = 0;
     mb->textw = 0;
     while (*s && mb->nlines < LINE_MAX) {
-        int n = 0, brk = -1;
-        while (s[n] && s[n] != '\n' && n < cols) {
+        int n = 0, brk = -1, px = 0;
+        while (s[n] && s[n] != '\n') {
+            int cw = TextWidthFont(FONT_GUI, s + n, 1);
+            if (px + cw > WRAP_W) break;
+            px += cw;
             if (s[n] == ' ') brk = n;
             n++;
         }
@@ -131,7 +137,8 @@ static void wrap(struct mbox *mb, const char *s)
         if (n >= LINE_LEN) n = LINE_LEN - 1;
         memcpy(mb->lines[mb->nlines], s, (size_t)n);
         mb->lines[mb->nlines][n] = '\0';
-        if (n * 8 > mb->textw) mb->textw = n * 8;
+        int lw = TextWidthFont(FONT_GUI, mb->lines[mb->nlines], -1);
+        if (lw > mb->textw) mb->textw = lw;
         mb->nlines++;
         s += n;
         if (*s == '\n' || *s == ' ')
@@ -208,6 +215,7 @@ LRESULT msgbox_proc(HWND h, unsigned msg, WPARAM wp, LPARAM lp)
     case WM_PAINT: {
         PAINTSTRUCT ps;
         HDC dc = BeginPaint(h, &ps);
+        SelectFont(dc, FONT_GUI);
         int ty = MARGIN + (text_h(mb) - mb->nlines * 16) / 2;
         if (mb->type & MB_ICONMASK)
             paint_icon(dc, MARGIN, MARGIN, mb->type & MB_ICONMASK);
@@ -237,6 +245,19 @@ LRESULT msgbox_proc(HWND h, unsigned msg, WPARAM wp, LPARAM lp)
     return DefWindowProc(h, msg, wp, lp);
 }
 
+/* The PC speaker's alert for a kind of box (MB_ICON*; 0xFFFFFFFF a plain beep). */
+bool MessageBeep(unsigned type)
+{
+    switch (type & MB_ICONMASK) {
+    case MB_ICONHAND:        Beep(220, 300); break;
+    case MB_ICONQUESTION:    Beep(660, 120); break;
+    case MB_ICONEXCLAMATION: Beep(880, 200); break;
+    case MB_ICONASTERISK:    Beep(1320, 100); break;
+    default:                 Beep(750, 150); break;
+    }
+    return true;
+}
+
 int MessageBox(HWND owner, const char *text, const char *caption, unsigned type)
 {
     struct mbox mb;
@@ -260,12 +281,27 @@ int MessageBox(HWND owner, const char *text, const char *caption, unsigned type)
     bool reenable = ow && ow->enabled;
     if (ow)
         EnableWindow(ow, false);
-    HWND box = CreateWindow("#MSGBOX", caption ? caption : "Error", WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
-                            x, y, w, h, ow, 0, &mb);
+    struct wnd *off[WND_MAX];                       /* task / system modal: the rest disabled */
+    int noff = 0;
+    if (type & (MB_TASKMODAL | MB_SYSTEMMODAL))
+        for (int i = 0; i < S->ntops; i++) {
+            struct wnd *t = S->tops[i];
+            if (t != ow && t->visible && t->enabled && t != S->desktop &&
+                ((type & MB_SYSTEMMODAL) || t->pid == ui_pid)) {
+                off[noff++] = t;
+                EnableWindow(t, false);
+            }
+        }
+    unsigned ex = (type & (MB_SYSTEMMODAL | MB_TOPMOST)) ? WS_EX_TOPMOST : 0;
+    HWND box = CreateWindowEx(ex, "#MSGBOX", caption ? caption : "Error", WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
+                              x, y, w, h, ow, 0, &mb);
     if (!box) {
         if (reenable) EnableWindow(ow, true);
+        for (int i = 0; i < noff; i++)
+            if (wnd_from(off[i])) EnableWindow(off[i], true);
         return 0;
     }
+    MessageBeep(type);
     if (!mb.cancel)                                 /* nothing to cancel with */
         EnableMenuItem(GetSystemMenu(box, false), SC_CLOSE, MF_GRAYED);
 
@@ -296,6 +332,8 @@ int MessageBox(HWND owner, const char *text, const char *caption, unsigned type)
     }
     if (reenable && wnd_from(ow))
         EnableWindow(ow, true);
+    for (int i = 0; i < noff; i++)
+        if (wnd_from(off[i])) EnableWindow(off[i], true);
     if (IsWindow(box))
         DestroyWindow(box);
     if (ow && wnd_from(ow))

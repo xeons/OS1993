@@ -12,6 +12,7 @@
 void ExitProcess(int code)                  { sys_exit(code); }
 void OutputDebugString(const char *s)       { sys_print(s); }
 uint32_t GetTickCount(void)                 { return sys_ticks() * 55; }  /* 18.2 Hz */
+bool Beep(unsigned freq, unsigned ms)       { sys_beep(freq, ms); return true; }   /* doesn't wait */
 const struct user_info *GetStartupInfo(void){ return (const struct user_info *)USER_INFO; }
 int  StartDosSession(void)                  { return sys_new_session(); }
 bool GetInputEvent(struct user_event *e)    { return sys_get_event(e) == 1; }
@@ -404,6 +405,46 @@ uint32_t GetFullPathName(const char *path, uint32_t size, char *buf, char **file
         *file_part = *last ? last : NULL;
     }
     return (uint32_t)rc;
+}
+
+uint32_t GetLogicalDrives(void)
+{
+    struct file_args a = { 0 };
+    int rc = file_call(FOP_DRIVES, &a);
+    return rc < 0 ? 0 : (uint32_t)rc;
+}
+
+static bool vol_info(const char *root, struct vol_info *vi)
+{
+    struct file_args a = { .path = root, .buf = vi };
+    return file_call(FOP_VOLINFO, &a) >= 0;
+}
+
+unsigned GetDriveType(const char *root)
+{
+    struct vol_info vi;
+    if (!root)
+        root = ".";
+    return vol_info(root, &vi) ? vi.type : 1;           /* DRIVE_NO_ROOT_DIR */
+}
+
+bool GetVolumeInformation(const char *root, char *label, uint32_t label_size, uint32_t *serial,
+                          uint32_t *max_component, uint32_t *flags, char *fs_name, uint32_t fs_size)
+{
+    struct vol_info vi;
+    if (!root || !vol_info(root, &vi))
+        return false;
+    if (label && label_size)
+        strncpy0(label, vi.label, label_size);
+    if (fs_name && fs_size)
+        strncpy0(fs_name, vi.fs, fs_size);
+    if (serial)
+        *serial = vi.serial;
+    if (max_component)
+        *max_component = 255;
+    if (flags)
+        *flags = 0;
+    return true;
 }
 
 bool GetDiskFreeSpace(const char *root, uint32_t *sectors_per_cluster, uint32_t *bytes_per_sector,

@@ -172,6 +172,132 @@ static const char *const art[ICON_COUNT][16] = {
         "................",
         "................",
     },
+    [ICON_FOLDER] = {
+        "................",
+        "................",
+        "..kkkkk.........",
+        ".kyyyyyk........",
+        "kyyyyyyykkkkkkk.",
+        "kylllllllllllyk3",
+        "kylyyyyyyyyyyyk3",
+        "kyyyyyyyyyyyyyk3",
+        "kyyyyyyyyyyyyyk3",
+        "kyyyyyyyyyyyyyk3",
+        "kyyyyyyyyyyyyyk3",
+        "kyyyyyyyyyyyyyk3",
+        "kyyyyyyyyyyyyyk3",
+        "kkkkkkkkkkkkkkk3",
+        ".333333333333333",
+        "................",
+    },
+    [ICON_FOLDER_OPEN] = {
+        "................",
+        "................",
+        "..kkkkk.........",
+        ".kyyyyyk........",
+        "kyyyyyyykkkkkk..",
+        "kylllllllllllk..",
+        "kyl...kkkkkkkkkk",
+        "kyl..kllllllllyk",
+        "kyl.klyyyyyyyyk.",
+        "kylklyyyyyyyyyk.",
+        "kykllyyyyyyyyk..",
+        "kkllyyyyyyyyyk..",
+        "kklyyyyyyyyyk...",
+        "kkkkkkkkkkkkk...",
+        "................",
+        "................",
+    },
+    [ICON_DRIVE] = {
+        "................",
+        "................",
+        "................",
+        "................",
+        "...kkkkkkkkkkk..",
+        "..kwwwwwwwwwwk3.",
+        ".kwwwwwwwwwwk33.",
+        "kkkkkkkkkkkkk33.",
+        "kwwwwwwwwwwwk33.",
+        "kw55555555ggk3..",
+        "kw555555555wk3..",
+        "kwwwwwwwwwwwk...",
+        "kkkkkkkkkkkkk...",
+        ".3333333333333..",
+        "................",
+        "................",
+    },
+    [ICON_FLOPPY] = {
+        "................",
+        ".kkkkkkkkkkkkk..",
+        ".kdk5555555kdk..",
+        ".kdk5555555kdk..",
+        ".kdk55kk555kdk..",
+        ".kdk55kk555kdk..",
+        ".kdkkkkkkkkkdk..",
+        ".kdddddddddddk..",
+        ".kddwwwwwwwddk..",
+        ".kddwkkkkkwddk..",
+        ".kddwwwwwwwddk..",
+        ".kddwkkkkkwddk..",
+        ".kddwwwwwwwddk..",
+        ".kkkkkkkkkkkkk..",
+        "................",
+        "................",
+    },
+    [ICON_DOCUMENT] = {
+        "..kkkkkkkk......",
+        "..kwwwwwwkk.....",
+        "..kwwwwwwk5k....",
+        "..kwwwwwwk55k...",
+        "..kwwwwwwkkkkk..",
+        "..kwwwwwwwwwwk..",
+        "..kwwwwwwwwwwk..",
+        "..kwwwwwwwwwwk..",
+        "..kwwwwwwwwwwk..",
+        "..kwwwwwwwwwwk..",
+        "..kwwwwwwwwwwk..",
+        "..kwwwwwwwwwwk..",
+        "..kwwwwwwwwwwk..",
+        "..kwwwwwwwwwwk..",
+        "..kkkkkkkkkkkk..",
+        "................",
+    },
+    [ICON_TEXT] = {
+        "..kkkkkkkk......",
+        "..kwwwwwwkk.....",
+        "..kwwwwwwk5k....",
+        "..kw3333wk55k...",
+        "..kwwwwwwkkkkk..",
+        "..kw33333333wk..",
+        "..kwwwwwwwwwwk..",
+        "..kw3333333wwk..",
+        "..kwwwwwwwwwwk..",
+        "..kw33333333wk..",
+        "..kwwwwwwwwwwk..",
+        "..kw333333wwwk..",
+        "..kwwwwwwwwwwk..",
+        "..kwwwwwwwwwwk..",
+        "..kkkkkkkkkkkk..",
+        "................",
+    },
+    [ICON_EXPLORER] = {
+        "................",
+        "..kkkkk.........",
+        ".kyyyyyk........",
+        "kyyyyyyykkkkkk..",
+        "kylllllllllllk..",
+        "kylyyyyyyyyyyk..",
+        "kyyyyyykkkkyyk..",
+        "kyyyyykAAAAkyk..",
+        "kyyyykAwAAAAkk..",
+        "kyyyykAAAAAAkk..",
+        "kyyyykAAAAAAkk..",
+        "kkkkkkkAAAAkkk..",
+        ".......kkkkkk...",
+        "...........kkk..",
+        "............kkk.",
+        ".............kk.",
+    },
     [ICON_SHUTDOWN] = {
         ".....kkkkkk.....",
         "...kkrrrrrrkk...",
@@ -229,3 +355,31 @@ static void draw(HDC dc, int x, int y, int icon, int scale)
 
 void DrawIcon(HDC dc, int x, int y, int icon)      { draw(dc, x, y, icon, 2); }
 void DrawSmallIcon(HDC dc, int x, int y, int icon) { draw(dc, x, y, icon, 1); }
+
+int ImageList_AddIcon(HIMAGELIST il, int icon)
+{
+    int cx, cy;
+    if (!ImageList_GetIconSize(il, &cx, &cy) || cx != cy || (cx != 16 && cx != 32))
+        return -1;
+    if (icon <= ICON_NONE || icon >= ICON_COUNT || !art[icon][0])
+        icon = ICON_APP;
+    uint8_t px[32 * 32];
+    int scale = cx / 16;
+    for (int r = 0; r < cx; r++)
+        for (int c = 0; c < cx; c++)
+            px[r * cx + c] = colour(art[icon][r / scale][c / scale]);
+    return ImageList_AddPixels(il, px);
+}
+
+bool GetIconPixels(int icon, int size, uint8_t *out)
+{
+    if (!out || (size != 16 && size != 32))
+        return false;
+    if (icon <= ICON_NONE || icon >= ICON_COUNT || !art[icon][0])
+        icon = ICON_APP;
+    int scale = size / 16;
+    for (int r = 0; r < size; r++)
+        for (int c = 0; c < size; c++)
+            out[r * size + c] = colour(art[icon][r / scale][c / scale]);
+    return true;
+}

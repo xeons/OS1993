@@ -9,11 +9,29 @@
  * bars for WS_VSCROLL and WS_HSCROLL; selects with the mouse or Shift and the movement keys;
  * cuts, copies and pastes through the clipboard; and undoes the last run
  * of typing (and undoes the undo). The usual EM_* messages work.
+ *
+ * Undo keeps a history: each change is a record (where, what was taken
+ * out, what was put in), and the records of one run of typing share a
+ * group, so Ctrl+Z steps back a run at a time and Ctrl+Y forward again
+ * (the oldest are dropped past UNDO_MAX groups or UNDO_BYTES of text).
+ * The caret blinks while the control has the focus. End on a wrapped row
+ * puts the caret after its last character: the index there is also the
+ * next row's start, so a flag (eol) says which row it belongs to.
  */
 #include "uipriv.h"
 
 #define LIMIT_DEFAULT 32767
 #define TABW          8
+#define UNDO_MAX      64                /* groups kept */
+#define UNDO_BYTES    65536             /* text kept in all records */
+#define BLINK_ID      0x7E01
+#define SCROLL_ID     0x7E02
+#define BLINK_MS      530
+
+struct urec {
+    int   pos, dlen, ilen, group;
+    char *text;                         /* the dlen taken out, then the ilen put in */
+};
 
 struct medit {
     char *buf;
@@ -25,9 +43,10 @@ struct medit {
     int   anchor, caret;                /* the selection: between them */
     int   top, left;                    /* first line and column shown */
     int   want;                         /* column Up/Down aim for, -1 none */
-    char *undo;
-    int   undo_len;
-    bool  undo_ok, armed, modified;
+    struct urec *u;                     /* [0, nu) done, [nu, nall) undone (redo) */
+    int   nu, nall, ucap, group, ubytes;
+    bool  armed, modified, eol, blink_off;
+    int   mx, my;                       /* the pointer while selecting */
     int   track;                        /* 1 selecting, 2 vertical bar, 3 horizontal bar */
     int   part, grab;
 };
@@ -128,9 +147,24 @@ static int line_of(struct medit *m, int idx)
     return lo;
 }
 
+static bool wrapped_row(struct medit *m, int n)        /* ends without a newline */
+{
+    return n + 1 < m->nlines && m->buf[m->line[n + 1] - 1] != '\n';
+}
+
 static int line_end(struct medit *m, int n)            /* where End puts the caret */
 {
-    return n + 1 < m->nlines ? m->line[n + 1] - 1 : m->len;
+    if (n + 1 >= m->nlines)
+        return m->len;
+    return wrapped_row(m, n) ? m->line[n + 1] : m->line[n + 1] - 1;
+}
+
+static int caret_line(struct medit *m)                 /* the caret's row (eol: the one above) */
+{
+    int ln = line_of(m, m->caret);
+    if (m->eol && ln > 0 && m->line[ln] == m->caret && wrapped_row(m, ln - 1))
+        return ln - 1;
+    return ln;
 }
 
 static int row_stop(struct medit *m, int n)            /* the row's text ends here */
@@ -141,10 +175,10 @@ static int row_stop(struct medit *m, int n)            /* the row's text ends he
     return m->buf[next - 1] == '\n' ? next - 1 : next;
 }
 
-static int vcol(struct medit *m, int idx)
+static int vcol_in(struct medit *m, int idx, int ln)
 {
     int col = 0;
-    for (int i = m->line[line_of(m, idx)]; i < idx; i++)
+    for (int i = m->line[ln]; i < idx; i++)
         col = m->buf[i] == '\t' ? (col / TABW + 1) * TABW : col + 1;
     return col;
 }
@@ -186,7 +220,7 @@ static void scroll_to(struct wnd *w, int top, int left)
 static void show_caret(struct wnd *w)
 {
     struct medit *m = me(w);
-    int ln = line_of(m, m->caret), c = vcol(m, m->caret), r = rows(w), k = cols(w);
+    int ln = caret_line(m), c = vcol_in(m, m->caret, ln), r = rows(w), k = cols(w);
     int top = m->top, left = m->left;
     if (ln < top) top = ln;
     if (ln >= top + r) top = ln - r + 1;
@@ -213,60 +247,124 @@ static void changed(struct wnd *w)
         SendMessage(w->parent, WM_COMMAND, MAKEWPARAM(w->id, EN_CHANGE), (LPARAM)w);
 }
 
-static void snapshot(struct medit *m)               /* undo point, once per run */
+static void drop_records(struct medit *m, int from, int to)
 {
-    if (m->armed)
+    for (int i = from; i < to; i++) {
+        m->ubytes -= m->u[i].dlen + m->u[i].ilen;
+        LocalFree(m->u[i].text);
+    }
+}
+
+static void clear_undo(struct medit *m)
+{
+    drop_records(m, 0, m->nall);
+    m->nu = m->nall = 0;
+    m->armed = false;
+}
+
+/* Remember a change about to happen: at pos, del characters out, ins (n) in. */
+static void record(struct medit *m, int pos, int del, const char *ins, int n)
+{
+    if (del == 0 && n == 0)
         return;
-    char *u = LocalReAlloc(m->undo, (uint32_t)m->len + 1, 0);
-    if (!u)
-        return;
-    m->undo = u;
-    memcpy(u, m->buf, (size_t)m->len);
-    m->undo_len = m->len;
-    m->undo_ok = m->armed = true;
+    drop_records(m, m->nu, m->nall);            /* a new change: no more redo */
+    m->nall = m->nu;
+    if (!m->armed) {
+        m->group++;
+        m->armed = true;
+    }
+    struct urec *last = m->nu ? &m->u[m->nu - 1] : NULL;
+    if (last && last->group == m->group && del == 0 && last->pos + last->ilen == pos) {
+        char *t = LocalReAlloc(last->text, (uint32_t)(last->dlen + last->ilen + n), 0);
+        if (t) {                                 /* typing on: the same record grows */
+            memcpy(t + last->dlen + last->ilen, ins, (size_t)n);
+            last->text = t;
+            last->ilen += n;
+            m->ubytes += n;
+            return;
+        }
+    }
+    if (m->nu == m->ucap) {
+        int cap = m->ucap + 32;
+        struct urec *u = LocalReAlloc(m->u, (uint32_t)cap * sizeof *u, 0);
+        if (!u) { clear_undo(m); return; }
+        m->u = u;
+        m->ucap = cap;
+    }
+    char *t = LocalAlloc(0, (uint32_t)(del + n + 1));
+    if (!t) { clear_undo(m); return; }
+    memcpy(t, m->buf + pos, (size_t)del);
+    memcpy(t + del, ins, (size_t)n);
+    m->u[m->nu++] = (struct urec){ pos, del, n, m->group, t };
+    m->nall = m->nu;
+    m->ubytes += del + n;
+    int groups = m->u[m->nu - 1].group - m->u[0].group + 1;    /* too much kept: the oldest go */
+    while (m->nu > 1 && (groups > UNDO_MAX || m->ubytes > UNDO_BYTES)) {
+        int g = m->u[0].group, k = 0;
+        while (k < m->nu - 1 && m->u[k].group == g) k++;
+        drop_records(m, 0, k);
+        memmove(m->u, m->u + k, (size_t)(m->nu - k) * sizeof *m->u);
+        m->nu -= k;
+        m->nall = m->nu;
+        groups = m->u[m->nu - 1].group - m->u[0].group + 1;
+    }
 }
 
 static void moved(struct medit *m) { m->armed = false; }   /* a new run starts */
 
-static void delete_range(struct medit *m, int a, int b)
-{
-    memmove(m->buf + a, m->buf + b, (size_t)(m->len - b));
-    m->len -= b - a;
-    m->buf[m->len] = '\0';
-    m->caret = m->anchor = a;
-}
-
 /* Replace the selection with text (n bytes, CRs dropped); false if the
  * limit kept some of it out. */
+static bool grow(struct medit *m, int need)
+{
+    if (need + 1 <= m->cap)
+        return true;
+    int cap = (need + 1 + 1023) & ~1023;
+    char *p = LocalReAlloc(m->buf, (uint32_t)cap, 0);
+    if (!p) return false;
+    m->buf = p;
+    m->cap = cap;
+    return true;
+}
+
+/* The buffer itself: n bytes at pos replace del (no undo record). */
+static bool raw_replace(struct medit *m, int pos, int del, const char *text, int n)
+{
+    if (!grow(m, m->len - del + n))
+        return false;
+    memmove(m->buf + pos + n, m->buf + pos + del, (size_t)(m->len - pos - del + 1));
+    memcpy(m->buf + pos, text, (size_t)n);
+    m->len += n - del;
+    return true;
+}
+
 static bool replace(struct wnd *w, const char *text, int n)
 {
     struct medit *m = me(w);
     if (w->style & ES_READONLY)
         return false;
-    snapshot(m);
     int a = sel_start(m), b = sel_end(m);
-    if (b > a)
-        delete_range(m, a, b);
     int add = 0;
     for (int i = 0; i < n; i++)
         if (text[i] != '\r') add++;
     bool all = true;
-    if (m->len + add > m->limit) {
-        add = m->limit - m->len;
+    if (m->len - (b - a) + add > m->limit) {
+        add = m->limit - (m->len - (b - a));
+        if (add < 0) add = 0;
         all = false;
     }
-    if (m->len + add + 1 > m->cap) {
-        int cap = (m->len + add + 1 + 1023) & ~1023;
-        char *p = LocalReAlloc(m->buf, (uint32_t)cap, 0);
-        if (!p) return false;
-        m->buf = p;
-        m->cap = cap;
-    }
-    memmove(m->buf + a + add, m->buf + a, (size_t)(m->len - a + 1));
+    char small[64], *clean = add <= (int)sizeof small ? small : LocalAlloc(0, (uint32_t)add);
+    if (!clean)
+        return false;
     for (int i = 0, k = 0; i < n && k < add; i++)
         if (text[i] != '\r')
-            m->buf[a + k++] = text[i];
-    m->len += add;
+            clean[k++] = text[i];
+    m->eol = false;
+    if (b > a || add) {
+        record(m, a, b - a, clean, add);
+        raw_replace(m, a, b - a, clean, add);
+    }
+    if (clean != small)
+        LocalFree(clean);
     m->caret = m->anchor = a + add;
     changed(w);
     return all;
@@ -284,7 +382,8 @@ static void set_text(struct wnd *w, const char *text)
     if (ro) w->style |= ES_READONLY;
     m->caret = m->anchor = 0;
     m->top = m->left = 0;
-    m->undo_ok = m->armed = m->modified = false;
+    clear_undo(m);
+    m->modified = false;
     InvalidateRect(w, NULL);
 }
 
@@ -308,30 +407,29 @@ static void paste(struct wnd *w)
     LocalFree(t);
 }
 
-static void undo(struct wnd *w)                     /* swap with the snapshot */
+/* Step back (or, redo, forward) one group of records. */
+static void undo(struct wnd *w, bool redo)
 {
     struct medit *m = me(w);
-    if (!m->undo_ok)
+    if (redo ? m->nu == m->nall : m->nu == 0)
         return;
-    char *cur = LocalAlloc(0, (uint32_t)m->len + 1);
-    if (!cur)
-        return;
-    memcpy(cur, m->buf, (size_t)m->len);
-    int cur_len = m->len;
-    if (m->undo_len + 1 > m->cap) {
-        char *p = LocalReAlloc(m->buf, (uint32_t)m->undo_len + 1, 0);
-        if (!p) { LocalFree(cur); return; }
-        m->buf = p;
-        m->cap = m->undo_len + 1;
+    int g = m->u[redo ? m->nu : m->nu - 1].group, sel_a = 0, sel_z = 0;
+    while (redo ? m->nu < m->nall && m->u[m->nu].group == g : m->nu > 0 && m->u[m->nu - 1].group == g) {
+        struct urec *r = &m->u[redo ? m->nu : m->nu - 1];
+        if (redo) {
+            raw_replace(m, r->pos, r->dlen, r->text + r->dlen, r->ilen);
+            sel_a = sel_z = r->pos + r->ilen;
+            m->nu++;
+        } else {
+            raw_replace(m, r->pos, r->ilen, r->text, r->dlen);
+            sel_a = r->pos;                     /* what came back is selected */
+            sel_z = r->pos + r->dlen;
+            m->nu--;
+        }
     }
-    memcpy(m->buf, m->undo, (size_t)m->undo_len);
-    m->len = m->undo_len;
-    m->buf[m->len] = '\0';
-    LocalFree(m->undo);
-    m->undo = cur;
-    m->undo_len = cur_len;
-    m->caret = m->anchor = clampi(m->caret, 0, m->len);
-    m->armed = false;
+    m->anchor = clampi(sel_a, 0, m->len);
+    m->caret = clampi(sel_z, 0, m->len);
+    m->armed = m->eol = false;
     changed(w);
 }
 
@@ -357,7 +455,7 @@ static void key(struct wnd *w, WPARAM vk, LPARAM lp)
 {
     struct medit *m = me(w);
     bool shift = lp & (1 << 25), ctrl = lp & (1 << 27);
-    int c = m->caret, ln = line_of(m, c);
+    int c = m->caret, ln = caret_line(m), eol_row = -1;
     bool vertical = false;
     switch (vk) {
     case VK_LEFT:
@@ -369,17 +467,18 @@ static void key(struct wnd *w, WPARAM vk, LPARAM lp)
         else c = ctrl ? word_right(m, c) : c < m->len ? c + 1 : m->len;
         break;
     case VK_UP: case VK_DOWN: case VK_PRIOR: case VK_NEXT: {
-        if (m->want < 0) m->want = vcol(m, c);
+        if (m->want < 0) m->want = vcol_in(m, c, ln);
         int d = vk == VK_UP ? -1 : vk == VK_DOWN ? 1 : vk == VK_PRIOR ? -rows(w) : rows(w);
         int to = clampi(ln + d, 0, m->nlines - 1);
         if (vk == VK_PRIOR || vk == VK_NEXT)
             scroll_to(w, m->top + d, m->left);
         c = at_vcol(m, to, m->want);
+        eol_row = to;
         vertical = true;
         break;
     }
     case VK_HOME: c = ctrl ? 0 : m->line[ln]; break;
-    case VK_END:  c = ctrl ? m->len : line_end(m, ln); break;
+    case VK_END:  c = ctrl ? m->len : line_end(m, ln); eol_row = ctrl ? -1 : ln; break;
     case VK_DELETE:
         if (m->anchor == c && c < m->len) m->caret = c + 1;
         if (m->anchor != m->caret) {
@@ -391,8 +490,10 @@ static void key(struct wnd *w, WPARAM vk, LPARAM lp)
         return;
     }
     m->caret = c;
+    m->eol = eol_row >= 0 && eol_row + 1 < m->nlines && c == m->line[eol_row + 1] && wrapped_row(m, eol_row);
     if (!shift) m->anchor = c;
     if (!vertical) m->want = -1;
+    m->blink_off = false;
     moved(m);
     show_caret(w);
     InvalidateRect(w, NULL);
@@ -406,7 +507,8 @@ static void typed(struct wnd *w, char ch)
     case 3:  copy(m); return;                                                   /* Ctrl+C */
     case 22: paste(w); return;                                                  /* Ctrl+V */
     case 24: copy(m); replace(w, "", 0); return;                                /* Ctrl+X */
-    case 26: undo(w); return;                                                   /* Ctrl+Z */
+    case 26: undo(w, false); return;                                            /* Ctrl+Z */
+    case 25: undo(w, true); return;                                             /* Ctrl+Y */
     case 13: replace(w, "\n", 1); return;
     case 9:  replace(w, "\t", 1); return;
     case 8:
@@ -421,14 +523,44 @@ static void typed(struct wnd *w, char ch)
 
 /* ---- the mouse --------------------------------------------------------------------- */
 
-static int index_at(struct wnd *w, int x, int y)
+/* The character nearest x,y (past the edges: one row or column beyond),
+ * with the eol flag for the end of a wrapped row. */
+static int index_at(struct wnd *w, int x, int y, bool *eol)
 {
     struct medit *m = me(w);
     RECT t = text_rect(w);
     int ln = m->top + (y < t.top ? -1 : (y - t.top) / 16);
     ln = clampi(ln, 0, m->nlines - 1);
-    int c = m->left + (x - t.left + 4) / 8;
-    return at_vcol(m, ln, c < 0 ? 0 : c);
+    int c = x < t.left ? m->left - 1 : m->left + (x - t.left + 4) / 8;
+    int i = at_vcol(m, ln, c < 0 ? 0 : c);
+    *eol = ln + 1 < m->nlines && i == m->line[ln + 1] && wrapped_row(m, ln);
+    return i;
+}
+
+/* The selection follows the pointer; outside the text it scrolls on a
+ * timer even while the mouse keeps still. */
+static void select_to(struct wnd *w)
+{
+    struct medit *m = me(w);
+    bool eol;
+    int c = index_at(w, m->mx, m->my, &eol);
+    if (c != m->caret || eol != m->eol) {
+        m->caret = c;
+        m->eol = eol;
+        show_caret(w);
+        InvalidateRect(w, NULL);
+    }
+    RECT t = text_rect(w);
+    if (rect_contains(&t, m->mx, m->my)) KillTimer(w, SCROLL_ID);
+    else SetTimer(w, SCROLL_ID, 60);
+}
+
+static void caret_on(struct wnd *w)               /* visible at once, blinking from now */
+{
+    struct medit *m = me(w);
+    m->blink_off = false;
+    if (ui_has_focus(w))
+        SetTimer(w, BLINK_ID, BLINK_MS);
 }
 
 static struct sbar vbar(struct wnd *w)
@@ -475,7 +607,9 @@ static void paint(struct wnd *w, HDC dc)
     struct medit *m = me(w);
     RECT all = { 0, 0, w->w, w->h };
     int b = border(w);
-    FillRect(dc, &all, C_WHITE);
+    uint8_t fg = C_BLACK, bg = C_WHITE;
+    ctl_color(w, dc, (w->style & ES_READONLY) ? WM_CTLCOLORSTATIC : WM_CTLCOLOREDIT, &fg, &bg);
+    FillRect(dc, &all, bg);
     if (b) {
         RECT s = { 0, 0, w->w, w->h }, k = { 1, 1, w->w - 1, w->h - 1 };
         DrawBevel(dc, &s, false);
@@ -502,7 +636,7 @@ static void paint(struct wnd *w, HDC dc)
                     RECT s = { x, y, x + n * 8, y + 16 };
                     FillRect(dc, &s, focus ? C_ACCENT : C_GRAY4);
                 }
-                TextOut(dc, x, y, run, run_sel ? C_WHITE : C_BLACK, -1);
+                TextOut(dc, x, y, run, run_sel ? C_WHITE : fg, -1);
                 n = 0;
             }
             if (at_end || col >= m->left + k + 1)
@@ -525,10 +659,10 @@ static void paint(struct wnd *w, HDC dc)
             if (col >= m->left) FillRect(dc, &s, focus ? C_ACCENT : C_GRAY4);
         }
     }
-    if (focus) {                                    /* the caret */
-        int ln = line_of(m, m->caret), c = vcol(m, m->caret);
+    if (focus && !m->blink_off) {                   /* the caret */
+        int ln = caret_line(m), c = vcol_in(m, m->caret, ln);
         if (ln >= m->top && ln < m->top + r + 1 && c >= m->left)
-            DrawLine(dc, t.left + (c - m->left) * 8, t.top + (ln - m->top) * 16, 16, true, C_BLACK);
+            DrawLine(dc, t.left + (c - m->left) * 8, t.top + (ln - m->top) * 16, 16, true, fg);
     }
     if (has_v(w)) { struct sbar s = vbar(w); sbar_draw(dc, &s, m->track == 2 ? m->part : SB_PART_NONE); }
     if (has_h(w)) { struct sbar s = hbar(w); sbar_draw(dc, &s, m->track == 3 ? m->part : SB_PART_NONE); }
@@ -561,7 +695,8 @@ LRESULT medit_proc(HWND h, unsigned msg, WPARAM wp, LPARAM lp)
     case WM_DESTROY:
         LocalFree(m->buf);
         LocalFree(m->line);
-        LocalFree(m->undo);
+        clear_undo(m);
+        LocalFree(m->u);
         LocalFree(m);
         w->ctl = NULL;
         return 0;
@@ -586,9 +721,33 @@ LRESULT medit_proc(HWND h, unsigned msg, WPARAM wp, LPARAM lp)
         InvalidateRect(h, NULL);
         return 0;
     case WM_SETFOCUS:
+        caret_on(w);
+        InvalidateRect(h, NULL);
+        return 0;
     case WM_KILLFOCUS:
+        KillTimer(h, BLINK_ID);
+        InvalidateRect(h, NULL);
+        return 0;
     case WM_ENABLE:
         InvalidateRect(h, NULL);
+        return 0;
+    case WM_TIMER:
+        if (wp == BLINK_ID) {
+            if (!ui_has_focus(w)) {
+                KillTimer(h, BLINK_ID);
+                m->blink_off = false;
+            } else {
+                m->blink_off = !m->blink_off;
+            }
+            int ln = caret_line(m), c = vcol_in(m, m->caret, ln);
+            RECT t = text_rect(w);
+            RECT r = { t.left + (c - m->left) * 8 - 1, t.top + (ln - m->top) * 16,
+                       t.left + (c - m->left) * 8 + 2, t.top + (ln - m->top) * 16 + 16 };
+            InvalidateRect(h, &r);
+        } else if (wp == SCROLL_ID) {
+            if (m->track == 1) select_to(w);
+            else KillTimer(h, SCROLL_ID);
+        }
         return 0;
     case WM_SETTEXT:
         set_text(w, (const char *)lp);
@@ -604,31 +763,38 @@ LRESULT medit_proc(HWND h, unsigned msg, WPARAM wp, LPARAM lp)
         return m->len;
     case WM_KEYDOWN:
         key(w, wp, lp);
+        caret_on(w);
         return 0;
     case WM_CHAR:
         typed(w, (char)wp);
+        caret_on(w);
         return 0;
     case WM_LBUTTONDOWN: {
         int x = GET_X_LPARAM(lp), y = GET_Y_LPARAM(lp);
         SetFocus(h);
         if (bar_press(w, 2, x, y) || bar_press(w, 3, x, y))
             return 0;
-        m->caret = index_at(w, x, y);
+        m->caret = index_at(w, x, y, &m->eol);
         if (!(GetKeyState(VK_SHIFT) < 0))
             m->anchor = m->caret;
         m->want = -1;
         m->track = 1;
+        m->mx = x;
+        m->my = y;
         moved(m);
+        caret_on(w);
         SetCapture(h);
         InvalidateRect(h, NULL);
         return 0;
     }
     case WM_LBUTTONDBLCLK: {                        /* a word */
-        int i = index_at(w, GET_X_LPARAM(lp), GET_Y_LPARAM(lp)), a = i, z = i;
+        bool eol;
+        int i = index_at(w, GET_X_LPARAM(lp), GET_Y_LPARAM(lp), &eol), a = i, z = i;
         while (a > 0 && is_word(m->buf[a - 1])) a--;
         while (z < m->len && is_word(m->buf[z])) z++;
         m->anchor = a;
         m->caret = z;
+        m->eol = false;
         moved(m);
         InvalidateRect(h, NULL);
         return 0;
@@ -636,12 +802,9 @@ LRESULT medit_proc(HWND h, unsigned msg, WPARAM wp, LPARAM lp)
     case WM_MOUSEMOVE: {
         int x = GET_X_LPARAM(lp), y = GET_Y_LPARAM(lp);
         if (m->track == 1) {
-            int c = index_at(w, x, y);
-            if (c != m->caret) {
-                m->caret = c;
-                show_caret(w);
-                InvalidateRect(h, NULL);
-            }
+            m->mx = x;
+            m->my = y;
+            select_to(w);
         } else if ((m->track == 2 || m->track == 3) && m->part == SB_PART_THUMB) {
             struct sbar s = m->track == 2 ? vbar(w) : hbar(w);
             int v = sbar_thumb_value(&s, s.vert ? y : x, m->grab);
@@ -651,6 +814,7 @@ LRESULT medit_proc(HWND h, unsigned msg, WPARAM wp, LPARAM lp)
         return 0;
     }
     case WM_LBUTTONUP:
+        KillTimer(h, SCROLL_ID);
         if (m->track) {
             ReleaseCapture();
             m->track = 0;
@@ -662,8 +826,11 @@ LRESULT medit_proc(HWND h, unsigned msg, WPARAM wp, LPARAM lp)
     case WM_PASTE: paste(w); return 0;
     case WM_CLEAR: replace(w, "", 0); return 0;
     case WM_UNDO:
-    case EM_UNDO:  undo(w); return 1;
-    case EM_CANUNDO: return m->undo_ok;
+    case EM_UNDO:  undo(w, false); return 1;
+    case EM_CANUNDO: return m->nu > 0;
+    case EM_CANREDO: return m->nu < m->nall;
+    case EM_REDO:    undo(w, true); return 1;
+    case EM_EMPTYUNDOBUFFER: clear_undo(m); return 0;
     case EM_GETSEL:
         if (wp) *(int *)wp = sel_start(m);
         if (lp) *(int *)lp = sel_end(m);
@@ -676,6 +843,7 @@ LRESULT medit_proc(HWND h, unsigned msg, WPARAM wp, LPARAM lp)
             m->anchor = a;
             m->caret = z;
         }
+        m->eol = false;
         moved(m);
         InvalidateRect(h, NULL);
         return 0;

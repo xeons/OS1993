@@ -14,6 +14,13 @@
  * Keys: arrows, Enter, Esc, mnemonics (the letter after '&'); Alt or F10
  * leaves the menu. Look: Platinum -- light grey, a black border, lavender-
  * blue highlight with white text.
+ *
+ * Items are text (in the window-text font), MF_BITMAP pictures, or
+ * MF_OWNERDRAW (the owner measures and draws them: WM_MEASUREITEM,
+ * WM_DRAWITEM); any item can carry an icon in the check column
+ * (SetMenuItemImage), and a menu a banner up its left side. The owner
+ * hears WM_MENUSELECT as the highlight moves. A menu bar too wide for its
+ * window wraps onto more rows.
  */
 #include "uipriv.h"
 
@@ -42,12 +49,13 @@ static struct menu *menu_from(HMENU h)
 
 static int label_width(const char *s)               /* the part before a tab */
 {
+    char buf[ITEM_TEXT];
     int n = 0;
-    for (; *s && *s != '\t'; s++) {
+    for (; *s && *s != '\t' && n < ITEM_TEXT - 1; s++) {
         if (*s == '&' && s[1]) s++;
-        n++;
+        buf[n++] = *s;
     }
-    return n * 8;
+    return gfx_text_width(&ui_gfx, GFX_FONT_PROP, buf, n);
 }
 
 static const char *accel_of(const char *s)
@@ -82,9 +90,12 @@ static void draw_label(int x, int y, const char *s, uint8_t fg)
         buf[n++] = *s;
     }
     buf[n] = '\0';
-    gfx_text(&ui_gfx, x, y, buf, fg, GFX_TRANSPARENT);
-    if (ul >= 0)
-        gfx_hline(&ui_gfx, x + ul * 8, y + 14, 8, fg);
+    gfx_text_font(&ui_gfx, GFX_FONT_PROP, x, y, buf, n, fg, GFX_TRANSPARENT);
+    if (ul >= 0) {
+        int ux = gfx_text_width(&ui_gfx, GFX_FONT_PROP, buf, ul);
+        int uw = gfx_text_width(&ui_gfx, GFX_FONT_PROP, buf + ul, 1) - 1;
+        gfx_hline(&ui_gfx, x + ux, y + 14, uw > 0 ? uw : 1, fg);
+    }
 }
 
 /* ---- menu objects -------------------------------------------------------------- */
@@ -117,21 +128,51 @@ bool DestroyMenu(HMENU h)
     return true;
 }
 
-bool AppendMenu(HMENU h, unsigned flags, uintptr_t id, const char *text)
+/* Fill in an item: text is a string, or MF_BITMAP's BITMAPIMAGE *, or
+ * MF_OWNERDRAW's value for WM_DRAWITEM. */
+static void set_item(struct mitem *it, unsigned flags, uintptr_t id, const char *text)
 {
-    struct menu *m = menu_from(h);
-    if (!m || m->n == ITEM_MAX || ((flags & MF_POPUP) && !menu_from((HMENU)id)))
-        return false;
-    struct mitem *it = &m->items[m->n++];
+    const uint8_t *image = it->image;
+    int iw = it->img_w, ih = it->img_h;
+    bool keep_icon = !(flags & MF_BITMAP) && !(it->flags & MF_BITMAP);
     memset(it, 0, sizeof *it);
     it->flags = flags & ~MF_BYPOSITION;
     if (flags & MF_POPUP)
         it->sub = (struct menu *)id;
     else
         it->id = (unsigned)id;
-    if (text && !(flags & MF_SEPARATOR))
+    if (flags & MF_OWNERDRAW) {
+        it->data = (LPARAM)text;
+    } else if (flags & MF_BITMAP) {
+        const BITMAPIMAGE *b = (const BITMAPIMAGE *)text;
+        if (b) { it->image = b->pixels; it->img_w = (int16_t)b->width; it->img_h = (int16_t)b->height; }
+    } else if (text && !(flags & MF_SEPARATOR)) {
         strncpy0(it->text, text, ITEM_TEXT);
+    }
+    if (keep_icon && image) {                   /* ModifyMenu keeps the icon */
+        it->image = image;
+        it->img_w = (int16_t)iw;
+        it->img_h = (int16_t)ih;
+    }
+}
+
+static bool insert_at(struct menu *m, int pos, unsigned flags, uintptr_t id, const char *text)
+{
+    if (m->n == ITEM_MAX || ((flags & MF_POPUP) && !menu_from((HMENU)id)))
+        return false;
+    if (pos < 0 || pos > m->n)
+        pos = m->n;
+    memmove(&m->items[pos + 1], &m->items[pos], (size_t)(m->n - pos) * sizeof m->items[0]);
+    m->n++;
+    memset(&m->items[pos], 0, sizeof m->items[pos]);
+    set_item(&m->items[pos], flags, id, text);
     return true;
+}
+
+bool AppendMenu(HMENU h, unsigned flags, uintptr_t id, const char *text)
+{
+    struct menu *m = menu_from(h);
+    return m && insert_at(m, m->n, flags, id, text);
 }
 
 static struct mitem *find_item(struct menu *m, unsigned item, unsigned flags)
@@ -148,6 +189,122 @@ static struct mitem *find_item(struct menu *m, unsigned item, unsigned flags)
         }
     }
     return NULL;
+}
+
+/* Where an item is: its menu and position (by command: searched in submenus too). */
+static struct menu *find_pos(struct menu *m, unsigned item, unsigned flags, int *pos)
+{
+    if (flags & MF_BYPOSITION) {
+        *pos = (int)item;
+        return item < (unsigned)m->n ? m : NULL;
+    }
+    for (int i = 0; i < m->n; i++) {
+        struct mitem *it = &m->items[i];
+        if (it->flags & MF_POPUP) {
+            struct menu *r = find_pos(it->sub, item, flags, pos);
+            if (r) return r;
+        } else if (!(it->flags & MF_SEPARATOR) && it->id == item) {
+            *pos = i;
+            return m;
+        }
+    }
+    return NULL;
+}
+
+/* item: the position (MF_BYPOSITION) or the command it goes before. */
+bool InsertMenu(HMENU h, unsigned item, unsigned flags, uintptr_t id, const char *text)
+{
+    struct menu *m = menu_from(h);
+    if (!m) return false;
+    if (item == (unsigned)-1 && (flags & MF_BYPOSITION))
+        return insert_at(m, m->n, flags, id, text);
+    int pos;
+    struct menu *in = find_pos(m, item, flags, &pos);
+    if (!in) {
+        if (flags & MF_BYPOSITION) return insert_at(m, m->n, flags, id, text);
+        return false;
+    }
+    return insert_at(in, pos, flags, id, text);
+}
+
+static bool take_out(HMENU h, unsigned item, unsigned flags, bool destroy)
+{
+    struct menu *m = menu_from(h);
+    int pos;
+    struct menu *in = m ? find_pos(m, item, flags, &pos) : NULL;
+    if (!in) return false;
+    if (destroy && (in->items[pos].flags & MF_POPUP))
+        DestroyMenu(in->items[pos].sub);
+    memmove(&in->items[pos], &in->items[pos + 1], (size_t)(in->n - pos - 1) * sizeof in->items[0]);
+    in->n--;
+    return true;
+}
+
+bool DeleteMenu(HMENU h, unsigned item, unsigned flags) { return take_out(h, item, flags, true); }
+bool RemoveMenu(HMENU h, unsigned item, unsigned flags) { return take_out(h, item, flags, false); }
+
+bool ModifyMenu(HMENU h, unsigned item, unsigned flags, uintptr_t id, const char *text)
+{
+    struct menu *m = menu_from(h);
+    int pos;
+    struct menu *in = m ? find_pos(m, item, flags, &pos) : NULL;
+    if (!in || ((flags & MF_POPUP) && !menu_from((HMENU)id)))
+        return false;
+    set_item(&in->items[pos], flags, id, text);
+    return true;
+}
+
+unsigned GetMenuItemID(HMENU h, int pos)
+{
+    struct menu *m = menu_from(h);
+    if (!m || pos < 0 || pos >= m->n || (m->items[pos].flags & MF_POPUP))
+        return (unsigned)-1;
+    return m->items[pos].id;
+}
+
+int GetMenuString(HMENU h, unsigned item, char *buf, int max, unsigned flags)
+{
+    struct menu *m = menu_from(h);
+    int pos;
+    struct menu *in = m ? find_pos(m, item, flags, &pos) : NULL;
+    if (!in || !buf || max <= 0) return 0;
+    strncpy0(buf, in->items[pos].text, (size_t)max);
+    return (int)strlen(buf);
+}
+
+int GetMenuState(HMENU h, unsigned item, unsigned flags)
+{
+    struct menu *m = menu_from(h);
+    int pos;
+    struct menu *in = m ? find_pos(m, item, flags, &pos) : NULL;
+    if (!in) return -1;
+    unsigned f = in->items[pos].flags & ~(unsigned)MF_BYPOSITION;
+    if (f & MF_POPUP)                           /* Windows: the item count in the high byte */
+        f |= (unsigned)in->items[pos].sub->n << 8;
+    return (int)f;
+}
+
+/* A 16x16 (or 32x32) picture, one byte a pixel in the theme's colours, FFh
+ * see-through, in the check column; NULL takes it away. The pixels stay
+ * the program's: they must outlive the menu. */
+bool SetMenuItemImage(HMENU h, unsigned item, unsigned flags, const uint8_t *pixels, int size)
+{
+    struct menu *m = menu_from(h);
+    int pos;
+    struct menu *in = m ? find_pos(m, item, flags, &pos) : NULL;
+    if (!in || (in->items[pos].flags & MF_BITMAP)) return false;
+    in->items[pos].image = pixels;
+    in->items[pos].img_w = in->items[pos].img_h = (int16_t)(pixels ? (size == 32 ? 32 : 16) : 0);
+    return true;
+}
+
+bool SetMenuBanner(HMENU h, const char *text, uint8_t bg)
+{
+    struct menu *m = menu_from(h);
+    if (!m) return false;
+    strncpy0(m->banner, text ? text : "", sizeof m->banner);
+    m->banner_bg = bg;
+    return true;
 }
 
 int CheckMenuItem(HMENU h, unsigned item, unsigned flags)
@@ -215,6 +372,7 @@ bool SetMenu(HWND h, HMENU menu)
     ui_invalidate_wnd(w);
     w->menu = menu;
     w->bar_sel = -1;
+    ui_reflow(w);
     RECT c;
     GetClientRect(w, &c);
     SendMessage(w, WM_SIZE, 0, MAKELPARAM(c.right, c.bottom));
@@ -283,15 +441,48 @@ void menu_window_gone(struct wnd *w)
 
 /* ---- the menu bar ------------------------------------------------------------------ */
 
+static int bar_item_w(struct mitem *it)
+{
+    if (it->flags & MF_BITMAP) return it->img_w + 8;
+    return label_width(it->text) + 16;
+}
+
+/* Item i of a bar from left to right, a new row when one doesn't fit
+ * (left: the bar's left edge, right: its right; -> its row). */
+static int bar_layout(struct menu *m, int i, int left, int right, int *x0, int *x1)
+{
+    int x = left + 6, row = 0;
+    for (int k = 0; ; k++) {
+        int iw = bar_item_w(&m->items[k]);
+        if (x + iw > right - 2 && x > left + 6) {
+            x = left + 6;
+            row++;
+        }
+        if (k == i) {
+            *x0 = x;
+            *x1 = x + iw;
+            return row;
+        }
+        x += iw;
+    }
+}
+
+/* Rows the bar takes at a window's outer width. */
+int menu_bar_rows(struct menu *m, int outer_w)
+{
+    if (!m || !m->n)
+        return 1;
+    int x0, x1;
+    return bar_layout(m, m->n - 1, FRAME, outer_w - FRAME, &x0, &x1) + 1;
+}
+
 static bool bar_item(struct wnd *w, int i, RECT *r)
 {
     RECT bar;
     if (!frame_menubar(w, &bar) || i < 0 || i >= w->menu->n)
         return false;
-    int x = bar.left + 6;
-    for (int k = 0; k < i; k++)
-        x += label_width(w->menu->items[k].text) + 16;
-    *r = (RECT){ x, bar.top + 1, x + label_width(w->menu->items[i].text) + 16, bar.bottom - 1 };
+    int x0, x1, row = bar_layout(w->menu, i, bar.left, bar.right, &x0, &x1);
+    *r = (RECT){ x0, bar.top + row * MENUBAR_H + 1, x1, bar.top + (row + 1) * MENUBAR_H - 1 };
     return true;
 }
 
@@ -319,12 +510,16 @@ void menubar_paint(struct wnd *w)
     for (int i = 0; bar_item(w, i, &r); i++) {
         struct mitem *it = &w->menu->items[i];
         bool sel = i == w->bar_sel;
-        if (r.left >= bar.right)
-            break;
         if (sel)
             gfx_fill(&ui_gfx, r.left, r.top, r.right - r.left, r.bottom - r.top, C_ACCENT);
         uint8_t fg = sel ? C_WHITE : (it->flags & (MF_GRAYED | MF_DISABLED)) || !active ? C_GRAY3 : C_BLACK;
-        draw_label(r.left + 8, r.top + 1, it->text, fg);
+        if (it->flags & MF_BITMAP) {
+            if (it->image)
+                gfx_blit8(&ui_gfx, r.left + 4, r.top + (r.bottom - r.top - it->img_h) / 2,
+                          it->img_w, it->img_h, it->image, it->img_w);
+        } else {
+            draw_label(r.left + 8, r.top + 1, it->text, fg);
+        }
     }
 }
 
@@ -337,7 +532,36 @@ void menu_process_gone(int pid)
             menus[i].magic = 0;
 }
 
-static int item_h(const struct mitem *it) { return (it->flags & MF_SEPARATOR) ? SEP_H : MITEM_H; }
+static int item_h(const struct mitem *it)
+{
+    if (it->flags & MF_SEPARATOR) return SEP_H;
+    if (it->flags & MF_OWNERDRAW) return it->oh > 0 ? it->oh : MITEM_H;
+    if (it->flags & MF_BITMAP) return it->img_h + 4;
+    return it->img_h + 4 > MITEM_H ? it->img_h + 4 : MITEM_H;
+}
+
+static int banner_w(const struct menu *m) { return m->banner[0] ? 22 : 0; }
+static int text_x(const struct menu *m)               /* where labels start */
+{
+    int icon = 0;
+    for (int i = 0; i < m->n; i++)
+        if (!(m->items[i].flags & MF_BITMAP) && m->items[i].img_w > icon) icon = m->items[i].img_w;
+    return banner_w(m) + (icon > 16 ? icon + 10 : TEXT_X);
+}
+
+/* MF_OWNERDRAW items: the owner says how big (once a menu opens). */
+static void measure(struct menu *m)
+{
+    for (int i = 0; i < m->n; i++) {
+        struct mitem *it = &m->items[i];
+        if (!(it->flags & MF_OWNERDRAW) || !T.owner || !wnd_mine(T.owner))
+            continue;
+        MEASUREITEMSTRUCT mi = { ODT_MENU, 0, it->id, 80, MITEM_H, it->data };
+        SendMessage(T.owner, WM_MEASUREITEM, 0, (LPARAM)&mi);
+        it->ow = (int16_t)clampi((int)mi.itemWidth, 8, 400);
+        it->oh = (int16_t)clampi((int)mi.itemHeight, 4, 200);
+    }
+}
 
 static bool selectable(const struct mitem *it) { return !(it->flags & MF_SEPARATOR); }
 
@@ -348,15 +572,19 @@ static bool enabled(const struct mitem *it)
 
 static void popup_size(struct menu *m, int *w, int *h)
 {
-    int label = 0, accel = 0, height = 2 * PAD;
+    int label = 0, accel = 0, height = 2 * PAD, other = 0;
     for (int i = 0; i < m->n; i++) {
-        const char *a = accel_of(m->items[i].text);
-        int lw = label_width(m->items[i].text), aw = a ? (int)strlen(a) * 8 : 0;
+        struct mitem *it = &m->items[i];
+        height += item_h(it);
+        if (it->flags & MF_OWNERDRAW) { if (it->ow + 4 > other) other = it->ow + 4; continue; }
+        if (it->flags & MF_BITMAP) { if (banner_w(m) + it->img_w + 8 > other) other = banner_w(m) + it->img_w + 8; continue; }
+        const char *a = accel_of(it->text);
+        int lw = label_width(it->text), aw = a ? gfx_text_width(&ui_gfx, GFX_FONT_PROP, a, -1) : 0;
         if (lw > label) label = lw;
         if (aw > accel) accel = aw;
-        height += item_h(&m->items[i]);
     }
-    *w = TEXT_X + label + (accel ? 24 + accel : 0) + 22;
+    *w = text_x(m) + label + (accel ? 24 + accel : 0) + 22;
+    if (other > *w) *w = other;
     *h = height;
 }
 
@@ -382,30 +610,75 @@ static void popup_paint(struct wnd *w, struct menu_level *lv)
     gfx_vline(g, x + 1, y + 1, ch - 2, C_WHITE);
     gfx_hline(g, x + 1, y + ch - 2, cw - 2, C_GRAY4);
     gfx_vline(g, x + cw - 2, y + 1, ch - 2, C_GRAY4);
-    for (int i = 0; i < lv->m->n; i++) {
-        struct mitem *it = &lv->m->items[i];
-        int iy = y + item_top(lv->m, i);
+    struct menu *m = lv->m;
+    int bw = banner_w(m), tx = text_x(m);
+    if (bw) {                                   /* the banner, written bottom to top */
+        gfx_fill(g, x + 2, y + 2, bw, ch - 4, m->banner_bg ? m->banner_bg : C_ACCENT_DK);
+        int len = (int)strlen(m->banner);
+        int by = y + ch - 6;
+        for (int c = 0; c < len; c++) {
+            uint8_t ch8 = (uint8_t)m->banner[c];
+            const uint8_t *glyph = g->font + ch8 * 16;
+            int adv = gfx_text_width(g, GFX_FONT_PROP, (const char *)&m->banner[c], 1);
+            for (int r = 0; r < 16; r++)            /* row r of the glyph: column x+3+r */
+                for (int b = 0; b < 8; b++)
+                    if (glyph[r] & (0x80 >> b))
+                        gfx_pixel(g, x + 5 + r, by - b, C_WHITE);
+            by -= adv;
+            if (by < y + 4) break;
+        }
+    }
+    for (int i = 0; i < m->n; i++) {
+        struct mitem *it = &m->items[i];
+        int iy = y + item_top(m, i), ih = item_h(it), ix = x + 2 + bw;
         if (it->flags & MF_SEPARATOR) {
-            gfx_hline(g, x + 2, iy + 3, cw - 4, C_GRAY4);
-            gfx_hline(g, x + 2, iy + 4, cw - 4, C_WHITE);
+            gfx_hline(g, ix, iy + 3, cw - 4 - bw, C_GRAY4);
+            gfx_hline(g, ix, iy + 4, cw - 4 - bw, C_WHITE);
             continue;
         }
         bool sel = i == lv->sel, on = enabled(it);
-        if (sel)
-            gfx_fill(g, x + 2, iy, cw - 4, MITEM_H, C_ACCENT);
-        uint8_t fg = sel ? (on ? C_WHITE : C_GRAY5) : (on ? C_BLACK : C_GRAY4);
-        if (it->flags & MF_CHECKED) {
-            if (it->flags & MFT_RADIOCHECK)
-                gfx_bitmap(g, x + 7, iy + 5, g_dot, 7, fg);
-            else
-                gfx_bitmap(g, x + 6, iy + 4, g_check, 9, fg);
+        if (it->flags & MF_OWNERDRAW) {
+            if (T.owner && wnd_mine(T.owner)) {
+                struct dc d = { .w = w, .ox = x, .oy = y, .cx0 = ui_gfx.cx0, .cy0 = ui_gfx.cy0,
+                                .cx1 = ui_gfx.cx1, .cy1 = ui_gfx.cy1 };
+                RECT r = { 2 + bw, iy - y, cw - 2, iy - y + ih };
+                DRAWITEMSTRUCT di = { ODT_MENU, 0, it->id, ODA_DRAWENTIRE,
+                                      (sel ? ODS_SELECTED : 0) | (on ? 0 : ODS_GRAYED) |
+                                      ((it->flags & MF_CHECKED) ? ODS_CHECKED : 0),
+                                      (HWND)(void *)m, &d, r, it->data };
+                SendMessage(T.owner, WM_DRAWITEM, 0, (LPARAM)&di);
+                dc_apply(&d);
+            }
+            continue;
         }
-        draw_label(x + TEXT_X, iy + 1, it->text, fg);
-        const char *a = accel_of(it->text);
-        if (a)
-            gfx_text(g, x + cw - 22 - (int)strlen(a) * 8, iy + 1, a, fg, GFX_TRANSPARENT);
+        if (sel)
+            gfx_fill(g, ix, iy, cw - 4 - bw, ih, C_ACCENT);
+        uint8_t fg = sel ? (on ? C_WHITE : C_GRAY5) : (on ? C_BLACK : C_GRAY4);
+        if (it->flags & MF_BITMAP) {
+            if (it->image)
+                gfx_blit8(g, ix + 4, iy + 2, it->img_w, it->img_h, it->image, it->img_w);
+        } else {
+            int ty = iy + (ih - 16) / 2;
+            if (it->image)
+                gfx_blit8(g, ix + (tx - bw - 2 - it->img_w) / 2, iy + (ih - it->img_h) / 2,
+                          it->img_w, it->img_h, it->image, it->img_w);
+            if (it->flags & MF_CHECKED) {
+                if (it->image)                      /* the icon pushed in */
+                    gfx_rect(g, ix + (tx - bw - 2 - it->img_w) / 2 - 2, iy + (ih - it->img_h) / 2 - 2,
+                             it->img_w + 4, it->img_h + 4, fg);
+                else if (it->flags & MFT_RADIOCHECK)
+                    gfx_bitmap(g, ix + 5, ty + 4, g_dot, 7, fg);
+                else
+                    gfx_bitmap(g, ix + 4, ty + 3, g_check, 9, fg);
+            }
+            draw_label(x + tx, ty, it->text, fg);
+            const char *a = accel_of(it->text);
+            if (a)
+                gfx_text_font(g, GFX_FONT_PROP, x + cw - 22 - gfx_text_width(g, GFX_FONT_PROP, a, -1), ty,
+                              a, -1, fg, GFX_TRANSPARENT);
+        }
         if (it->flags & MF_POPUP)
-            gfx_bitmap(g, x + cw - 12, iy + 5, g_arrow, 7, fg);
+            gfx_bitmap(g, x + cw - 12, iy + (ih - 7) / 2, g_arrow, 7, fg);
     }
 }
 
@@ -432,6 +705,22 @@ static void invalidate_item(struct menu_level *lv, int i)
     ui_invalidate_screen(lv->w->x, lv->w->y + item_top(lv->m, i), lv->w->w, item_h(&lv->m->items[i]));
 }
 
+/* WM_MENUSELECT: the highlighted item (a command's id, a submenu's
+ * position) and its flags, lParam the menu; 0xFFFF flags when it closes. */
+static void menu_select(struct menu *m, int i)
+{
+    if (!T.owner || !wnd_mine(T.owner))
+        return;
+    if (!m || i < 0) {
+        SendMessage(T.owner, WM_MENUSELECT, MAKEWPARAM(0, m ? 0 : 0xFFFF), (LPARAM)m);
+        return;
+    }
+    struct mitem *it = &m->items[i];
+    unsigned f = (it->flags & 0xFFFF) | (m->system ? MF_SYSMENU : 0);
+    SendMessage(T.owner, WM_MENUSELECT, MAKEWPARAM((it->flags & MF_POPUP) ? (unsigned)i : it->id, f),
+                (LPARAM)m);
+}
+
 static void set_sel(int k, int i)
 {
     struct menu_level *lv = &T.lv[k];
@@ -440,6 +729,7 @@ static void set_sel(int k, int i)
     invalidate_item(lv, lv->sel);
     lv->sel = i;
     invalidate_item(lv, i);
+    menu_select(lv->m, i);
 }
 
 static int first_selectable(struct menu *m)
@@ -467,6 +757,7 @@ static void open_popup_at(struct menu *m, int x, int y, bool keyboard, int pos, 
     if (m->system)
         sysmenu_update(T.owner);
     SendMessage(T.owner, WM_INITMENUPOPUP, (WPARAM)m, MAKELPARAM(pos, m->system));
+    measure(m);
     int w, h;
     popup_size(m, &w, &h);
     if (x + w > S->scr_w && flip_x >= 0) x = flip_x - w;
@@ -482,6 +773,8 @@ static void open_popup_at(struct menu *m, int x, int y, bool keyboard, int pos, 
         return;
     lv->w->userdata = (int32_t)(uintptr_t)lv;
     T.n++;
+    if (lv->sel >= 0)
+        menu_select(m, lv->sel);
 }
 
 static void open_popup(struct menu *m, int x, int y, bool keyboard, int pos)
@@ -496,6 +789,7 @@ static void open_bar_item(int i, bool keyboard)
     if (w->bar_sel != i) {
         w->bar_sel = i;
         bar_invalidate(w);
+        menu_select(w->menu, i);
     }
     RECT r;
     if (i >= 0 && bar_item(w, i, &r) && (w->menu->items[i].flags & MF_POPUP) && enabled(&w->menu->items[i]))
@@ -581,6 +875,7 @@ static void step_bar(int dir)
     else {
         T.owner->bar_sel = i;
         bar_invalidate(T.owner);
+        menu_select(T.owner->menu, i);
     }
 }
 
@@ -721,6 +1016,8 @@ static unsigned run(bool return_cmd)
     }
     close_to(0);
     struct wnd *owner = wnd_from(T.owner);
+    if (owner)
+        menu_select(NULL, -1);                      /* closed */
     if (owner && T.bar) {
         owner->bar_sel = -1;
         bar_invalidate(owner);

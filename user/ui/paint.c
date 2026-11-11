@@ -1,9 +1,9 @@
 /*
  * paint.c -- invalidation, painting, and drawing through an HDC.
  *
- * Every top-level window has its own update rectangle (screen coordinates);
- * invalidating part of the screen adds to the update rectangle of each
- * window there, and wakes the processes they belong to. A process paints
+ * Every top-level window has its own update region (a few rectangles,
+ * screen coordinates); invalidating part of the screen adds to the region
+ * of each window there, and wakes the processes they belong to. A process paints
  * only its own windows, each clipped to its visible region -- what's left
  * of it after taking away the windows above -- so processes can paint in
  * any order: per region rectangle, the frame, the client area cleared to
@@ -78,6 +78,41 @@ static void subtract_above(struct region *g, struct wnd *t)
 
 /* ---- invalidation ---------------------------------------------------------- */
 
+static int area(RECT r) { return (r.right - r.left) * (r.bottom - r.top); }
+
+static RECT joined(RECT a, RECT b) { rect_union(&a, b); return a; }
+
+/* Add r: into a rectangle it overlaps or nearly fills out, else a new one;
+ * when they run out, the two whose union wastes least merge. */
+static void dirty_add(struct dirty *d, RECT r)
+{
+    for (int i = 0; i < d->n; i++) {
+        RECT u = joined(d->r[i], r), in;
+        if (rect_intersect(d->r[i], r, &in) || area(u) <= (area(d->r[i]) + area(r)) * 5 / 4) {
+            d->r[i] = u;                            /* ... and anything it now overlaps */
+            for (int j = 0; j < d->n; j++)
+                if (j != i && rect_intersect(d->r[i], d->r[j], &in)) {
+                    rect_union(&d->r[i], d->r[j]);
+                    d->r[j] = d->r[--d->n];
+                    if (i == d->n) i = j;
+                    j = -1;
+                }
+            return;
+        }
+    }
+    if (d->n == DIRTY_MAX) {
+        int bi = 0, bj = 1, best = 1 << 30;
+        for (int i = 0; i < d->n; i++)
+            for (int j = i + 1; j < d->n; j++) {
+                int waste = area(joined(d->r[i], d->r[j])) - area(d->r[i]) - area(d->r[j]);
+                if (waste < best) { best = waste; bi = i; bj = j; }
+            }
+        rect_union(&d->r[bi], d->r[bj]);
+        d->r[bj] = d->r[--d->n];
+    }
+    d->r[d->n++] = r;
+}
+
 void ui_invalidate_screen(int x, int y, int w, int h)
 {
     RECT r = { x, y, x + w, y + h }, scr = { 0, 0, S->scr_w, S->scr_h }, in;
@@ -91,18 +126,16 @@ void ui_invalidate_screen(int x, int y, int w, int h)
         frame_outer(t, &o);
         if (!rect_intersect(r, o, &in))
             continue;
-        if (t->has_upd)
-            rect_union(&t->upd, in);
-        else
-            t->upd = in;
+        if (!t->has_upd)
+            t->upd.n = 0;
+        dirty_add(&t->upd, in);
         t->has_upd = true;
         if (t->pid != ui_pid)
             WakeProcess(t->pid);
     }
-    if (S->desk_dirty)
-        rect_union(&S->desk, r);
-    else
-        S->desk = r;
+    if (!S->desk_dirty)
+        S->desk.n = 0;
+    dirty_add(&S->desk, r);
     S->desk_dirty = true;
 }
 
@@ -156,11 +189,17 @@ void ui_present(int x0, int y0, int x1, int y1)
     int px0 = x0 & ~7, px1 = (x1 + 7) & ~7;     /* whole bytes */
     bool cur = ui_cursor_overlaps(px0, y0, px1, y1);
     bool outl = S->in.outline_on;
-    if (outl) ui_outline(false);
+    if (ui_screen.bpp != 4 && !outl && S->in.cur_on) {  /* the sprite: refreshed, never off */
+        gfx_present(&ui_gfx, &ui_screen, x0, y0, x1 - x0, y1 - y0);
+        if (cur)
+            ui_cursor_refresh();
+        return;
+    }
     if (cur) ui_cursor(false);
+    if (outl) ui_outline(false);
     gfx_present(&ui_gfx, &ui_screen, x0, y0, x1 - x0, y1 - y0);
-    ui_cursor(true);                            /* also after a repaint from scratch */
     if (outl) ui_outline(true);
+    ui_cursor(true);                            /* also after a repaint from scratch */
 }
 
 /* ---- painting ------------------------------------------------------------------ */
@@ -174,7 +213,8 @@ static void send_paint(struct wnd *w, RECT clip)
 {
     int ox, oy;
     wnd_client_screen(w, &ox, &oy);
-    paint_dc = (struct dc){ w, ox, oy, clip.left, clip.top, clip.right, clip.bottom };
+    paint_dc = (struct dc){ .w = w, .ox = ox, .oy = oy, .cx0 = clip.left, .cy0 = clip.top,
+                            .cx1 = clip.right, .cy1 = clip.bottom };
     painting = w;
     SendMessage(w, WM_PAINT, 0, 0);
     painting = NULL;
@@ -227,10 +267,13 @@ static void paint_window(struct wnd *t)
     RECT o, u;
     t->has_upd = false;
     frame_outer(t, &o);
-    if (!covers(t) || !rect_intersect(t->upd, o, &u))
+    if (!covers(t))
         return;
     struct region g = { 0 };
-    region_add(&g, u);
+    for (int i = 0; i < t->upd.n; i++)
+        if (rect_intersect(t->upd.r[i], o, &u))
+            region_add(&g, u);
+    t->upd.n = 0;
     subtract_above(&g, t);
     for (int i = 0; i < g.n && wnd_from(t); i++)
         paint_rect(t, g.r[i]);
@@ -239,7 +282,9 @@ static void paint_window(struct wnd *t)
 static void paint_desktop(void)
 {
     struct region g = { 0 };
-    region_add(&g, S->desk);
+    for (int i = 0; i < S->desk.n; i++)
+        region_add(&g, S->desk.r[i]);
+    S->desk.n = 0;
     S->desk_dirty = false;
     for (int i = 0; i < S->ntops; i++)
         if (covers(S->tops[i])) {
@@ -292,7 +337,7 @@ HDC BeginPaint(HWND h, PAINTSTRUCT *ps)
     if (painting != w) {                        /* outside WM_PAINT: draws nothing */
         int ox, oy;
         wnd_client_screen(w, &ox, &oy);
-        paint_dc = (struct dc){ w, ox, oy, 0, 0, 0, 0 };
+        paint_dc = (struct dc){ .w = w, .ox = ox, .oy = oy };
     }
     if (ps) {
         ps->hdc = &paint_dc;
@@ -411,7 +456,145 @@ void DrawPixels(HDC dc, int x, int y, int w, int h, const uint8_t *pixels, int s
 void TextOut(HDC dc, int x, int y, const char *s, uint8_t fg, int bg)
 {
     dc_apply(dc);
-    gfx_text(&ui_gfx, dc->ox + x, dc->oy + y, s, fg, bg < 0 ? GFX_TRANSPARENT : (uint8_t)bg);
+    gfx_text_font(&ui_gfx, dc->font, dc->ox + x, dc->oy + y, s, -1, fg, bg < 0 ? GFX_TRANSPARENT : (uint8_t)bg);
+}
+
+int SelectFont(HDC dc, int font)
+{
+    int old = dc->font;
+    dc->font = font == FONT_GUI ? FONT_GUI : FONT_FIXED;
+    return old;
+}
+
+int TextWidthFont(int font, const char *s, int n)
+{
+    return gfx_text_width(&ui_gfx, font, s, n);
+}
+
+int GetTextWidth(HDC dc, const char *s, int n) { return gfx_text_width(&ui_gfx, dc->font, s, n); }
+
+int SetTextColor(HDC dc, int color)
+{
+    int old = dc->has_fg ? dc->fg : -1;
+    dc->has_fg = color >= 0;
+    dc->fg = (uint8_t)color;
+    return old;
+}
+
+int SetBkColor(HDC dc, int color)
+{
+    int old = dc->has_bg ? dc->bg : -1;
+    dc->has_bg = color >= 0;
+    dc->bg = (uint8_t)color;
+    return old;
+}
+
+/* One line of DrawText: the characters shown (prefixes taken out) and
+ * where the mnemonic is (-1 none). */
+static int strip_prefix(const char *s, int n, unsigned flags, char *out, int size, int *mn)
+{
+    int k = 0;
+    *mn = -1;
+    for (int i = 0; i < n && k < size - 1; i++) {
+        if (s[i] == '&' && !(flags & DT_NOPREFIX)) {
+            if (i + 1 < n && s[i + 1] == '&') { out[k++] = '&'; i++; continue; }
+            if (i + 1 < n) *mn = k;
+            continue;
+        }
+        out[k++] = s[i] == '\t' ? ' ' : s[i];
+    }
+    out[k] = '\0';
+    return k;
+}
+
+int DrawText(HDC dc, const char *s, int n, RECT *r, unsigned flags)
+{
+    if (!s || !r)
+        return 0;
+    if (n < 0)
+        n = (int)strlen(s);
+    int width = r->right - r->left, font = dc->font;
+    int starts[64], lens[64], nl = 0;
+    if (flags & DT_SINGLELINE) {
+        starts[0] = 0;
+        lens[0] = n;
+        nl = 1;
+    } else {                                    /* lines, wrapped at spaces */
+        int i = 0;
+        while (i <= n && nl < 64) {
+            int start = i, brk = -1, w = 0;
+            while (i < n && s[i] != '\n') {
+                char c = s[i] == '\t' ? ' ' : s[i];
+                if (c == '&' && !(flags & DT_NOPREFIX)) { i++; continue; }
+                int cw = gfx_text_width(&ui_gfx, font, &c, 1);
+                if ((flags & DT_WORDBREAK) && w + cw > width && i > start) {
+                    if (brk > start) i = brk;
+                    break;
+                }
+                if (c == ' ') brk = i + 1;
+                w += cw;
+                i++;
+            }
+            int end = i;
+            while (end > start && s[end - 1] == ' ' && i < n && s[i] != '\n') end--;
+            starts[nl] = start;
+            lens[nl] = end - start;
+            nl++;
+            if (i < n && s[i] == '\n') i++;
+            else if (i >= n) break;
+            while (i < n && s[i] == ' ' && s[i - 1] != '\n') i++;  /* a wrapped line's spaces */
+        }
+    }
+    int h = nl * 16, maxw = 0;
+    char line[256];
+    int mn;
+    for (int k = 0; k < nl; k++) {
+        int len = strip_prefix(s + starts[k], lens[k], flags, line, sizeof line, &mn);
+        int w = gfx_text_width(&ui_gfx, font, line, len);
+        if (w > maxw) maxw = w;
+    }
+    if (flags & DT_CALCRECT) {
+        r->right = r->left + ((flags & DT_END_ELLIPSIS) && maxw > width ? width : maxw);
+        r->bottom = r->top + h;
+        return h;
+    }
+    RECT saved;
+    if (!(flags & DT_NOCLIP))
+        dc_clip(dc, *r, &saved);
+    int y = r->top;
+    if (flags & DT_SINGLELINE) {
+        if (flags & DT_VCENTER) y = r->top + (r->bottom - r->top - 16) / 2;
+        else if (flags & DT_BOTTOM) y = r->bottom - 16;
+    }
+    uint8_t fg = dc->has_fg ? dc->fg : C_BLACK;
+    for (int k = 0; k < nl; k++, y += 16) {
+        int len = strip_prefix(s + starts[k], lens[k], flags, line, sizeof line, &mn);
+        int w = gfx_text_width(&ui_gfx, font, line, len);
+        if ((flags & DT_END_ELLIPSIS) && w > width) {
+            int dots = gfx_text_width(&ui_gfx, font, "...", 3);
+            while (len > 0 && gfx_text_width(&ui_gfx, font, line, len) + dots > width)
+                len--;
+            memcpy(line + len, "...", 4);
+            if (mn >= len) mn = -1;
+            len += 3;
+            w = gfx_text_width(&ui_gfx, font, line, len);
+        }
+        int x = r->left;
+        if (flags & DT_CENTER) x = r->left + (width - w) / 2;
+        else if (flags & DT_RIGHT) x = r->right - w;
+        dc_apply(dc);
+        if (dc->has_bg)
+            gfx_fill(&ui_gfx, dc->ox + x, dc->oy + y, w, 16, dc->bg);
+        gfx_text_font(&ui_gfx, font, dc->ox + x, dc->oy + y, line, len, fg, GFX_TRANSPARENT);
+        if (mn >= 0 && !(flags & DT_HIDEPREFIX)) {
+            int ux = x + gfx_text_width(&ui_gfx, font, line, mn);
+            int uw = gfx_text_width(&ui_gfx, font, line + mn, 1) - (font == FONT_GUI ? 1 : 0);
+            gfx_hline(&ui_gfx, dc->ox + ux, dc->oy + y + 14, uw > 0 ? uw : 1, fg);
+        }
+    }
+    if (!(flags & DT_NOCLIP))
+        dc_unclip(dc, &saved);
+    return h;
 }
 
 void DrawBitmap(HDC dc, int x, int y, const uint16_t *rows, int h, uint8_t color)
@@ -451,3 +634,9 @@ void FillRectRGB(HDC dc, const RECT *r, uint8_t red, uint8_t green, uint8_t blue
 }
 
 int TextWidth(const char *s) { return (int)strlen(s) * 8; }
+
+COLORREF GetThemeColor(int i)
+{
+    const uint8_t *c = theme_palette[i & 15];
+    return RGB(c[0] * 255 / 63, c[1] * 255 / 63, c[2] * 255 / 63);
+}

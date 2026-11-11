@@ -8,21 +8,65 @@
  * goes there. Save As asks before replacing a file, Open checks that it
  * exists. Modal to the owner, as a MessageBox is. The dialog moves the
  * process's current directory (as Windows does without OFN_NOCHANGEDIR).
+ * "Look in" lists the drives (with their labels); "Files of type" the
+ * program's filters (ofn->types). Names are kept as the disk has them:
+ * long and in either case where the file system allows.
  */
 #include "os1993.h"
+#include <stdio.h>
 
 #define ID_NAME   100
 #define ID_LIST   101
 #define ID_FOLDER 102
+#define ID_DRIVE  103
+#define ID_TYPE   104
 #define ITEMS     96
 #define NAME_LEN  64                            /* long names, cut at 61 */
 
 struct dlg {
     OPENFILENAME *ofn;
     bool          save;
-    char          filter[16];
+    char          filter[32];
     bool          done, ok;
 };
+
+/* The n-th (0-based) "description\0pattern\0" pair of ofn->types. */
+static bool type_at(const char *types, int n, const char **desc, const char **pat)
+{
+    if (!types)
+        return false;
+    for (int i = 0; *types; i++) {
+        const char *d = types, *p = d + strlen(d) + 1;
+        if (!*p) return false;
+        if (i == n) { *desc = d; *pat = p; return true; }
+        types = p + strlen(p) + 1;
+    }
+    return false;
+}
+
+static void fill_drives(HWND h)
+{
+    HWND c = GetDlgItem(h, ID_DRIVE);
+    char cwd[MAX_PATH];
+    GetCurrentDirectory(sizeof cwd, cwd);
+    SendMessage(c, CB_RESETCONTENT, 0, 0);
+    uint32_t mask = GetLogicalDrives();
+    for (int i = 0; i < 26; i++) {
+        if (!(mask & (1u << i)))
+            continue;
+        char root[4] = { (char)('A' + i), ':', '\\', 0 }, label[16] = "", item[32];
+        unsigned type = GetDriveType(root);
+        if (type != DRIVE_REMOVABLE)            /* (no waiting on an empty floppy drive) */
+            GetVolumeInformation(root, label, sizeof label, NULL, NULL, NULL, NULL, 0);
+        if (label[0]) snprintf(item, sizeof item, "%c: [%s]", 'A' + i, label);
+        else snprintf(item, sizeof item, "%c:", 'A' + i);
+        int at = (int)SendMessage(c, CB_ADDSTRING, 0, (LPARAM)item);
+        SendMessage(c, CB_SETITEMDATA, (WPARAM)at, 'A' + i);
+        char up = cwd[0] >= 'a' && cwd[0] <= 'z' ? (char)(cwd[0] - 32) : cwd[0];
+        if (up == 'A' + i)
+            SendMessage(c, CB_SETCURSEL, (WPARAM)at, 0);
+    }
+}
 
 static struct dlg *dlg_of(HWND h) { return (struct dlg *)(uintptr_t)GetWindowLong(h, GWL_USERDATA); }
 
@@ -50,6 +94,11 @@ static void fill(HWND h)
     GetCurrentDirectory(sizeof cwd, cwd);
     SetDlgItemText(h, ID_FOLDER, cwd);
     DebugLog("folder %s", cwd);
+    HWND dc = GetDlgItem(h, ID_DRIVE);              /* "Look in" follows */
+    char up = cwd[0] >= 'a' && cwd[0] <= 'z' ? (char)(cwd[0] - 32) : cwd[0];
+    for (int i = 0, n = (int)SendMessage(dc, CB_GETCOUNT, 0, 0); i < n; i++)
+        if (SendMessage(dc, CB_GETITEMDATA, (WPARAM)i, 0) == up)
+            SendMessage(dc, CB_SETCURSEL, (WPARAM)i, 0);
     HWND list = GetDlgItem(h, ID_LIST);
     SendMessage(list, LB_RESETCONTENT, 0, 0);
 
@@ -98,6 +147,29 @@ static bool go(HWND h, const char *name)
         return false;
     fill(h);
     return true;
+}
+
+/* On FAT a name that fits 8.3 is stored as DOS has it, in capitals;
+ * longer names, and names on other file systems, keep their case. */
+static void fat_case(char *path)
+{
+    char root[4] = { path[0], ':', '\\', 0 }, fs[16] = "";
+    if (path[1] != ':' || !GetVolumeInformation(root, NULL, 0, NULL, NULL, NULL, fs, sizeof fs) ||
+        strncmp(fs, "FAT", 3))
+        return;
+    char *name = path;
+    for (char *c = path; *c; c++)
+        if (*c == '\\') name = c + 1;
+    int base = 0, ext = -1;
+    for (char *c = name; *c; c++) {
+        if (*c == '.') { if (ext >= 0) return; ext = 0; continue; }
+        if (*c == ' ') return;
+        if (ext >= 0) ext++; else base++;
+    }
+    if (base < 1 || base > 8 || ext > 3)
+        return;
+    for (char *c = path; *c; c++)
+        if (*c >= 'a' && *c <= 'z') *c = (char)(*c - 32);
 }
 
 static void accept(HWND h)
@@ -153,9 +225,7 @@ static void accept(HWND h)
         if (path[n - 1] != '\\' && n + 1 < sizeof path) path[n++] = '\\';
         strncpy0(path + n, name[0] == '\\' ? name + 1 : name, sizeof path - n);
     }
-    for (char *c = path; *c; c++)                       /* DOS names: upper case */
-        if (*c >= 'a' && *c <= 'z')
-            *c = (char)(*c - 32);
+    fat_case(path);
     strncpy0(d->ofn->file, path, d->ofn->max);
     d->ok = d->done = true;
 }
@@ -166,19 +236,35 @@ static LRESULT dlg_proc(HWND h, unsigned msg, WPARAM wp, LPARAM lp)
     case WM_CREATE: {
         struct dlg *d = (struct dlg *)lp;
         SetWindowLong(h, GWL_USERDATA, (int32_t)lp);
-        CreateWindow(WC_STATIC, "Folder:", WS_CHILD | WS_VISIBLE, 12, 10, 64, 16, h, 0, NULL);
-        CreateWindow(WC_STATIC, "", WS_CHILD | WS_VISIBLE, 76, 10, 220, 16, h, ID_FOLDER, NULL);
-        CreateWindow(WC_STATIC, "File name:", WS_CHILD | WS_VISIBLE, 12, 38, 80, 16, h, 0, NULL);
+        CreateWindow(WC_STATIC, "Look &in:", WS_CHILD | WS_VISIBLE, 12, 10, 64, 16, h, 0, NULL);
+        CreateWindow(WC_COMBOBOX, "", WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST,
+                     70, 3, 110, 28, h, ID_DRIVE, NULL);
+        CreateWindow(WC_STATIC, "", WS_CHILD | WS_VISIBLE | SS_ENDELLIPSIS, 186, 10, 110, 16, h, ID_FOLDER, NULL);
+        CreateWindow(WC_STATIC, "File &name:", WS_CHILD | WS_VISIBLE, 12, 40, 80, 16, h, 0, NULL);
         const char *base = d->ofn->file;                /* just the name part */
         for (const char *c = d->ofn->file; *c; c++)
             if (*c == '\\' || *c == ':') base = c + 1;
-        CreateWindow(WC_EDIT, base, WS_CHILD | WS_VISIBLE | WS_TABSTOP, 94, 31, 198, 28, h, ID_NAME, NULL);
+        CreateWindow(WC_EDIT, base, WS_CHILD | WS_VISIBLE | WS_TABSTOP, 94, 33, 198, 28, h, ID_NAME, NULL);
         CreateWindow(WC_LISTBOX, "", WS_CHILD | WS_VISIBLE | WS_TABSTOP | LBS_NOTIFY,
-                     9, 64, 286, 150, h, ID_LIST, NULL);
-        CreateWindow(WC_BUTTON, d->save ? "Save" : "Open", WS_CHILD | WS_VISIBLE | WS_TABSTOP |
-                     BS_DEFPUSHBUTTON, 122, 222, 84, 30, h, IDOK, NULL);
+                     9, 66, 286, 140, h, ID_LIST, NULL);
+        CreateWindow(WC_STATIC, "Files of &type:", WS_CHILD | WS_VISIBLE, 12, 218, 100, 16, h, 0, NULL);
+        HWND types = CreateWindow(WC_COMBOBOX, "", WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST,
+                                  110, 211, 186, 28, h, ID_TYPE, NULL);
+        const char *desc, *pat;
+        int nt = 0;
+        while (type_at(d->ofn->types, nt, &desc, &pat))
+            SendMessage(types, CB_ADDSTRING, 0, (LPARAM)desc), nt++;
+        if (!nt)
+            SendMessage(types, CB_ADDSTRING, 0, (LPARAM)d->filter);
+        int ti = d->ofn->type_index > 0 ? d->ofn->type_index - 1 : 0;
+        SendMessage(types, CB_SETCURSEL, (WPARAM)(ti < nt ? ti : 0), 0);
+        if (nt && type_at(d->ofn->types, ti < nt ? ti : 0, &desc, &pat))
+            strncpy0(d->filter, pat, sizeof d->filter);
+        CreateWindow(WC_BUTTON, d->save ? "&Save" : "&Open", WS_CHILD | WS_VISIBLE | WS_TABSTOP |
+                     BS_DEFPUSHBUTTON, 122, 248, 84, 30, h, IDOK, NULL);
         CreateWindow(WC_BUTTON, "Cancel", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-                     216, 226, 76, 22, h, IDCANCEL, NULL);
+                     216, 252, 76, 22, h, IDCANCEL, NULL);
+        fill_drives(h);
         return 0;
     }
     case WM_COMMAND: {
@@ -189,6 +275,32 @@ static LRESULT dlg_proc(HWND h, unsigned msg, WPARAM wp, LPARAM lp)
             break;
         case IDCANCEL:
             d->done = true;
+            break;
+        case ID_DRIVE:
+            if (HIWORD(wp) == CBN_SELCHANGE) {
+                HWND c = (HWND)lp;
+                int i = (int)SendMessage(c, CB_GETCURSEL, 0, 0);
+                char drive = (char)SendMessage(c, CB_GETITEMDATA, (WPARAM)i, 0);
+                char root[4] = { drive, ':', 0, 0 };
+                if (!SetCurrentDirectory(root)) {   /* that drive's own current folder, else its root */
+                    root[2] = '\\';
+                    if (!SetCurrentDirectory(root)) {
+                        MessageBox(h, "The drive isn't ready.", "Look in", MB_OK | MB_ICONWARNING);
+                    }
+                }
+                fill(h);
+            }
+            break;
+        case ID_TYPE:
+            if (HIWORD(wp) == CBN_SELCHANGE) {
+                int i = (int)SendMessage((HWND)lp, CB_GETCURSEL, 0, 0);
+                const char *desc, *pat;
+                if (type_at(d->ofn->types, i, &desc, &pat)) {
+                    strncpy0(d->filter, pat, sizeof d->filter);
+                    d->ofn->type_index = i + 1;
+                    fill(h);
+                }
+            }
             break;
         case ID_LIST: {
             HWND list = (HWND)lp;
@@ -239,7 +351,7 @@ static bool run(OPENFILENAME *ofn, bool save)
     o = work;
     if (owner)
         GetWindowRect(owner, &o);
-    int w = 304 + 10, hh = 262 + 25 + 5;
+    int w = 304 + 10, hh = 288 + 25 + 5;
     int x = o.left + (o.right - o.left - w) / 2, y = o.top + (o.bottom - o.top - hh) / 3;
     if (x < 0) x = 0;
     if (y < 0) y = 0;

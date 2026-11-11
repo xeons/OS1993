@@ -12,6 +12,8 @@ EXPORTS
     gfx_vline
     gfx_rect
     gfx_text
+    gfx_text_font
+    gfx_text_width
     gfx_bitmap
     gfx_xor_bitmap
     gfx_xor_fill
@@ -22,3 +24,6 @@ EXPORTS
     gfx_init_linear
     gfx_set_colors
     gfx_fill_rgb
+    gfx_sprite_save
+    gfx_sprite_restore
+    gfx_sprite_draw

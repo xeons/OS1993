@@ -578,6 +578,30 @@ int file_op(struct proc_files *pf, uint32_t op, struct file_args *a)
     char path[PATH_MAX], path2[PATH_MAX];
     int rc, s;
     bool handled;
+    if (op == FOP_DRIVES)
+        return (int)redir_drives();
+    if (op == FOP_VOLINFO) {                            /* ours: label and type; DOS's: what DOS says */
+        struct vol_info vi;
+        memset(&vi, 0, sizeof vi);
+        if (!a->path || !a->path[0] || a->path[0] < 'A' || (a->path[0] | 0x20) > 'z')
+            return -ERROR_INVALID_PARAMETER;
+        char letter = (char)(a->path[0] & ~0x20);
+        if (!(redir_drives() & (1u << (letter - 'A'))))
+            return -ERROR_INVALID_DRIVE;
+        vi.type = letter < 'C' ? 2 : 3;                 /* DRIVE_REMOVABLE, DRIVE_FIXED */
+        struct vol *v = fs_volume(letter);
+        if (v) {
+            copy_str(vi.label, fs_label(v), sizeof vi.label);
+            copy_str(vi.fs, fs_type_name(v), sizeof vi.fs);
+            vi.serial = fs_serial(v);
+        } else {
+            copy_str(vi.fs, "FAT", sizeof vi.fs);
+        }
+        if (!user_writable((uint32_t)(uintptr_t)a->buf, sizeof vi))
+            return -ERROR_NOACCESS;
+        memcpy(a->buf, &vi, sizeof vi);
+        return 0;
+    }
     rc = native_op(pf, op, a, &handled);
     if (handled)
         return rc;

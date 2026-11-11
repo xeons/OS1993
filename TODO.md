@@ -5,47 +5,62 @@ README.md for what already works.
 
 ## GUI and UI library
 
-- [ ] Menus: owner-drawn
-      items, bitmaps in menus, `WM_MENUSELECT` for status-bar help,
-      `InsertMenu`/`DeleteMenu`/`ModifyMenu`, a menu bar that wraps to a
-      second line when the window is narrow.
-- [ ] More controls: tree view, list view, tooltips, status bar, toolbar.
-      Combo boxes, the tab control and up-downs exist; missing there:
-      `CBS_SIMPLE`, item data (`CB_SETITEMDATA`), `CBN_SELENDOK`/`CANCEL`,
-      autocomplete in the editable combo; a non-blocking
-      `CB_SHOWDROPDOWN` (it returns when the list closes); tab rows that
-      wrap or scroll when the tabs don't fit, icons in tabs, Ctrl+Tab;
-      `UDN_DELTAPOS`, acceleration while an up-down is held, thousands
-      separators. A real `WM_NOTIFY` would let tabs notify as in Win32.
-- [ ] Standard dialogs: file open/save, colour picker. Message boxes could
-      use a system-modal flag and a beep (no sound driver yet).
-- [ ] Edit controls: text selection, clipboard (cut/copy/paste), horizontal
-      scrolling done properly.
-- [ ] Mouse cursor shapes: resize arrows over borders, I-beam over edits,
-      wait cursor.
-- [ ] Keyboard: Alt+Esc,
-      arrow keys between radio buttons in a group.
-- [ ] Proportional font for window text (the VGA 8x16 font is all there is).
-- [ ] Shell: wallpaper patterns, icon dragging, a Programs list read from a
-      file (needs file I/O), large icons in the Start menu with the
-      vertical banner, taskbar button right-click (the window's system
-      menu), tooltips for tray icons. Close Program could mark programs
-      "Not responding" (queue untouched for seconds) and try WM_CLOSE
-      before ending one.
-- [ ] Notepad: Print (no printer yet), files over 32 KB, a status bar. Calculator scientific view; Paint: cut/copy/paste, zoom, a
-      canvas size setting.
-- [ ] Multi-line edit: more than one undo step, a blinking caret, End on a
-      wrapped row (it stops before the row's last character),
-      auto-scroll while drag-selecting outside the control.
-- [ ] Clipboard: text only (16 KB); bitmaps for Paint.
-- [ ] File dialogs: a drive list, long file names (FreeDOS has no LFN
-      here), a file type list.
-- [ ] Layout: controls don't reflow when a window is resized (programs can
-      do it themselves now on `WM_SIZE` with `MoveWindow`).
-- [ ] Dialog templates (`CreateDialog` from a table) and modal loops.
-- [ ] Owner-drawn controls (`WM_DRAWITEM`), `WM_CTLCOLOR*`, `WM_NCHITTEST`.
-- [ ] Repainting: the dirty region is a single bounding rectangle; a region
-      list would repaint less when far-apart things change.
+- [x] Menus: owner-drawn items (`MF_OWNERDRAW`, `WM_MEASUREITEM`/`WM_DRAWITEM`),
+      pictures (`MF_BITMAP`) and icons beside items (`SetMenuItemImage`), a
+      banner (`SetMenuBanner`), `WM_MENUSELECT`, `InsertMenu`/`DeleteMenu`/
+      `RemoveMenu`/`ModifyMenu`/`GetMenuState`/`GetMenuString`, a menu bar
+      that wraps onto more rows when the window is narrow.
+- [x] Tree view and list view (its four views), image lists, `WM_NOTIFY`;
+      Explorer on them.
+- [x] Tree and list views: dragging (`TVN_BEGINDRAG`, `LVN_BEGINDRAG`, drop
+      highlighting), check boxes (`TVS_CHECKBOXES`, `LVS_EX_CHECKBOXES`), label
+      editing in the tree, `LVS_EX_GRIDLINES`/`FULLROWSELECT`, virtual lists
+      (`LVS_OWNERDATA`), icons placed anywhere (`LVM_SETITEMPOSITION`, dragged
+      about in the icon views), sort arrows in the header, marquee selection.
+      Explorer: cut, copy and paste of files (`CF_FILES`), drag and drop
+      between folders and drives, a toolbar with tooltips, Back and Forward,
+      file types from FILETYPES.INI.
+- [x] More controls: tooltips, status bar, toolbar. Combo boxes: `CBS_SIMPLE`,
+      item data, `CBN_SELENDOK`/`CANCEL`, autocomplete, owner-drawn items, a
+      `CB_SHOWDROPDOWN` that returns at once. Tabs: rows that wrap
+      (`TCS_MULTILINE`) or scroll, icons, Ctrl+Tab, `WM_NOTIFY`. Up-downs:
+      `UDN_DELTAPOS`, acceleration, thousands separators, hex, 32-bit ranges.
+- [x] Standard dialogs: the colour dialog (`ChooseColor`). Message boxes:
+      `MB_SYSTEMMODAL`/`MB_TASKMODAL`/`MB_TOPMOST`, `MessageBeep` through the PC
+      speaker (`Beep`, `SYS_BEEP`).
+- [x] Edit controls: selection (mouse, Shift, double-click), cut/copy/paste of
+      it, sideways scrolling, undo, `ES_PASSWORD`/`NUMBER`/`UPPERCASE`/
+      `LOWERCASE`/`READONLY`.
+- [x] Mouse cursor shapes: resize arrows over borders, I-beam over edits,
+      wait, cross, move, no-entry (`LoadCursor`/`SetCursor`, class and window
+      cursors).
+- [x] Keyboard: Alt+Esc, arrow keys between the buttons of a group, Alt+letter
+      mnemonics in dialogs.
+- [x] Proportional font for window text (`FONT_GUI`: the VGA glyphs set
+      proportionally), `DrawText`, `SetTextColor`/`SetBkColor`.
+- [x] Shell: background patterns, icon dragging (kept in OS1993.INI), the
+      Programs menu read from PROGRAMS.INI, large icons in the Start menu with
+      the vertical banner, taskbar button right-click (the window's system
+      menu), tooltips for tray icons. Close Program marks programs "Not
+      responding" and tries WM_CLOSE before ending one.
+- [x] Notepad: Print (to a .PRN file: there is no printer driver), files up to
+      512 KB, a status bar. Calculator scientific view; Paint: selection with
+      cut/copy/paste, zoom, a canvas size setting, undo.
+- [x] Multi-line edit: an undo history (and redo), a blinking caret, End on a
+      wrapped row, auto-scroll while drag-selecting.
+- [x] Clipboard: text, pictures (`SetClipboardBitmap`, up to 640x480), files.
+- [x] File dialogs: a drive list, names kept as the disk has them (long, mixed
+      case), a file type list.
+- [x] Layout: anchored children follow the parent's edges (`SetWindowAnchor`).
+- [x] Dialog templates (`DialogBox`/`CreateDialog` from a table, `EndDialog`,
+      `WM_INITDIALOG`).
+- [x] Owner-drawn controls (`WM_DRAWITEM`), `WM_CTLCOLOR*`, `WM_NCHITTEST`.
+- [x] Repainting: update regions are lists of rectangles.
+- [ ] GUI follow-ups: edit controls keep the fixed font; a real printer
+      driver (Print writes files); drag images (dragging shows only the
+      cursor); `WM_NCHITTEST` answers act on the caption, the borders and
+      the system box only; virtual lists stop at 32767 items; menus can't
+      be owner-drawn on the menu bar itself.
 
 ## Ring 3 and DLLs
 

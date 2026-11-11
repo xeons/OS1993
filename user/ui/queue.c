@@ -313,6 +313,7 @@ bool PeekMessage(MSG *m, bool remove)
 {
     if (!myq)
         return false;
+    myq->last_read = GetTickCount();
     ui_cleanup_dead();
     answer_sent();
     if (input_for_us())
@@ -346,8 +347,59 @@ bool GetMessage(MSG *m)
     return m->message != WM_QUIT;
 }
 
+/* WM_NCHITTEST, asked here in the window's own process just before a
+ * mouse message reaches it: a window answering something other than
+ * HTCLIENT gets the frame's behaviour instead (a press on HTCAPTION moves
+ * the window, a border code sizes it, HTTRANSPARENT passes the message to
+ * the parent). -> true if the message was dealt with so. */
+static bool hit_test(const MSG *m)
+{
+    unsigned msg = m->message;
+    if (msg < WM_MOUSEMOVE || msg > WM_RBUTTONUP)
+        return false;
+    struct wnd *w = wnd_from(m->hwnd);
+    if (!w || !wnd_mine(w) || (w->cls->pid == 0 && w->proc == w->cls->proc))
+        return false;                           /* a built-in control: the client */
+    int ox, oy;
+    wnd_client_screen(w, &ox, &oy);
+    int x = GET_X_LPARAM(m->lParam), y = GET_Y_LPARAM(m->lParam), sx = ox + x, sy = oy + y;
+    int ht = (int)w->proc(w, WM_NCHITTEST, 0, MAKELPARAM(sx, sy));
+    if (ht == HTCLIENT || !wnd_from(w))
+        return false;
+    if (ht == HTTRANSPARENT) {
+        if (w->parent)
+            PostMessage(w->parent, msg, m->wParam, MAKELPARAM(x + w->x, y + w->y));
+        return true;
+    }
+    static const uint8_t edges[] = { [HTLEFT] = E_L, [HTRIGHT] = E_R, [HTTOP] = E_T,
+        [HTTOPLEFT] = E_T | E_L, [HTTOPRIGHT] = E_T | E_R, [HTBOTTOM] = E_B,
+        [HTBOTTOMLEFT] = E_B | E_L, [HTBOTTOMRIGHT] = E_B | E_R };
+    int e = ht >= HTLEFT && ht <= HTBOTTOMRIGHT ? edges[ht] : 0;
+    struct wnd *t = wnd_top(w);
+    if (msg == WM_MOUSEMOVE) {
+        ui_set_cursor(e && (t->style & WS_THICKFRAME) ? ui_edge_cursor(e) : CURSOR_ARROW);
+        return true;
+    }
+    if (msg != WM_LBUTTONDOWN && msg != WM_LBUTTONDBLCLK)
+        return true;
+    int part = e ? HT_BORDER : ht;
+    if (part != HT_CAPTION && part != HT_BORDER && part != HT_SYSMENU)
+        return true;
+    if (part == HT_BORDER && !(t->style & WS_THICKFRAME))
+        return true;
+    if (msg == WM_LBUTTONDBLCLK && part == HT_CAPTION) {
+        SendMessage(t, WM_NCLBUTTONDBLCLK, HT_CAPTION, MAKELPARAM(sx, sy));
+        return true;
+    }
+    ui_reserve_input(ui_pid);
+    SendMessage(t, WM_NCLBUTTONDOWN, (WPARAM)(part | e << 8), MAKELPARAM(sx, sy));
+    return true;
+}
+
 LRESULT DispatchMessage(const MSG *m)
 {
+    if (hit_test(m))
+        return 0;
     struct wnd *w = wnd_from(m->hwnd);
     LRESULT r = wnd_mine(w) ? w->proc(m->hwnd, m->message, m->wParam, m->lParam) : 0;
     if (S->in.modal_pid == ui_pid && !S->in.modal_running)
@@ -365,4 +417,18 @@ bool TranslateMessage(const MSG *m)
     if ((m->lParam & (1 << 27)) && m->wParam >= 'A' && m->wParam <= 'Z')
         ch = (char)(m->wParam - 'A' + 1);           /* Ctrl+letter: a control code */
     return PostMessage(m->hwnd, WM_CHAR, (WPARAM)(uint8_t)ch, m->lParam);
+}
+
+/* A program not looking at its messages: some waiting, none read for 5
+ * seconds (as Windows' "Not responding"). */
+bool IsHungAppWindow(HWND h)
+{
+    struct wnd *w = wnd_from(h);
+    if (!w) return false;
+    for (int i = 0; i < PROC_MAX; i++) {
+        struct pqueue *q = &S->queues[i];
+        if (q->pid == w->pid)
+            return q->head != q->tail && GetTickCount() - q->last_read > 5000;
+    }
+    return false;
 }

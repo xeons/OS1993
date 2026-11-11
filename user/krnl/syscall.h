@@ -38,6 +38,7 @@ static inline int  sys_kill(int pid)         { return (int)syscall3(SYS_KILL, (u
 static inline int  sys_lock(int n)           { return (int)syscall3(SYS_LOCK, (uint32_t)n, 0, 0); }
 static inline int  sys_unlock(int n)         { return (int)syscall3(SYS_UNLOCK, (uint32_t)n, 0, 0); }
 static inline int  sys_time(struct systime *t) { return (int)syscall3(SYS_TIME, (uint32_t)t, 0, 0); }
+static inline void sys_beep(unsigned hz, unsigned ms) { syscall3(SYS_BEEP, hz, ms, 0); }
 static inline int  sys_timezone(int set, struct fs_timezone *z) { return (int)syscall3(SYS_TIMEZONE, (uint32_t)set, (uint32_t)z, 0); }
 static inline uint32_t sys_exits(void)       { return syscall3(SYS_PROC_EXITS, 0, 0, 0); }
 static inline int  sys_tasklist_ack(void)    { return (int)syscall3(SYS_TASKLIST_ACK, 0, 0, 0); }

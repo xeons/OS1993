@@ -226,6 +226,7 @@ struct mem_info {
 /* ---- sockets (SYS_SOCKET; WSOCK.DLL wraps them as Winsock) ---------------- */
 #define SYS_SOCKET      38              /* EBX = SOP_*, ECX = struct sock_args * -> result, or -errno */
 #define SYS_TIMEZONE    39              /* EBX = 1 set / 0 get, ECX = struct fs_timezone * -> 0 unknown, 1 standard, 2 daylight */
+#define SYS_BEEP        40              /* EBX = frequency (Hz), ECX = ms: the PC speaker */
 struct fs_tzrule { uint8_t month, week, day_of_week, hour, minute; };   /* month 0: none; week 5: the last */
 struct fs_timezone {                    /* UTC = local + bias + (std_bias or dst_bias) */
     int32_t bias, std_bias, dst_bias;
@@ -310,7 +311,16 @@ enum { FOP_OPEN, FOP_READ, FOP_WRITE, FOP_CLOSE, FOP_SEEK, FOP_SIZE, FOP_DELETE,
        FOP_SEEK64,                      /* handle, a|c<<32: offset, b: method -> buf (uint64_t): the position */
        FOP_SIZE64,                      /* handle -> buf (uint64_t) */
        FOP_LINK,                        /* path2: a new name for the file at path (a hard link) */
-       FOP_SYMLINK };                   /* path: a symbolic link, path2: what it points to (as given) */
+       FOP_SYMLINK,                     /* path: a symbolic link, path2: what it points to (as given) */
+       FOP_DRIVES,                      /* -> the drives there are, bit 0 = A: */
+       FOP_VOLINFO };                   /* path (a drive) -> buf: struct vol_info */
+
+struct vol_info {
+    char     label[16];                 /* "" if none (or DOS's own drive) */
+    char     fs[16];                    /* "FAT16", "ext4" ... */
+    uint32_t serial;
+    uint32_t type;                      /* DRIVE_REMOVABLE, DRIVE_FIXED, DRIVE_REMOTE */
+};
 
 struct disk_free {
     uint32_t sectors_per_cluster, bytes_per_sector, free_clusters, total_clusters;
@@ -360,6 +370,7 @@ struct find_data {                      /* a directory entry (FIND_FIRST/NEXT) *
 #define ERROR_INVALID_NAME       123
 #define ERROR_CURRENT_DIRECTORY   16
 #define ERROR_NOT_SAME_DEVICE     17
+#define ERROR_INVALID_DRIVE       15
 #define ERROR_WRITE_PROTECT       19
 #define ERROR_GEN_FAILURE         31
 #define ERROR_SHARING_VIOLATION   32
