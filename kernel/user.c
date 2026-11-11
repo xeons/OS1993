@@ -32,6 +32,7 @@
 #include "user.h"
 #include "random.h"
 #include "net.h"
+#include "fs.h"
 #include "v86.h"
 #include "vga.h"
 #include "vm.h"
@@ -1471,6 +1472,14 @@ static void read_time(struct systime *t)
     *t = (struct systime){ .year = (uint16_t)(y < 80 ? 2000 + y : 1900 + y), .month = mo,
                            .day_of_week = (uint16_t)(dow ? dow - 1 : 0), .day = d,
                            .hour = (uint16_t)(h & 0x7F), .minute = m, .second = s, .ms = 0 };
+}
+
+void rtc_dos_time(uint16_t *date, uint16_t *time)
+{
+    struct systime t;
+    read_time(&t);
+    *date = (uint16_t)((t.year - 1980) << 9 | t.month << 5 | t.day);
+    *time = (uint16_t)(t.hour << 11 | t.minute << 5 | t.second / 2);
 }
 
 /* ---- INT 30h ------------------------------------------------------------------ */

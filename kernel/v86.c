@@ -6,7 +6,8 @@
  * Each VM's interrupt flag is virtual (vm->vif); the real IF stays on so
  * hardware interrupts always reach the kernel. Port I/O is checked against
  * the TSS I/O bitmap: only the PIC (20h/21h/A0h/A1h) and keyboard
- * controller (60h/64h) ports trap, to the per-VM virtual devices.
+ * controller (60h/64h) ports trap, to the per-VM virtual devices, and an
+ * IDE channel the VMM drives itself (ata.c) reads as empty.
  *
  * A kernel V86 call (v86_int) pushes an INT-style frame whose return
  * address is an ARPL instruction in the loader's segment. ARPL is invalid
@@ -21,6 +22,8 @@
  * a real HIMEM's block move. That needs VCPI/DPMI support.
  */
 #include "kernel.h"
+#include "disk.h"
+#include "fs.h"
 #include "gdt.h"
 #include "io.h"
 #include "mm.h"
@@ -153,6 +156,7 @@ static uint8_t port_in8(struct vm *vm, uint16_t p)
 {
     if (vpic_port(p)) return vpic_in(&vm->pic, p);
     if (vkbd_port(p)) return vkbd_in(vm, p);
+    if (ata_port_owned(p)) return 0xFF;         /* the VMM's disk channel: nothing there */
     return inb(p);
 }
 
@@ -160,7 +164,7 @@ static void port_out8(struct vm *vm, uint16_t p, uint8_t v)
 {
     if (vpic_port(p))      vpic_out(&vm->pic, p, v);
     else if (vkbd_port(p)) vkbd_out(vm, p, v);
-    else                   outb(p, v);
+    else if (!ata_port_owned(p)) outb(p, v);
 }
 
 static uint32_t port_in(struct vm *vm, uint16_t port, int size)
@@ -221,6 +225,16 @@ static void emulate(struct vm *vm, struct regs *r)
     case 0xCD: {                                /* INT n */
         uint8_t n = *lin(r->cs, ip);
         uint16_t next = (uint16_t)(ip + 1);
+        if (n == 0x2F && (r->eax & 0xFF00) == 0x1100 && redir_int2f(vm, r)) {
+            r->eip = next;                      /* the redirector answered (redir.c) */
+            return;
+        }
+        if (n == 0x13 && (r->edx & 0x80) && ata_bios_owned((uint8_t)r->edx)) {
+            r->eax = (r->eax & 0xFFFF00FFu) | 0xAA00;   /* the VMM's disk: "not ready" */
+            r->eflags |= EFLAGS_CF;
+            r->eip = next;
+            return;
+        }
         switch (dosmgr_int(vm, r, n, next)) {
         case DOSMGR_DONE:
             return;

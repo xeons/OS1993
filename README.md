@@ -21,12 +21,13 @@ are for later stages.
 | `make run`       | boots it in DOSBox-X: 486, 16 MB, XMS, no EMS                 |
 | `make test`      | headless round trip DOS → VMM → DOS, checked automatically    |
 | `make check486`  | fails if any binary contains a post-486 or FPU instruction    |
-| `make qemu`      | boots real FreeDOS 1.3 in QEMU (486, 16 MB, ISA PC with the ISA VGA and its VBE registers); `OS1993` is in `C:\OS1993` |
+| `make qemu`      | boots real FreeDOS 1.3 in QEMU (486, 16 MB, ISA PC with the ISA VGA and its VBE registers); `OS1993` is in `C:\OS1993`. `build/data.img` (made once by `tools/mkdata.sh`, then kept) is on the secondary IDE channel: D: (FAT32) and E: (FAT16) |
 | `make qemu-test` | headless FreeDOS run of the same checks as `make test`        |
 | `make qemu-emm386` | FreeDOS with JEMM386: the loader must refuse to start       |
 | `make qemu-sessions` | types into two concurrent DOS sessions via QEMU's monitor |
 | `make qemu-absmouse` | absolute pointer through QEMU's VMware port: the cursor lands on the exact pixel, and clicks hit their control |
 | `make qemu-crt` | the C runtime: CRTTEST.BIN (CRT.DLL) and CRTSTAT.BIN (libcrt.a) pass its checks; a stack overrun, a heap overrun, a double free, a fortified memcpy, a broken Annex K constraint, `%n` and a failed assert each end the program with the reason logged; every process has its own canary |
+| `make qemu-fat` | the VMM's own disks: a FAT32 and a FAT16 partition on the secondary IDE channel, which FreeDOS had mounted as D: and E:; a DOS session works on them through the redirector (DIR, TYPE, COPY, MD, REN, DEL, a batch file read from E:), FSTEST.BIN's checks through KERNEL.DLL (long names and aliases, a 300 KB file in pieces, writing, gaps, truncating, folders, moves, read-only, a FAT16 directory that grows), DOS sees it all as its own drives again after OS1993 ends, and mtools and fsck.fat check the image |
 | `make qemu-net` | the network: the NE2000 and a DHCP lease, NETTEST.BIN's 26 checks (loopback UDP and TCP with a server thread, refused connections, ICMP port unreachable, timeouts, non-blocking sockets and select, 64 KB echoed by a server on the host), PING to the host, the loopback and nobody, IPCONFIG, and the host connecting in to a server in the guest |
 | `make qemu-threads` | threads: 67 checks (joins and exit codes, critical sections, events, semaphores, mutexes, timeouts, TLS and errno per thread, suspend/terminate, the 16-thread limit, malloc and printf from several threads, virtual memory, private heaps, a child process, the file calls); a stack overflow hits the guard page, a read-only page faults, the last thread's code ends the process, `exit` from a second thread ends them all |
 | `make qemu-vesa` | the VBE display driver: Display Properties switches to 1024×768 high colour, 800×600 in 256 colours and true colour, No and the 15-second timeout go back, a DOS session and back keeps the mode, OS1993.INI restores it next session, and 640×480×16 is VGA again |
@@ -437,6 +438,57 @@ loopback, as Windows for Workgroups and Win95 had theirs in VxDs.
   first thread moving the text in on a timer; the window stays when the
   program ends. Start them from Run: `ping -n 3 10.0.2.2`, `ipconfig`.
 
+## Disks and file systems
+
+The VMM has its own disk driver and file system, as Windows for
+Workgroups 3.11 had 32-bit File Access, so files on its disks never go
+through DOS or the BIOS, and OS1993 programs get long names.
+
+- **IDE** (`kernel/disk/ata.c`): both legacy channels, PIO, polled (the
+  drive's interrupt off). Each disk found is matched to its BIOS drive
+  number by reading its first sector both ways. The channel holding BIOS
+  drive 80h -- the disk DOS booted from -- stays DOS's; the VMM takes every
+  other channel: its ports read as empty from V86 code and INT 13h for its
+  disks fails, so nothing else touches it. LBA28 (up to 128 GB).
+- **Partitions** (`part.c`): the MBR's four entries and the logical drives
+  in an extended partition; a disk with a boot sector and no table is one
+  volume. **The block cache** (`cache.c`) keeps 160 sectors, least recently
+  used out first; every file system call that changed something writes it
+  all back before it returns, so the disk is consistent between calls.
+- **FAT12, FAT16, FAT32** (`kernel/fs/fat.c`): the cluster count decides
+  the type; every FAT copy is kept (unless FAT32 says otherwise), the FAT32
+  FSInfo free count and next free cluster too. **Long names** (VFAT): read
+  back from their entries (checked by sequence and checksum, an orphan
+  ignored), written for any name that isn't plain 8.3, with a unique
+  `BASIS~N.EXT` alias; an 8.3 name in one case per part gets Windows NT's
+  case bits instead (`lower.txt`). Names match without regard to case,
+  long or short. Open files are shared nodes, one per directory entry, so
+  every handle sees one size; whole clusters move straight between the
+  disk and the caller.
+- **OS1993 programs** use the same calls as before (`CreateFile`,
+  `FindFirstFile` ...); `files.c` sends paths on the VMM's drives straight
+  to the file system, keeping their case. `WIN32_FIND_DATA` has the long
+  `name` and the 8.3 `short_name`.
+- **DOS** (`kernel/fs/redir.c`) sees the same volumes as network drives: the
+  drive letter's current directory structure is marked "network", so DOS
+  sends every call for it to the network redirector, INT 2Fh AH=11h, as it
+  does for MSCDEX and network clients. DOS itself issues those INT 2Fh
+  calls; they trap into the V86 monitor, which answers them from the file
+  system in 32-bit code, in whichever VM made them: 8.3 names from DOS's
+  swappable data area, open files as DOS's own file table entries with our
+  file number in them, searches kept in the caller's DTA. A volume DOS had
+  mounted itself (the same serial number) keeps its letter: DOS's buffers
+  are flushed and dropped first, and when OS1993 ends the drive is given
+  back and DOS rebuilds it from the disk (FSInfo is up to date, so even
+  the free space is right). Other volumes get free letters below
+  LASTDRIVE.
+
+What doesn't work yet: other file systems (exFAT, ext2/3/4, btrfs: see
+TODO.md), sharing a channel with the boot disk (that needs INT 13h done by
+the VMM for DOS too), more than 128 GB, sector sizes other than 512, DOS's
+file sharing and locks (accepted, not enforced), and long names for DOS
+programs (they see the aliases).
+
 ## The window system across processes
 
 UI.DLL's state (windows, classes, z-order, queues, timers, menus, input
@@ -726,6 +778,9 @@ kernel/vmtest.c                          multi-VM self-test
 kernel/dosmgr.c                          one DOS shared by all VMs
 kernel/random.c                          random numbers (ChaCha20 from interrupt timing)
 kernel/net/                              the NE2000, Ethernet/ARP/IP/ICMP/DHCP, sockets and UDP, TCP
+kernel/disk/                             IDE (ATA PIO), partitions, the block cache
+kernel/fs/                               FAT12/16/32 with long names, the DOS redirector (INT 2Fh AH=11h)
+kernel/files.c                           file calls for ring 3: DOS's drives through DOS, the VMM's directly
 kernel/vga.c gfx.c                       VGA state (VDD), planar drawing
 kernel/display.c vbe.c                   display modes: the VBE adapter, the VBE BIOS probe
 kernel/user.c                            ring-3 loader, INT 30h system calls
@@ -742,7 +797,7 @@ kernel/gdt.c idt.c pic.c timer.c keyboard.c console.c serial.c kprintf.c panic.c
 kernel/include/          headers; bootinfo.h is shared with the loader
 kernel/linker.ld         links at 0x80000000, header first
 test/dosbox-x.conf       the emulated 1993 machine
-tools/                   check486.sh, check-test.sh
+tools/                   check486.sh, check-test.sh, mkfreedos.sh, mkdata.sh, the QEMU tests
 ```
 
 ## Rules of the house
@@ -765,9 +820,13 @@ tools/                   check486.sh, check-test.sh
 3. ~~**Multiple VMs.**~~ Done: private address spaces, preemptive
    scheduling, virtual keyboard and display, Alt+Tab focus switching, and
    one DOS shared by all VMs with a critical section.
-4. **DOS services from protected mode.** Call `INT 21h` inside the System VM
-   for file I/O, behind a `fs_*` interface so a native FAT driver can replace
-   it later (as 32-bit File Access did in Windows for Workgroups 3.11).
+4. ~~**DOS services from protected mode.**~~ Done: programs' files go
+   through `INT 21h` in the System VM on DOS's drives, and through the
+   VMM's own IDE driver and FAT12/16/32 file system (long names) on the
+   others, which DOS reaches through a redirector in the V86 monitor (as
+   32-bit File Access did in Windows for Workgroups 3.11). Still to do:
+   INT 13h done by the VMM for DOS (so the boot disk can be the VMM's too),
+   and the other file systems in TODO.md.
 5. **More virtual devices (VxD-style).** The PIC, keyboard and text display
    are done. Still to do: the PIT (programs that reprogram the timer), CRTC
    ports for background VMs, graphics modes, mouse, serial and printer ports.

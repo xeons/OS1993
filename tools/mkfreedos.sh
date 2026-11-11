@@ -6,7 +6,8 @@
 #   normal    HIMEMX only (what OS1993 needs)
 #   emm386    HIMEMX + JEMM386: the CPU is in V86 mode, OS1993 must refuse
 #   autotest  run "OS1993 /T" at boot and power off afterwards
-#   autorun   run "OS1993" at boot (driven by a script) and power off
+#   autorun   run "OS1993" at boot (driven by a script), then C:\OS1993\AFTER.BAT
+#             if a test put one there, and power off
 #
 # The FreeDOS 1.3 Lite USB image is downloaded once into .cache/freedos and
 # checked against the published SHA-256.
@@ -69,6 +70,7 @@ OS1993 /T > LOADER.LOG
 QEXIT
 :run
 OS1993
+if exist AFTER.BAT call AFTER.BAT
 QEXIT
 :end
 EOF

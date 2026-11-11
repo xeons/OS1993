@@ -15,6 +15,7 @@
 #define ID_LIST   101
 #define ID_FOLDER 102
 #define ITEMS     96
+#define NAME_LEN  64                            /* long names, cut at 61 */
 
 struct dlg {
     OPENFILENAME *ofn;
@@ -45,14 +46,14 @@ static int compare(const char *a, const char *b)
 static void fill(HWND h)
 {
     struct dlg *d = dlg_of(h);
-    char cwd[128];
+    char cwd[MAX_PATH];
     GetCurrentDirectory(sizeof cwd, cwd);
     SetDlgItemText(h, ID_FOLDER, cwd);
     DebugLog("folder %s", cwd);
     HWND list = GetDlgItem(h, ID_LIST);
     SendMessage(list, LB_RESETCONTENT, 0, 0);
 
-    static char names[ITEMS][16];
+    static char names[ITEMS][NAME_LEN];
     int n = 0, ndirs = 0;
     WIN32_FIND_DATA fd;
     for (int pass = 0; pass < 2; pass++) {              /* folders, then files */
@@ -67,14 +68,14 @@ static void fill(HWND h)
                 continue;
             int at = pass ? n : ndirs, start = pass ? ndirs : 0;  /* sorted insert */
             while (at > start && compare(names[at - 1], fd.name) > 0) {
-                strncpy0(names[at], names[at - 1], 16);
+                strncpy0(names[at], names[at - 1], NAME_LEN);
                 at--;
             }
             if (pass) {
-                strncpy0(names[at], fd.name, 16);
+                strncpy0(names[at], fd.name, NAME_LEN);
             } else {
                 names[at][0] = '[';
-                strncpy0(names[at] + 1, fd.name, 14);
+                strncpy0(names[at] + 1, fd.name, NAME_LEN - 2);
                 size_t k = strlen(names[at]);
                 names[at][k] = ']';
                 names[at][k + 1] = '\0';
@@ -191,7 +192,7 @@ static LRESULT dlg_proc(HWND h, unsigned msg, WPARAM wp, LPARAM lp)
             break;
         case ID_LIST: {
             HWND list = (HWND)lp;
-            char item[16];
+            char item[NAME_LEN];
             if (SendMessage(list, LB_GETTEXT, (WPARAM)SendMessage(list, LB_GETCURSEL, 0, 0),
                             (LPARAM)item) == LB_ERR)
                 break;

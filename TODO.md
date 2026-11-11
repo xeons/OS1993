@@ -124,18 +124,28 @@ README.md for what already works.
 
 ## File systems
 
-Files go through DOS today (FAT12/16, FAT32 where the DOS has it). Native
-file systems need two pieces first, then one driver per format:
+The VMM has its own IDE driver and FAT12/16/32 (README: Disks and file
+systems); DOS reaches its volumes through the redirector.
 
-- [ ] Native disk access in the VMM: an IDE/ATA driver, MBR partitions, a
-      block cache; arbitration with DOS and BIOS INT 13h in the VMs
-      (exclusive partitions, or virtualized INT 13h as 32-bit disk access).
-- [ ] DOS sees them as drive letters through a network redirector
-      (INT 2Fh AH=11h, as MSCDEX and network drives): 8.3 short aliases for
-      long names, no permissions or symlinks, nothing over 2-4 GB, names that
-      differ only in case collide. OS1993 programs get the full names.
-- [ ] FAT16 and FAT32 natively (FSInfo, VFAT long names); first, since DOS
-      can check the redirector against its own reading of the same disk.
+- [x] Native disk access in the VMM: an IDE/ATA driver, MBR and extended
+      partitions, a block cache; the channels away from the boot disk are
+      the VMM's alone (V86 ports hidden, INT 13h refused).
+- [ ] INT 13h done by the VMM for DOS (32-bit disk access, as WDCTRL), so a
+      disk sharing a channel with the boot disk -- or the boot disk's other
+      partitions -- can be the VMM's too. Interrupt-driven transfers.
+- [ ] LBA48 (disks over 128 GB); sector sizes other than 512.
+- [x] DOS sees them as drive letters through a network redirector
+      (INT 2Fh AH=11h); volumes DOS had mounted keep their letters and go
+      back to DOS when OS1993 ends.
+- [ ] The redirector's limits: DOS programs see only the 8.3 aliases (an
+      LFN API, INT 21h AX=71xxh, as Win95 gave them); share modes and
+      locks are accepted, not enforced; findfirst state in the DTA holds a
+      16-bit entry index.
+- [x] FAT12, FAT16 and FAT32 natively (FSInfo, VFAT long names, NT case
+      bits).
+- [ ] FAT: write-behind (now every call writes through when it returns);
+      a dirty-volume bit; a free-cluster bitmap instead of walking the FAT.
+- [ ] A volume ops table, so exFAT and ext2 plug in beside FAT.
 - [ ] exFAT (allocation bitmap, upcase table, checksummed entry sets).
 - [ ] ext2; ext3 (journal replay to read, journalled writes); ext4
       (extents, 64-bit blocks, htree directories, CRC32C metadata) read-only
@@ -143,6 +153,8 @@ file systems need two pieces first, then one driver per format:
 - [ ] btrfs, read-only (CoW B-trees, chunk tree, checksums, zlib/LZO/zstd).
 - [ ] 64-bit offsets everywhere without libgcc's division; caches that fit
       in 16 MB.
+- [ ] Long names in DOS's own drives for OS1993 programs (the VMM taking
+      over C: too, as Win95 did).
 
 ## DOS virtual machines
 

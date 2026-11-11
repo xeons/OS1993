@@ -31,7 +31,8 @@ def vga_rom_dir():
 IMG = os.path.join(BUILD, "freedos.img")
 
 KEYS = {" ": "spc", "\n": "ret", ".": "dot", ",": "comma", "-": "minus", "/": "slash",
-        "\t": "tab", "=": "equal", "+": "shift-equal", "*": "shift-8", "%": "shift-5", "@": "shift-2"}
+        "\t": "tab", "=": "equal", "+": "shift-equal", "*": "shift-8", "%": "shift-5", "@": "shift-2",
+        "\\": "backslash", ":": "shift-semicolon", ">": "shift-dot", "~": "shift-grave_accent"}
 
 
 def near(rgb, want, tol=4):
@@ -93,15 +94,23 @@ class Checker:
 
 
 class Machine:
-    def __init__(self, variant="normal", mode="autorun", vmport=False, hostfwd=()):
+    def __init__(self, variant="normal", mode="autorun", vmport=False, hostfwd=(), data_disk=None, files=None):
         self.variant, self.mode, self.vmport = variant, mode, vmport
         self.hostfwd = hostfwd                      # e.g. ("tcp:127.0.0.1:5555-:7",)
+        self.data_disk = data_disk                  # an image for the secondary IDE master
+        self.files = files or {}                    # {name: text} for C:\OS1993 (DOS line endings)
 
     def __enter__(self):
         os.makedirs(QDIR, exist_ok=True)
         os.chdir(QDIR)                              # short monitor socket path
         subprocess.run([os.path.join(ROOT, "tools", "mkfreedos.sh"), self.variant, self.mode],
                        check=True, stdout=subprocess.DEVNULL)
+        for name, text in self.files.items():
+            path = os.path.join(QDIR, name)
+            with open(path, "w", newline="\r\n") as f:
+                f.write(text)
+            subprocess.run(["mcopy", "-o", "-i", IMG + "@@32256", path, "::/OS1993/" + name], check=True,
+                           env=dict(os.environ, MTOOLS_SKIP_CHECK="1"))
         for f in ("monitor.sock", "qmp.sock", "SERIAL.LOG"):
             if os.path.exists(f):
                 os.unlink(f)
@@ -111,7 +120,8 @@ class Machine:
             # PS/2 path that mouse_move can drive.
             "qemu-system-i386", "-M", "isapc,vmport=on" if self.vmport else "isapc,vmport=off",
             "-cpu", "486", "-m", "16", "-vga", "std", "-L", rom, "-L", "/usr/share/qemu",
-            "-drive", f"file={IMG},format=raw,if=ide", "-serial", "file:SERIAL.LOG",
+            "-drive", f"file={IMG},format=raw,if=ide,index=0", "-serial", "file:SERIAL.LOG",
+            *(["-drive", f"file={self.data_disk},format=raw,if=ide,index=2"] if self.data_disk else []),
             # an NE2000 on QEMU's user-mode network: DHCP, gateway 10.0.2.2 (the host)
             "-nic", "user,model=ne2k_isa,mac=52:54:00:12:34:56" + "".join(",hostfwd=" + f for f in self.hostfwd),
             "-device", "isa-debug-exit,iobase=0xf4,iosize=4",

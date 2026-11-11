@@ -23,6 +23,7 @@
 #   make qemu-crt      the C runtime (CRT.DLL, libcrt.a) and its protections
 #   make qemu-threads  threads, synchronization, virtual memory, heaps, processes, file calls
 #   make qemu-net      the NE2000, TCP/IP, WSOCK.DLL, PING and IPCONFIG
+#   make qemu-fat      the VMM's own disks: IDE, FAT32/FAT16, long names, the DOS redirector
 #   make clean
 
 CC      := i686-elf-gcc
@@ -93,7 +94,7 @@ SHELL_OBJ := $(U)/hdr/SHELL.DLL.o $(U)/shell/shell.o $(U)/shell/icons.o $(U)/she
 
 # Programs: user/apps/<name>.c, each a process of its own, sharing CRT.DLL.
 # CRTSTAT.BIN is CRTTEST.BIN with the C runtime linked in (libcrt.a).
-APPS      := SHELL DEMO CALC PAINT CLOCK NOTEPAD HANG CRTTEST THRTEST PING IPCONFIG NETTEST
+APPS      := SHELL DEMO CALC PAINT CLOCK NOTEPAD HANG CRTTEST THRTEST PING IPCONFIG NETTEST FSTEST
 APP_LIBS  := $(U)/lib/crt0.o $(U)/gen/krnl_imports.o $(U)/gen/ui_imports.o \
              $(U)/gen/shell_imports.o $(U)/gen/crt_imports.o $(U)/gen/wsock_imports.o $(SSP)
 app_obj    = $(U)/hdr/$(1).BIN.o $(U)/apps/$(shell echo $(1) | tr A-Z a-z).o $(APP_LIBS)
@@ -106,12 +107,12 @@ MODULES   := $(BUILD)/KERNEL.DLL $(BUILD)/GFX.DLL $(BUILD)/UI.DLL $(BUILD)/SHELL
              $(patsubst %,$(BUILD)/%.BIN,$(APPS)) $(BUILD)/CRTSTAT.BIN
 MODULE_ELFS := $(patsubst $(BUILD)/%,$(U)/%.elf,$(MODULES))
 
-KERNEL_C   := $(wildcard kernel/*.c kernel/net/*.c)
+KERNEL_C   := $(wildcard kernel/*.c kernel/net/*.c kernel/disk/*.c kernel/fs/*.c)
 KERNEL_ASM := $(wildcard kernel/*.asm)
 KERNEL_OBJ := $(patsubst kernel/%.asm,$(BUILD)/kernel/%.o,$(KERNEL_ASM)) \
               $(patsubst kernel/%.c,$(BUILD)/kernel/%.o,$(KERNEL_C))
 
-.PHONY: all run test check486 qemu qemu-test qemu-emm386 qemu-sessions qemu-vga qemu-wm qemu-absmouse qemu-menu qemu-controls qemu-msgbox qemu-shell qemu-files qemu-notepad qemu-tasklist qemu-vesa qemu-crt qemu-threads qemu-net clean
+.PHONY: all run test check486 qemu qemu-test qemu-emm386 qemu-sessions qemu-vga qemu-wm qemu-absmouse qemu-menu qemu-controls qemu-msgbox qemu-shell qemu-files qemu-notepad qemu-tasklist qemu-vesa qemu-crt qemu-threads qemu-net qemu-fat clean
 
 all: $(BUILD)/OS1993.COM $(BUILD)/VMM.BIN $(MODULES)
 
@@ -258,10 +259,15 @@ $(QEMU_ROM):
 	@for d in /usr/share/qemu /usr/share/qemu-firmware /usr/share/seabios; do \
 	    if [ -e $$d/vgabios-isavga.bin ]; then ln -sf $$d/vgabios-isavga.bin $@; break; fi; done
 
-qemu: all $(QEMU_ROM)
+# make qemu also attaches build/data.img (made once, then kept: it is yours)
+# on the secondary IDE channel: the VMM's own disk, D: and E: in DOS.
+$(BUILD)/data.img:
+	tools/mkdata.sh $@
+
+qemu: all $(QEMU_ROM) $(BUILD)/data.img
 	@mkdir -p $(BUILD)/qemu
 	tools/mkfreedos.sh normal
-	$(QEMU) $(QEMU_ARGS)
+	$(QEMU) $(QEMU_ARGS) -drive file=$(BUILD)/data.img,format=raw,if=ide,index=2
 
 qemu-test: all $(QEMU_ROM)
 	@mkdir -p $(BUILD)/qemu && rm -f $(BUILD)/qemu/*.LOG
@@ -324,6 +330,9 @@ qemu-threads: all $(QEMU_ROM)
 
 qemu-net: all $(QEMU_ROM)
 	@tools/qemu-net-test.py
+
+qemu-fat: all $(QEMU_ROM)
+	@tools/qemu-fat-test.py
 
 check486: $(BUILD)/vmm.elf $(MODULE_ELFS)
 	@for f in $^; do tools/check486.sh $(OBJDUMP) $$f || exit 1; done

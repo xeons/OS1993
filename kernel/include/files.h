@@ -1,5 +1,6 @@
 /*
- * files.h -- file access for ring-3 processes (files.c), through DOS.
+ * files.h -- file access for ring-3 processes (files.c): DOS's drives
+ * through DOS, the VMM's own (fs.h) directly.
  */
 #ifndef OS1993_FILES_H
 #define OS1993_FILES_H
@@ -9,11 +10,18 @@
 
 #define FILE_MAX    8                   /* open files per process */
 #define FIND_MAX    4                   /* searches in progress per process */
-#define PATH_MAX    128
+#define PATH_MAX    260
+#define DOS_PATH_MAX 128                /* what DOS takes */
+
+struct fnode;
+struct fs_find;
 
 struct proc_files {
     int16_t dos[FILE_MAX];              /* DOS handles, -1 free */
-    struct { bool used; uint8_t dta[43]; } find[FIND_MAX];
+    struct fnode *nf[FILE_MAX];         /* ... or a file on the VMM's own disks */
+    uint32_t pos[FILE_MAX];             /* ... and its file pointer */
+    bool    wr[FILE_MAX];               /* ... opened for writing */
+    struct { bool used; uint8_t dta[43]; struct fs_find *nat; } find[FIND_MAX];
     char    cwd[PATH_MAX];              /* "C:\OS1993" */
 };
 

@@ -317,7 +317,8 @@ struct find_data {                      /* a directory entry (FIND_FIRST/NEXT) *
     uint32_t attrib;                    /* FILE_ATTRIBUTE_* (DOS attributes) */
     uint32_t size;
     uint16_t time, date;                /* DOS format */
-    char     name[13];                  /* 8.3 */
+    char     name[260];                 /* the long name (on DOS's drives, the 8.3 one) */
+    char     short_name[14];            /* the 8.3 alias, "" if the name is one */
 };
 
 #define GENERIC_READ        0x80000000u
@@ -344,6 +345,17 @@ struct find_data {                      /* a directory entry (FIND_FIRST/NEXT) *
 #define ERROR_FILE_EXISTS        80
 #define ERROR_INVALID_PARAMETER  87
 #define ERROR_INVALID_NAME       123
+#define ERROR_CURRENT_DIRECTORY   16
+#define ERROR_NOT_SAME_DEVICE     17
+#define ERROR_WRITE_PROTECT       19
+#define ERROR_GEN_FAILURE         31
+#define ERROR_SHARING_VIOLATION   32
+#define ERROR_HANDLE_DISK_FULL    39
+#define ERROR_CANNOT_MAKE         82
+#define ERROR_DISK_FULL           112
+#define ERROR_DIR_NOT_EMPTY       145
+#define ERROR_FILENAME_EXCED_RANGE 206
+#define MAX_PATH                 260
 #define ERROR_NOACCESS           998     /* a bad user pointer */
 #define ERROR_NOT_ENOUGH_MEMORY  8
 #define ERROR_INVALID_ADDRESS    487

@@ -41,6 +41,13 @@ static inline uint32_t irq_save(void)
     return flags;
 }
 
+static inline uint32_t read_eflags(void)
+{
+    uint32_t f;
+    __asm__ volatile("pushfl\n\tpopl %0" : "=r"(f));
+    return f;
+}
+
 static inline void irq_restore(uint32_t flags)
 {
     if (flags & 0x200)                   /* EFLAGS.IF */

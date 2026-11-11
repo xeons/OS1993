@@ -48,3 +48,29 @@ size_t strlen(const char *s)
     while (s[n]) n++;
     return n;
 }
+
+int strcmp(const char *a, const char *b)
+{
+    while (*a && *a == *b)
+        a++, b++;
+    return (unsigned char)*a - (unsigned char)*b;
+}
+
+int strncmp(const char *a, const char *b, size_t n)
+{
+    for (; n; n--, a++, b++)
+        if (*a != *b || !*a)
+            return (unsigned char)*a - (unsigned char)*b;
+    return 0;
+}
+
+char *strrchr(const char *s, int c)
+{
+    const char *r = NULL;
+    for (;; s++) {
+        if (*s == (char)c)
+            r = s;
+        if (!*s)
+            return (char *)r;
+    }
+}

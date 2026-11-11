@@ -2,6 +2,7 @@
  * vm.c -- creating, switching and destroying virtual machines.
  */
 #include "kernel.h"
+#include "fs.h"
 #include "console.h"
 #include "devices.h"
 #include "gdt.h"
@@ -227,6 +228,7 @@ static void vm_thread_main(void *arg)
 
 static void vm_free_resources(struct vm *vm)
 {
+    redir_vm_end(vm);
     free_frames(vm->priv, priv_count);
     free_frames(vm->video, VM_VIDEO_PAGES);
     if (vm->pt0_phys) pmm_free(vm->pt0_phys);

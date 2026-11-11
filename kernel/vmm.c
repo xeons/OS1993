@@ -17,6 +17,8 @@
 #include "display.h"
 #include "random.h"
 #include "net.h"
+#include "fs.h"
+#include "disk.h"
 #include "vm.h"
 
 const struct bootinfo *g_bootinfo;
@@ -70,8 +72,10 @@ void kernel_shutdown(uint8_t exit_code)
     cpu_cli();
     pic_mask_all();
     ne2000_stop();
+    fs_shutdown();                      /* everything on the disks */
     mouse_shutdown();                   /* or DOS's keyboard would jam */
     vm_restore_dos();                   /* the original DOS memory and screen */
+    redir_restore();                    /* DOS's own drive letters back */
     klog("VMM: returning to DOS (exit code %u)\n", exit_code);
     serial_flush();
     exit_to_dos(g_bootinfo, exit_code);
@@ -155,9 +159,18 @@ void kmain(const struct bootinfo *bi)
     sched_init(system_vm);
     ok("V86 monitor, System VM and scheduler");
     dosmgr_init();
+    fs_init();                                      /* DOS's drive letters: before the snapshot */
     vm_finish_init();
     dosmgr_started();
     ok("DOS shared between VMs (DOSMGR)");
+    {
+        char line[64];
+        int nd = 0;
+        for (int i = 0; i < DISK_MAX; i++)
+            nd += disks[i].owned;
+        ksnprintf(line, sizeof line, "Disks (IDE: %d of the VMM's, %d volume(s))", nd, fs_volume_count());
+        ok(line);
+    }
     vga_init();
     random_init();
     vbe_init();

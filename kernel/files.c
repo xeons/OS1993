@@ -8,9 +8,15 @@
  * are closed when it ends however it ends, its own searches (each keeps a
  * copy of DOS's disk transfer area), and its own current directory, which
  * relative paths start from.
+ *
+ * A drive letter of the VMM's own (fs.h) skips DOS: the call goes to the
+ * file system directly, long names and all, with the file pointer kept
+ * here. Paths keep their case there; on DOS's drives they are upper case.
  */
 #include "kernel.h"
 #include "files.h"
+#include "fs.h"
+#include "mm.h"
 #include "user.h"
 #include "v86.h"
 
@@ -37,10 +43,14 @@ static int dos(struct v86_regs *r)
 
 void files_init(struct proc_files *pf, const char *cwd)
 {
-    for (int i = 0; i < FILE_MAX; i++)
+    for (int i = 0; i < FILE_MAX; i++) {
         pf->dos[i] = -1;
-    for (int i = 0; i < FIND_MAX; i++)
+        pf->nf[i] = NULL;
+    }
+    for (int i = 0; i < FIND_MAX; i++) {
         pf->find[i].used = false;
+        pf->find[i].nat = NULL;
+    }
     copy_str(pf->cwd, cwd, sizeof pf->cwd);
     static bool more_handles;
     if (!more_handles) {                /* every process's files share one PSP */
@@ -52,6 +62,16 @@ void files_init(struct proc_files *pf, const char *cwd)
 
 void files_close_all(struct proc_files *pf)
 {
+    for (int i = 0; i < FILE_MAX; i++)
+        if (pf->nf[i]) {
+            fs_close(pf->nf[i]);
+            pf->nf[i] = NULL;
+        }
+    for (int i = 0; i < FIND_MAX; i++) {
+        kfree(pf->find[i].nat);
+        pf->find[i].nat = NULL;
+        pf->find[i].used = false;
+    }
     for (int i = 0; i < FILE_MAX; i++)
         if (pf->dos[i] >= 0) {
             struct v86_regs r = { .eax = 0x3E00, .ebx = (uint32_t)pf->dos[i] };
@@ -85,14 +105,16 @@ static bool normalize(char *p)
             if (n > 3) out[n++] = '\\';
             if (n + len >= PATH_MAX)
                 return false;
-            for (int i = 0; i < len; i++) {
-                char c = s[i];
-                out[n++] = (c >= 'a' && c <= 'z') ? (char)(c - 32) : c;
-            }
+            for (int i = 0; i < len; i++)
+                out[n++] = s[i];
         }
         s = *e ? e + 1 : e;
     }
     out[n] = '\0';
+    if (!fs_volume(out[0]))                             /* DOS's: upper case, short */
+        for (char *c = out; *c; c++)
+            if (*c >= 'a' && *c <= 'z')
+                *c = (char)(*c - 32);
     copy_str(p, out, PATH_MAX);
     return true;
 }
@@ -138,8 +160,21 @@ static int user_path(const struct proc_files *pf, const char *up, uint32_t off, 
         return -ERROR_NOACCESS;
     if (!resolve(pf, in, out))
         return -ERROR_INVALID_NAME;
-    memcpy(xbuf() + off, out, strlen(out) + 1);
+    if (!fs_volume(out[0])) {
+        if (strlen(out) >= DOS_PATH_MAX)
+            return -ERROR_FILENAME_EXCED_RANGE;
+        memcpy(xbuf() + off, out, strlen(out) + 1);
+    }
     return 0;
+}
+
+/* The VMM's volume for a resolved path, and the path on it. */
+static struct vol *native(const char *path, const char **rest)
+{
+    struct vol *v = fs_volume(path[0]);
+    if (v)
+        *rest = path + 3;
+    return v;
 }
 
 static int attributes(uint32_t off)             /* of the path at off */
@@ -154,7 +189,7 @@ static int attributes(uint32_t off)             /* of the path at off */
 static int slot_of(const struct proc_files *pf, uint32_t h)
 {
     int i = (int)h - HANDLE_BASE;
-    return i >= 0 && i < FILE_MAX && pf->dos[i] >= 0 ? i : -1;
+    return i >= 0 && i < FILE_MAX && (pf->dos[i] >= 0 || pf->nf[i]) ? i : -1;
 }
 
 static int find_of(const struct proc_files *pf, uint32_t h)
@@ -177,7 +212,7 @@ static int open_file(struct proc_files *pf, struct file_args *a)
 {
     int slot = -1;
     for (int i = 0; i < FILE_MAX && slot < 0; i++)
-        if (pf->dos[i] < 0)
+        if (pf->dos[i] < 0 && !pf->nf[i])
             slot = i;
     if (slot < 0)
         return -ERROR_TOO_MANY_OPEN_FILES;
@@ -185,6 +220,18 @@ static int open_file(struct proc_files *pf, struct file_args *a)
     int rc = user_path(pf, a->path, 0, path);
     if (rc < 0)
         return rc;
+    const char *rest;
+    struct vol *v = native(path, &rest);
+    if (v) {
+        bool wr = a->a & GENERIC_WRITE;
+        if ((rc = fs_open(v, rest, a->b, wr, 0, &pf->nf[slot], NULL)) < 0) {
+            pf->nf[slot] = NULL;
+            return rc;
+        }
+        pf->pos[slot] = 0;
+        pf->wr[slot] = wr;
+        return HANDLE_BASE + slot;
+    }
     int attr = attributes(0);
     bool exists = attr >= 0;
     if (exists && (attr & FILE_ATTRIBUTE_DIRECTORY))
@@ -216,6 +263,17 @@ static int transfer(struct proc_files *pf, struct file_args *a, bool write)
     uint32_t ubuf = (uint32_t)(uintptr_t)a->buf;
     if (a->len && !(write ? user_range_ok(ubuf, a->len) : user_writable(ubuf, a->len)))
         return -ERROR_NOACCESS;
+    if (pf->nf[s]) {
+        if (write && !pf->wr[s])
+            return -ERROR_ACCESS_DENIED;
+        if (!a->len)
+            return 0;
+        int rc = write ? fs_write(pf->nf[s], pf->pos[s], (const void *)(uintptr_t)ubuf, a->len)
+                       : fs_read(pf->nf[s], pf->pos[s], (void *)(uintptr_t)ubuf, a->len);
+        if (rc > 0)
+            pf->pos[s] += (uint32_t)rc;
+        return rc;
+    }
     uint32_t chunk = v86_buf_size(), done = 0;
     while (done < a->len) {
         uint32_t n = a->len - done < chunk ? a->len - done : chunk;
@@ -243,7 +301,8 @@ static void put_find(const uint8_t *dta, struct find_data *fd)
     fd->date = (uint16_t)(dta[24] | dta[25] << 8);
     fd->size = (uint32_t)dta[26] | (uint32_t)dta[27] << 8 | (uint32_t)dta[28] << 16 |
                (uint32_t)dta[29] << 24;
-    copy_str(fd->name, (const char *)dta + 30, sizeof fd->name);
+    copy_str(fd->name, (const char *)dta + 30, 13);
+    fd->short_name[0] = '\0';
 }
 
 /* FindFirst (pattern at PATH2_OFF) or FindNext, with DOS's DTA in the
@@ -273,12 +332,208 @@ static int find(struct proc_files *pf, int slot, bool first, struct file_args *a
     return 0;
 }
 
+/* ---- the VMM's own drives ----------------------------------------------- */
+
+static int put_entry(const struct fs_entry *e, struct file_args *a)
+{
+    if (!user_writable((uint32_t)(uintptr_t)a->buf, sizeof(struct find_data)))
+        return -ERROR_NOACCESS;
+    struct find_data fd;
+    memset(&fd, 0, sizeof fd);
+    fd.attrib = e->attr;
+    fd.size = e->size;
+    fd.time = e->time;
+    fd.date = e->date;
+    copy_str(fd.name, e->name, sizeof fd.name);
+    if (e->lfn)
+        copy_str(fd.short_name, e->short_name, sizeof fd.short_name);
+    memcpy(a->buf, &fd, sizeof fd);
+    return 0;
+}
+
+/* *handled: the call was for one of the VMM's drives. */
+static int native_op(struct proc_files *pf, uint32_t op, struct file_args *a, bool *handled)
+{
+    char path[PATH_MAX], path2[PATH_MAX];
+    const char *rest, *rest2;
+    struct vol *v = NULL;
+    int rc, s;
+    *handled = true;
+    switch (op) {
+    case FOP_CLOSE: case FOP_SEEK: case FOP_SIZE: case FOP_TRUNCATE: case FOP_FLUSH:
+    case FOP_GETTIME: case FOP_SETTIME: {
+        if ((s = slot_of(pf, a->handle)) < 0 || !pf->nf[s]) {
+            *handled = false;
+            return 0;
+        }
+        struct fnode *n = pf->nf[s];
+        switch (op) {
+        case FOP_CLOSE:
+            fs_close(n);
+            pf->nf[s] = NULL;
+            return 0;
+        case FOP_SEEK: {
+            int64_t base = a->b == FILE_BEGIN ? 0 : a->b == FILE_CURRENT ? (int64_t)pf->pos[s]
+                         : a->b == FILE_END ? (int64_t)fs_size(n) : -1;
+            if (base < 0)
+                return -ERROR_INVALID_PARAMETER;
+            int64_t to = base + (int32_t)a->a;
+            if (to < 0 || to > 0x7FFFFFFF)
+                return -ERROR_INVALID_PARAMETER;
+            pf->pos[s] = (uint32_t)to;
+            return (int)to;
+        }
+        case FOP_SIZE:
+            return (int)fs_size(n);
+        case FOP_TRUNCATE:
+            return pf->wr[s] ? fs_set_size(n, pf->pos[s]) : -ERROR_ACCESS_DENIED;
+        case FOP_FLUSH:
+            return fs_flush(n);
+        case FOP_GETTIME: {
+            uint16_t d, t;
+            fs_get_time(n, &d, &t);
+            uint32_t when = (uint32_t)t << 16 | d;
+            if (!user_writable((uint32_t)(uintptr_t)a->buf, 4))
+                return -ERROR_NOACCESS;
+            memcpy(a->buf, &when, 4);
+            return 0;
+        }
+        default:
+            return fs_set_time(n, (uint16_t)a->a, (uint16_t)(a->a >> 16));
+        }
+    }
+    case FOP_FIND_NEXT:
+    case FOP_FIND_CLOSE:
+        if ((s = find_of(pf, a->handle)) < 0 || !pf->find[s].nat) {
+            *handled = false;
+            return 0;
+        }
+        if (op == FOP_FIND_CLOSE) {
+            kfree(pf->find[s].nat);
+            pf->find[s].nat = NULL;
+            pf->find[s].used = false;
+            return 0;
+        } else {
+            struct fs_entry e;
+            if ((rc = fs_find_next(pf->find[s].nat, &e)) < 0)
+                return rc;
+            return put_entry(&e, a);
+        }
+    case FOP_DISKFREE:
+        if (a->path) {
+            if ((rc = user_path(pf, a->path, 0, path)) < 0)
+                return rc;
+        } else {
+            copy_str(path, pf->cwd, sizeof path);
+        }
+        if (!(v = native(path, &rest))) {
+            *handled = false;
+            return 0;
+        } else {
+            struct disk_free df;
+            if ((rc = fs_space(v, &df.sectors_per_cluster, &df.bytes_per_sector, &df.free_clusters,
+                               &df.total_clusters)) < 0)
+                return rc;
+            if (!user_writable((uint32_t)(uintptr_t)a->buf, sizeof df))
+                return -ERROR_NOACCESS;
+            memcpy(a->buf, &df, sizeof df);
+            return 0;
+        }
+    case FOP_DELETE: case FOP_MKDIR: case FOP_RMDIR: case FOP_RENAME: case FOP_ATTRIB:
+    case FOP_SETCWD: case FOP_FIND_FIRST: case FOP_SETATTR:
+        if (!a->path || !user_string((uint32_t)(uintptr_t)a->path, path, sizeof path) ||
+            !resolve(pf, path, path)) {
+            *handled = false;                           /* DOS's path reports it */
+            return 0;
+        }
+        if (!(v = native(path, &rest))) {
+            if (op != FOP_RENAME) {
+                *handled = false;
+                return 0;
+            }
+        }
+        break;
+    default:
+        *handled = false;
+        return 0;
+    }
+
+    struct fs_entry e;
+    switch (op) {
+    case FOP_DELETE:
+        return fs_delete(v, rest);
+    case FOP_MKDIR:
+        return fs_mkdir(v, rest);
+    case FOP_RMDIR:
+        if (strncmp(pf->cwd, path, strlen(path)) == 0 &&
+            (pf->cwd[strlen(path)] == '\\' || !pf->cwd[strlen(path)]))
+            return -ERROR_CURRENT_DIRECTORY;
+        return fs_rmdir(v, rest);
+    case FOP_RENAME:
+        if (!a->path2 || !user_string((uint32_t)(uintptr_t)a->path2, path2, sizeof path2) ||
+            !resolve(pf, path2, path2))
+            return -ERROR_INVALID_NAME;
+        if (!v) {
+            if (!fs_volume(path2[0])) {
+                *handled = false;                       /* DOS to DOS */
+                return 0;
+            }
+            return -ERROR_NOT_SAME_DEVICE;
+        }
+        if (native(path2, &rest2) != v)
+            return -ERROR_NOT_SAME_DEVICE;
+        return fs_rename(v, rest, rest2);
+    case FOP_ATTRIB:
+        if ((rc = fs_stat(v, rest, &e)) < 0)
+            return rc;
+        return e.attr;
+    case FOP_SETATTR:
+        return fs_set_attr(v, rest, (uint8_t)a->a);
+    case FOP_SETCWD:
+        if ((rc = fs_stat(v, rest, &e)) < 0)
+            return rc == -ERROR_FILE_NOT_FOUND ? -ERROR_PATH_NOT_FOUND : rc;
+        if (!(e.attr & FILE_ATTRIBUTE_DIRECTORY))
+            return -ERROR_PATH_NOT_FOUND;
+        copy_str(pf->cwd, path, sizeof pf->cwd);
+        return 0;
+    case FOP_FIND_FIRST: {
+        for (s = 0; s < FIND_MAX && pf->find[s].used; s++)
+            ;
+        if (s == FIND_MAX)
+            return -ERROR_TOO_MANY_OPEN_FILES;
+        struct fs_find *f = kmalloc(sizeof *f);
+        if (!f)
+            return -ERROR_NOT_ENOUGH_MEMORY;
+        char dir[PATH_MAX];
+        const char *slash = strrchr(rest, '\\');
+        const char *pattern = slash ? slash + 1 : rest;
+        size_t dl = slash ? (size_t)(slash - rest) : 0;
+        memcpy(dir, rest, dl);
+        dir[dl] = '\0';
+        if ((rc = fs_find_first(v, dir, *pattern ? pattern : "*", f, &e)) < 0 ||
+            (rc = put_entry(&e, a)) < 0) {
+            kfree(f);
+            return rc;
+        }
+        pf->find[s].used = true;
+        pf->find[s].nat = f;
+        return FIND_BASE + s;
+    }
+    }
+    *handled = false;
+    return 0;
+}
+
 /* ---- the operations ----------------------------------------------------- */
 
 int file_op(struct proc_files *pf, uint32_t op, struct file_args *a)
 {
     char path[PATH_MAX], path2[PATH_MAX];
     int rc, s;
+    bool handled;
+    rc = native_op(pf, op, a, &handled);
+    if (handled)
+        return rc;
     struct v86_regs r = { .edx = v86_buf_off(), .ds = v86_buf_seg() };
     switch (op) {
     case FOP_OPEN:
