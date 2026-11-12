@@ -12,8 +12,9 @@ C:\> OS1993
 ## Building and running
 
 Requirements: `nasm`, `i686-elf-gcc` / `i686-elf-binutils`, `dosbox-x`,
-`qemu-system-i386`, `mtools`, `curl`. Bochs and Open Watcom (`/opt/watcom`)
-are for later stages.
+`qemu-system-i386`, `mtools`, `curl`. Open Watcom (`/opt/watcom`) builds
+the DOS/4GW test program for `make qemu-dpmi` and provides DOS4GW.EXE and
+DOS32A.EXE; Bochs is for later.
 
 | Command          | What it does                                                  |
 |------------------|---------------------------------------------------------------|
@@ -23,13 +24,16 @@ are for later stages.
 | `make check486`  | fails if any binary contains a post-486 or FPU instruction    |
 | `make qemu`      | boots real FreeDOS 1.3 in QEMU (486, 16 MB, ISA PC with the ISA VGA and its VBE registers); `OS1993` is in `C:\OS1993`. `build/data.img` (made once by `tools/mkdata.sh`, then kept) is on the secondary IDE channel: D: (FAT32), E: (FAT16), F: (exFAT), G: (ext2), H: (ext2, 8 KB blocks), I: (ext3) |
 | `make qemu-test` | headless FreeDOS run of the same checks as `make test`        |
-| `make qemu-emm386` | FreeDOS with JEMM386: the loader must refuse to start       |
+| `make qemu-emm386` | FreeDOS with JEMM386 loaded: the loader starts OS1993 through VCPI, the self-tests run (two DOS sessions included) with the memory manager's HLT-stub vectors moved to the BIOS meanwhile, and OS1993 goes back to V86 mode under JEMM386 |
 | `make qemu-sessions` | types into two concurrent DOS sessions via QEMU's monitor |
 | `make qemu-absmouse` | absolute pointer through QEMU's VMware port: the cursor lands on the exact pixel, and clicks hit their control |
 | `make qemu-crt` | the C runtime: CRTTEST.BIN (CRT.DLL) and CRTSTAT.BIN (libcrt.a) pass its checks; a stack overrun, a heap overrun, a double free, a fortified memcpy, a broken Annex K constraint, `%n` and a failed assert each end the program with the reason logged; every process has its own canary |
+| `make qemu-kdbg` | the kernel debugger on COM1 (`OS1993 /D`), driven through a socket: Ctrl+C breaks in, R, .T, .VM, .M, DB, .PT, an execution breakpoint hit by pressing N, K, a single step, a write watch hit in V86 mode by a key in a DOS session; then a kernel thread overflows its stack, the double fault arrives in its own task and both the debugger and the blue screen name the thread |
+| `make qemu-dosvm` | DOS sessions' virtual devices through DOSVM.COM (`test/dos/dosvm.asm`): a VM that sets the timer to 1 kHz gets 1000 IRQ 0s a second (the real timer follows, then slows down again), a VM polling the keyboard is idled, COM2 and LPT1 go to the first VM that touches them (COM2's interrupt reaches it) and a second VM is refused, COM1 stays the VMM's, the INT 33h mouse (an event handler sees a click at the right place), XMS (allocate, move, lock, an INT 15h AH=87h move into the locked block) and INT 15h; then OS1993.INI's `[DOS]` settings for a new session: Memory=400, no XMS, no mouse, LPT1 only |
+| `make qemu-dpmi` | the DPMI host: DOSVM D's own checks (the mode switch, descriptors, 256 KB through a 32-bit offset, 0300h, vectors, the end through INT 21h), then DPMITEST.EXE (`test/dos/dpmitest.c`, built with Open Watcom) under DOS/4GW and again under DOS32A: malloc of 2 MB, files, the text screen, all in a DOS session that carries on |
 | `make qemu-fat` | the VMM's own disks, run twice: with the data disk on the secondary channel and beside the boot disk (whose INT 13h the VMM then does); FAT32, FAT16, exFAT, two ext2 logical drives and an ext3 one left needing recovery, plus a 5 GB exFAT disk; FreeDOS had mounted the FAT ones as D: and E:, exFAT is F:, ext2 G: and H:, ext3 I:, the big disk J:; a DOS session works on them through the redirector (DIR, TYPE, COPY, MD, REN, DEL, a batch file read from E:), FSTEST.BIN's 184 checks through KERNEL.DLL (long names and aliases, numbered aliases, a 300 KB file in pieces, writing, gaps, truncating, folders, moves, read-only, locks, directories that grow, an exFAT file that can't stay contiguous, ext2's indirect blocks and 8 KB blocks, links, an ext3 journal replayed and ext3 written through its journal (internal, and an external one with data=journal and CRC32 checksums), ext4 read with its checksums and written (extent trees grown, split and truncated, unwritten extents written, a hashed directory changed, bitmaps written for the first time), a long name on C:, case and dot files, a 4.5 GB exFAT file on a 4 KB-sector disk, a 5 GB sparse ext2 file, the time zone), LFNTEST.COM's long-name calls, share modes and locks from DOS, DOS sees D: and E: as its own drives again after OS1993 ends, and mtools, `tools/exfat.py`, debugfs, fsck.fat, fsck.exfat and e2fsck check the image; then a crash: QEMU killed right after writes to ext3 and ext4, e2fsck and the next boot both replay the journals; then btrfs (zstd with a subvolume, LZO, zlib with a damaged sector) on a disk of its own |
 | `make qemu-net` | the network: the NE2000 and a DHCP lease, NETTEST.BIN's 26 checks (loopback UDP and TCP with a server thread, refused connections, ICMP port unreachable, timeouts, non-blocking sockets and select, 64 KB echoed by a server on the host), PING to the host, the loopback and nobody, IPCONFIG, and the host connecting in to a server in the guest |
-| `make qemu-threads` | threads: 67 checks (joins and exit codes, critical sections, events, semaphores, mutexes, timeouts, TLS and errno per thread, suspend/terminate, the 16-thread limit, malloc and printf from several threads, virtual memory, private heaps, a child process, the file calls); a stack overflow hits the guard page, a read-only page faults, the last thread's code ends the process, `exit` from a second thread ends them all |
+| `make qemu-threads` | threads: 67 checks (joins and exit codes, critical sections, events, semaphores, mutexes, timeouts, TLS and errno per thread, suspend/terminate, the 16-thread limit, malloc and printf from several threads, virtual memory, private heaps, a child process, the file calls); a stack overflow hits the guard page, a read-only page faults, the last thread's code ends the process, `exit` from a second thread ends them all; then 16 MB committed on the 16 MB machine, written and read back twice through a 12 MB swap file |
 | `make qemu-vesa` | the VBE display driver: Display Properties switches to 1024×768 high colour, 800×600 in 256 colours and true colour, No and the 15-second timeout go back, a DOS session and back keeps the mode, OS1993.INI restores it next session, and 640×480×16 is VGA again |
 | `make qemu-tasklist` | Ctrl+Alt+Del: Close Program ends a program, works from a DOS session, and the VMM's screen ends a program that froze the GUI |
 | `make qemu-notepad` | Notepad: typing, Save As with CR LF, the clipboard between two processes, Open, select/delete/undo, unsaved-changes questions, Find/Find Next/whole words, Replace All and its undo, Word Wrap, the file's bytes on disk |
@@ -38,6 +42,7 @@ are for later stages.
 | `make qemu-msgbox` | keyboard accelerators per window, message boxes: modality, default button, Tab, Yes/No letters, Esc, Alt+F4 |
 | `make qemu-menu` | menu bar, system menu and right-click menus by mouse and keyboard (mnemonics, F10, Alt+Space, keyboard Move) |
 | `make qemu-explorer` | Explorer, the tree view and the list view: the address field, the four views, a folder made and named in place, opened, filled, deleted with its contents; the tree by keyboard, letters jumping to names, Enter opening a file in Notepad, sorting by menu and by a header click, double-clicking a folder |
+| `make qemu-gui` | the newer GUI parts: Calculator's scientific view, Notepad's Print through a dialog template to a .PRN file, Paint's Attributes dialog, picture clipboard, zoom and undo, Explorer's toolbar tooltip, files clipboard, Back and Forward, a taskbar button's system menu; the printed file and the folder checked on the disk |
 | `make qemu-controls` | combo boxes (drop-down list with a scroll bar, editable, a list that opens upwards), the tab control and up-downs (buddy edit, auto-repeat, wrap) by mouse and keyboard |
 | `make qemu-wm`   | drives the window manager through QEMU's mouse and keyboard: every control, activate/move/resize/minimize/maximize/close, palette after a DOS session |
 | `make qemu-vga`  | the VDD: the GUI's desktop must come back pixel-identical after a text DOS session (except its animated progress bar) |
@@ -55,12 +60,15 @@ There are two test machines because they catch different bugs:
   as a 486.
 
 Kernel debug output goes to COM1; under DOSBox-X it lands in
-`build/SERIAL.LOG`.
+`build/SERIAL.LOG`. `OS1993 /D` also puts the kernel debugger there (see
+*The kernel debugger*).
 
 ## How it boots
 
 1. **`OS1993.COM`** (real mode, `loader/os1993.asm`) checks for a 486 (one
-   that can set EFLAGS.AC; a 386 is refused with a message) that is in real mode, not V86 mode under EMM386/QEMM. It then allocates the largest
+   that can set EFLAGS.AC; a 386 is refused with a message). If the CPU is
+   in V86 mode under a memory manager (EMM386, JEMM386, QEMM), the manager
+   must offer VCPI (see *Running under EMM386*). It then allocates the largest
    free extended memory block from HIMEM.SYS (XMS), locks it, and enables A20.
 2. It reads **`VMM.BIN`** from its own directory and copies it into the XMS
    block with XMS moves.
@@ -87,8 +95,10 @@ Arena layout: `[kernel image + bss][page directory][PT 0–4MB][arena PTs][free 
 | `00000000–003FFFFF`       | identity: DOS, BIOS, video RAM (the future V86 machine) |
 | `80000000–83FFFFFF`       | XMS arena, direct mapped: kernel, then PMM frames       |
 | `C0000000–CFFFFFFF`       | kernel heap (`kmalloc`), grown on demand                |
-| `D0000000–D010FFFF`       | kernel window on physical 0–1 MB + HMA (`KLOW`)         |
-| `D0000000–FFBFFFFF`       | free for future kernel mappings                         |
+| `D0000000–D010FFFF`       | kernel window on the System VM's 0–1 MB + HMA (`KLOW`)  |
+| `D0400000–D04FFFFF`       | kernel thread stacks, each with an unmapped guard page below |
+| `E0000000–E3FFFFFF`       | the running VM's extended memory window: XMS blocks and DPMI memory (swapped with the VM) |
+| `D0110000–FFBFFFFF`       | otherwise free for future kernel mappings               |
 | `FFC00000–FFFFFFFF`       | recursive window: page tables; directory at `FFFFF000`  |
 
 Memory manager (`kernel/include/mm.h`):
@@ -101,6 +111,25 @@ Memory manager (`kernel/include/mm.h`):
   freed memory poisoned to 0xDD, and a full consistency checker
   (`heap_check`).
 - `mmtest.c` is a self-test of all three that runs on every boot.
+- **Kernel stacks and the double fault.** Every kernel thread's stack has
+  an unmapped guard page below it (`sched.c`). Running off a stack faults
+  there, and the CPU can't push that fault's frame on the same stack, so it
+  double-faults; the double fault is a task gate to a TSS of its own with
+  its own stack (`gdt.c`), whose handler finds the thread from the faulting
+  ESP and stops with "Kernel stack overflow in thread ...".
+- **Demand paging and the swap file** (`pager.c`). A program's private
+  memory -- its heap, VirtualAlloc'd pages and thread stacks -- is
+  committed without frames: the page table entry says "demand zero" and
+  the first touch faults in a zeroed frame. When fewer than 1 MB of frames
+  are free, a clock hand goes round the processes' page tables and writes
+  pages nobody touched since it last came by to `WIN386.SWP` next to
+  VMM.BIN (`SwapFile=` KB in OS1993.INI's `[386Enh]`, 8 MB by default),
+  through the VMM's own file system; touching one reads it back. Pages of a
+  process with a thread inside a system call stay put, and the VMM's checks
+  on buffers (`user_range_ok`, `user_writable`) fault pages in first, so the
+  VMM never meets a missing page in the middle of using one. Without a
+  drive of the VMM's own (DOSBox-X), or with `SwapFile=0`, there is no swap
+  file and memory just runs out sooner.
 
 ## The DOS virtual machine
 
@@ -112,8 +141,10 @@ the VMM (`kernel/v86.c`, `kernel/vpic.c`):
   out of V86 mode land there, and `v86_leave` unwinds them (setjmp/longjmp).
 - **Instruction emulation.** V86 code runs at IOPL 0, so `CLI`, `STI`,
   `PUSHF`, `POPF`, `INT n`, `IRET` and `HLT` raise #GP and are emulated
-  against a virtual interrupt flag. CPU exceptions 0–7 are reflected to the
-  real-mode IVT, as on a real 8086.
+  against a virtual interrupt flag. IOPL reads as 3 and can't be changed,
+  as under EMM386, so a program that tests for real mode that way learns
+  it isn't in it. CPU exceptions 0–7 are reflected to the real-mode IVT,
+  as on a real 8086.
 - **Ports.** The TSS I/O bitmap lets the VM drive hardware directly, except
   the PIC ports 20h/21h/A0h/A1h, which trap to the virtual PIC.
 - **Virtual PIC.** IRQs without a kernel handler are reflected into DOS's
@@ -199,9 +230,121 @@ batch file runs inside one emulator callback, so the two VMs' DOS work runs
 one after the other rather than interleaved. DOSBox's CDS layout is also
 different, so it isn't instanced there.
 
-Not handled yet: programs that switch to protected mode themselves (DOS
-extenders, a real HIMEM's block moves). The VM is stopped with a message.
-That needs VCPI/DPMI.
+Programs that switch to protected mode by themselves, without DPMI (a DOS
+extender with DPMI turned off, a raw HIMEM block move), are stopped with a
+message: a VM gets DPMI and XMS from the VMM instead (below), as under
+Windows.
+
+### Virtual devices for DOS sessions
+
+- **Timer** (`vpit.c`). Ports 40h and 43h trap: each VM has its own
+  channel 0 (reload value, access and counting modes, latches, read-back).
+  The real timer runs at the fastest rate any VM asked for (up to about
+  2 kHz), the kernel counts its own 18.2 Hz tick out of that, and every
+  real interrupt is shared out: a VM whose period has ended gets its IRQ 0.
+  A count read from port 40h comes from the PIT clocks gone by since the VM
+  loaded the counter. Channel 2 (the speaker) goes to the hardware.
+- **Serial and printer ports** (`vdev.c`). COM1-COM4 and LPT1-LPT3 each
+  belong to at most one VM: the first one to touch a device's ports gets
+  it, if its settings allow, and from then on the device's interrupt goes
+  to that VM, its ports are open to it in the I/O bitmap (switched with the
+  VM, so its accesses run at full speed), and the real PIC follows its
+  virtual one for that IRQ. Any other VM gets FFh and its writes are
+  dropped, logged once ("VM 2 wants COM2, which VM 1 owns"), until the
+  owner ends. COM1 stays the VMM's while it carries the debug log.
+- **Mouse** (`vmouse.c`). While a DOS session has the focus, the kernel's
+  mouse goes to that VM's INT 33h driver, answered in the monitor
+  (functions 00h-26h as text-mode programs use them): position, buttons,
+  press and release counts, ranges, mickeys, the software text cursor
+  (screen and cursor masks), and event handlers, called as a real driver
+  calls them -- a far call with the events in AX -- through a monitor
+  breakpoint that restores the VM afterwards. Under the VMware absolute
+  pointer the VM's coordinates follow the host's pointer exactly.
+- **XMS and INT 15h** (`xms.c`, `vmx.c`). INT 2Fh AX=4300h/4310h point a
+  session's programs at an XMS 3.0 driver in the monitor. Each VM has its
+  own blocks, in a 64 MB extended memory window at E0000000h that is
+  swapped with the VM (out of V86 code's reach); moves copy between blocks
+  and conventional memory, a lock gives the block's linear address (which
+  INT 15h AH=87h accepts and a DPMI client can use), A20 is always on, the
+  HMA is DOS's. INT 15h AH=88h says there's no extended memory outside XMS,
+  as with HIMEM loaded. The System VM keeps the real HIMEM.
+- **Idle detection.** A VM that polls the keyboard (INT 16h AH=01h/11h, or
+  the controller's status port) more than `Idle=` times in one timer tick
+  without a key sleeps until the next tick or a key; the other VMs get the
+  time. (`make qemu-dosvm`: a polling loop went round 950 times in three
+  seconds instead of millions.)
+- **Settings per session** (`vmset.c`), like a PIF file's: OS1993.INI's
+  `[DOS]` section is read for every new session -- `Memory=` KB of
+  conventional memory (the free block spanning the limit is split and the
+  rest given to DOS itself; INT 12h agrees), `XMS=` and `DPMI=` KB (0: no
+  driver), `Devices=` which ports it may own (`COM2 LPT1`, `all`, `none`),
+  `Idle=`, `Mouse=`. The GUI can pass its own for one session
+  (`StartDosSessionEx`, `struct vm_settings` in `user.h`).
+
+### The DPMI host
+
+`dpmi.c` is a DPMI 0.9 host, so DOS extenders and their programs run in a
+DOS session: DOS/4GW and DOS32A programs (`make qemu-dpmi`), and anything
+else that asks INT 2Fh AX=1687h. A program that calls the mode-switch entry
+becomes the VM's client: it gets an LDT of its own, its code, data, stack,
+PSP and environment as 16-bit descriptors, and runs in ring 3 in the VM's
+thread, as its V86 code did. Both are the same trap frame on the VM's
+kernel stack -- TSS.ESP0 leaves 16 bytes spare below it, so a ring-3 frame
+can be rewritten into a V86 one in place -- so every mode switch is the
+monitor rewriting that frame:
+
+- **Interrupts.** Software interrupts trap (their gates are ring 0). INT 31h
+  is the API; a vector the client hooked (0205h) goes to its handler;
+  anything else is reflected to real mode as an INT instruction in a stub
+  in the host's data area, so DOS calls still pass the DOS critical section,
+  the redirector, the mouse and XMS, and come back with the general
+  registers. Hardware interrupts go to a hooked protected-mode handler
+  through a host stub that restores the virtual interrupt flag after its
+  IRET, or to real mode. Exceptions go to the client's handlers (0203h) on
+  a host stack; one it doesn't handle ends it.
+- **The API**: descriptors (0000h-000Dh), DOS memory (0100h-0102h, by a
+  real-mode INT 21h underneath), vectors and exception handlers
+  (0200h-0205h), real-mode calls (0300h-0302h), real-mode callbacks (0303h),
+  state save and raw mode switches (0305h, 0306h), version, memory (0500h-
+  0503h, from the VM's extended memory window, up to `DPMI=` KB), locking,
+  page size, adapter-space mapping, the virtual interrupt flag (0900h-0902h).
+- **Protection.** The client's descriptors are its own, ring 3 only; paging
+  keeps it out of the VMM and out of the GUI's processes (their private
+  page tables come out of the directory while a client runs). A selector
+  freed while it was loaded becomes null on the way back, as the CPU's cache
+  would have hidden it.
+- **espfix.** Going back to ring 3 on a 16-bit stack segment, IRET loads only
+  SP, leaving the VMM's top half of ESP -- and code that uses ESP, or an EBP
+  copied from it, as a 32-bit address then faults (DOS32A does). So such
+  returns go through a ring-3 trampoline on a 32-bit stack that loads the
+  whole of SS:ESP with LSS and IRETs from the client's own stack.
+- **The end.** INT 21h AH=4Ch (or INT 20h, AH=00h) from the client's process
+  ends it: everything it had goes, its environment segment goes back in the
+  PSP, and DOS ends the program.
+
+One client per VM at a time.
+
+### Running under EMM386
+
+With a memory manager loaded, the CPU runs DOS in V86 mode and the manager
+owns protected mode. If it offers VCPI, the loader asks it for its map of
+the first megabytes (DE01h: UMBs and the HMA as it has them, its own code
+above), builds the page tables in extended memory through XMS moves (V86
+mode can't reach it otherwise), and has it switch to protected mode with
+them (DE0Ch); at the end the kernel switches back through the manager's
+protected-mode entry, so DOS carries on under it. Meanwhile:
+
+- The KLOW window follows that map, so the kernel sees UMBs where DOS does.
+- The manager's resident code is rows of HLT instructions -- breakpoints
+  into its monitor, asleep while OS1993 runs. The vectors it hooked
+  (INT 13h, 15h, 19h, 40h, 4Bh) go to the BIOS's fixed entry points for
+  them, and its own come back at the end; a breakpoint reached anyway (its
+  hook on the XMS entry, which FreeDOS calls for A20) is answered by the
+  monitor; VDS is off.
+- INT 67h in a VM says "not supported": no EMS and no VCPI while OS1993
+  runs; programs get XMS and DPMI from the VMM instead.
+
+`make qemu-emm386` runs the self-tests this way under JEMM386.
 
 ## Ring 3: processes
 
@@ -904,8 +1047,8 @@ and up-downs. Esc closes the demo.
   on IRQ 1 isn't taken for a key.
 - **Delivery.** Events go to the ring-3 GUI while it has the screen.
   `SYS_GET_EVENT` returns key and mouse events, and consecutive moves are
-  merged. DOS sessions get no mouse yet (that needs a virtual aux device
-  for a DOS mouse driver).
+  merged. While a DOS session has the screen they go to its INT 33h driver
+  (`vmouse.c`, under *Virtual devices for DOS sessions*).
 - **Exit.** Before returning to DOS, streaming is stopped and the 8042
   command byte restored. Otherwise mouse bytes would jam DOS's keyboard.
 - **Absolute positioning under emulators.** A PS/2 mouse only reports
@@ -987,6 +1130,29 @@ INT 10h on the console thread): see TODO.md.
 Limitations: DOS sessions must stay in text mode. A DOS program switching
 its VM to graphics isn't virtualized yet. Mono adapters get text only.
 
+## The kernel debugger
+
+`OS1993 /D` starts the kernel debugger on COM1 (`kernel/kdbg.c`), in the
+spirit of WDEB386: a terminal on the serial line (115200 8N1) gets a `#`
+prompt when Ctrl+C arrives on the line (polled from the timer interrupt),
+when a breakpoint set there is hit -- the 486's debug registers, so
+execution breakpoints and data watches (`BP`, `BW`, `BR`) work in the
+kernel, in ring 3 and in V86 mode alike, and nothing is patched -- after a
+single step (`T`), on an INT 3 in the kernel, and when the VMM panics or
+double-faults, for a last look before the blue screen. The machine is
+frozen while the prompt is up.
+
+```
+R [reg=val]        registers           D[B|W|D] addr [n]   dump       E addr b ...  enter
+BP addr            execution break     BW|BR addr [len]    data watch BL / BC n|*  list, clear
+G [addr]  T [n]    go, step            K                   stack (EBP chain)
+.T .VM .P .M       threads, VMs, processes, memory          .PT addr   page table walk
+.CRASH             overflow a thread's stack (the double-fault test)   .EXIT  Q
+```
+
+Addresses are linear, `seg:off` in the current VM, or `%phys`; memory that
+isn't mapped shows as `??` instead of faulting.
+
 ## Source layout
 
 ```
@@ -996,6 +1162,12 @@ kernel/isr.asm           exception + IRQ stubs → interrupt_dispatch()
 kernel/vmm.c             kmain
 kernel/pmm.c paging.c heap.c mmtest.c   memory manager
 kernel/v86.c v86entry.asm vpic.c         V86 monitor and virtual PIC
+kernel/vpit.c vdev.c vmouse.c            each VM's timer, COM/LPT ownership, INT 33h mouse
+kernel/xms.c vmx.c                       XMS and INT 15h for VMs, their extended memory window
+kernel/dpmi.c                            the DPMI host
+kernel/vmset.c                           per-session settings (OS1993.INI [DOS])
+kernel/pager.c                           demand paging and the swap file
+kernel/kdbg.c                            the kernel debugger on COM1
 kernel/v86test.c dosshell.c              DOS calls from the kernel, DOS sessions
 kernel/vm.c sched.c switch.asm           VMs, address spaces, focus; threads
 kernel/vmtest.c                          multi-VM self-test
@@ -1023,6 +1195,8 @@ kernel/linker.ld         links at 0x80000000, header first
 test/dosbox-x.conf       the emulated 1993 machine
 tools/                   check486.sh, check-test.sh, mkfreedos.sh, mkdata.sh, exfat.py, decomp-test.c, the QEMU tests
 test/dos/lfntest.asm     a DOS program using the long-name calls, share modes and locks
+test/dos/dosvm.asm       a DOS program exercising a session's virtual devices and DPMI
+test/dos/dpmitest.c      a DOS/4GW program (Open Watcom) for the DPMI host
 ```
 
 ## Rules of the house
@@ -1037,9 +1211,9 @@ test/dos/lfntest.asm     a DOS program using the long-name calls, share modes an
 
 ## Roadmap
 
-1. ~~**Memory manager.**~~ Done: frame allocator, paging API, kernel heap.
-   Still to do: demand paging and a double-fault task gate, which would make
-   a kernel stack guard page safe.
+1. ~~**Memory manager.**~~ Done: frame allocator, paging API, kernel heap,
+   demand paging with a swap file, guard pages under kernel stacks and a
+   double-fault task gate.
 2. ~~**TSS + V86 monitor.**~~ Done: DOS runs as a V86 VM, the kernel calls
    DOS and BIOS through it, and the DOS prompt runs inside it.
 3. ~~**Multiple VMs.**~~ Done: private address spaces, preemptive
@@ -1052,9 +1226,10 @@ test/dos/lfntest.asm     a DOS program using the long-name calls, share modes an
    32-bit File Access did in Windows for Workgroups 3.11), with INT 13h for
    DOS done by the VMM and long names for DOS programs. Still to do: the
    other file systems in TODO.md.
-5. **More virtual devices (VxD-style).** The PIC, keyboard and text display
-   are done. Still to do: the PIT (programs that reprogram the timer), CRTC
-   ports for background VMs, graphics modes, mouse, serial and printer ports.
+5. **More virtual devices (VxD-style).** The PIC, keyboard, text display,
+   timer, mouse (INT 33h), serial and printer ports (one owner each), XMS
+   and idle detection are done, with settings per session. Still to do:
+   CRTC ports for background VMs and graphics modes.
 6. **Graphics and GUI.** Done: the VGA driver and ring-3 support (flat
    user segments, INT 30h system calls, program loader, fault
    isolation), the PS/2 mouse, and the window manager with the Windows 95
@@ -1073,4 +1248,6 @@ test/dos/lfntest.asm     a DOS program using the long-name calls, share modes an
    Winsock, PING and IPCONFIG in console windows).
 7. **Win16-style API layer.** 16-bit protected-mode apps in ring 3 with LDTs,
    built with Open Watcom.
-8. **Coexisting with EMM386** through VCPI/GEMMIS, and acting as a DPMI host.
+8. ~~**Coexisting with EMM386** and acting as a DPMI host.~~ Done: OS1993
+   starts through VCPI under EMM386-style managers and goes back to them,
+   and DOS sessions have a DPMI 0.9 host (DOS/4GW, DOS32A).

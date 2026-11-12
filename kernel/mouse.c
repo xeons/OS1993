@@ -2,9 +2,9 @@
  * mouse.c -- PS/2 mouse on the 8042's auxiliary port (IRQ 12).
  *
  * The kernel owns the mouse. It keeps an absolute pointer position on the
- * screen (640x480, or the display mode's size) and queues events for the ring-3 GUI while the GUI has
- * the screen. DOS sessions don't get a mouse yet (that needs a virtual
- * auxiliary device for a DOS mouse driver to talk to).
+ * screen (640x480, or the display mode's size) and queues events for the
+ * ring-3 GUI while the GUI has the screen; while a DOS session has it, they
+ * go to that VM's INT 33h driver (vmouse.c).
  *
  * Under an emulator a PS/2 mouse only reports movement, so the guest's
  * pointer drifts away from the host's. If the VMware "backdoor" port
@@ -140,6 +140,11 @@ static void vmmouse_poll(void)
         my = (int)(r[2] * (uint32_t)screen_h / 65536);
         buttons = (uint8_t)(((r[0] & 0x20) ? 1 : 0) | ((r[0] & 0x10) ? 2 : 0) |
                             ((r[0] & 0x08) ? 4 : 0));
+        struct vm *f = vm_focus();
+        if (f) {                                /* a DOS session's INT 33h mouse */
+            vmouse_input(f, (int)(r[1] & 0xFFFF), (int)(r[2] & 0xFFFF), true, buttons);
+            continue;
+        }
         struct user_event e = { .type = EV_MOUSE, .buttons = buttons,
                                 .x = (int16_t)mx, .y = (int16_t)my };
         enqueue(&e);
@@ -163,6 +168,12 @@ void mouse_byte(uint8_t b)
 
     int dx = packet[1] - ((packet[0] << 4) & 0x100);
     int dy = packet[2] - ((packet[0] << 3) & 0x100);
+    struct vm *f = vm_focus();
+    if (f) {                                    /* a DOS session's INT 33h mouse */
+        buttons = packet[0] & 0x07;
+        vmouse_input(f, dx, -dy, false, buttons);
+        return;
+    }
     mx += dx;
     my -= dy;                       /* PS/2 y grows upwards */
     if (mx < 0) mx = 0;

@@ -11,7 +11,10 @@
  *   D0000000-D010FFFF  kernel window on physical 0-1 MB + HMA (KLOW): the
  *                      real video RAM and the System VM's memory, whatever
  *                      VM's page table is currently in PDE 0
- *   D0110000-FFBFFFFF  free for future kernel mappings
+ *   D0400000-D04FFFFF  kernel thread stacks, each with an unmapped guard
+ *                      page below it (a stack overflow double-faults into
+ *                      a task of its own instead of corrupting memory)
+ *   D0110000-FFBFFFFF  otherwise free for future kernel mappings
  *   FFC00000-FFFFFFFF  recursive window: all page tables; PD at FFFFF000
  */
 #ifndef OS1993_MM_H
@@ -44,6 +47,8 @@
 #define KLOW_BASE    0xD0000000u
 #define KLOW_SIZE    0x00110000u
 #define KLOW(pa)     ((void *)(uintptr_t)(KLOW_BASE + (uint32_t)(pa)))
+#define KSTACK_BASE  0xD0400000u
+#define KSTACK_LIMIT 0xD0500000u
 #define PT_WINDOW    0xFFC00000u
 #define PD_WINDOW    0xFFFFF000u
 
@@ -66,6 +71,20 @@ void     klow_init(void);               /* map the KLOW window */
 #define VMM_ENOMEM  (-1)
 #define VMM_EEXIST  (-2)
 #define VMM_EINVAL  (-3)
+
+/* pager.c -- demand paging and the swap file for programs' memory */
+struct regs;
+void     pager_init(uint32_t kb);
+void     pager_shutdown(void);
+bool     pager_fault(struct regs *r);
+bool     pager_resident(uint32_t va);
+bool     pager_commit(uint32_t va, uint32_t len, bool writable);
+bool     pager_committed(uint32_t va, bool *writable);
+void     pager_release(uint32_t va);
+void     pager_pin(uint32_t va);
+void     pager_make_room(void);
+bool     pager_swap_on(void);
+uint32_t pager_stats(uint32_t *outs, uint32_t *ins, uint32_t *zeros);
 
 /* heap.c -- kernel heap */
 struct heap_stats {

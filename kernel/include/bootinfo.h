@@ -29,6 +29,8 @@
 #define KHDR_MAGIC       0x334D4D56u   /* "VMM3" */
 
 #define BI_FLAG_TEST     0x00000001u   /* /T: automated test run, auto-exit */
+#define BI_FLAG_DEBUG    0x00000002u   /* /D: the kernel debugger on COM1 */
+#define BI_FLAG_VCPI     0x00000004u   /* started under a memory manager, through VCPI */
 
 struct bootinfo {
     uint32_t magic;        /*  0 BOOTINFO_MAGIC                              */

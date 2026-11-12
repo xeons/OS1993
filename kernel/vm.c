@@ -24,6 +24,13 @@ static bool     irq_ready;                  /* System VM exists: route IRQs */
 static struct vm *focus;                    /* NULL = VMM console */
 static uint8_t  dos_mask1, dos_mask2;
 
+/* What a new VM may have, unless it is told otherwise (vmset.c). */
+struct vm_settings vm_defaults = {
+    .mem_kb = 0, .xms_kb = 2048, .dpmi_kb = 4096,
+    .devices = VMDEV_ALL & ~VMDEV_COM1,     /* COM1 is the VMM's debug line */
+    .idle = 16, .mouse = true,
+};
+
 /* Private pages: [priv_first, VM_LOW_PAGES) and the BIOS RAM pages.
  * priv_page[i] is the page number of private slot i; priv_slot[page] the
  * reverse (-1 for shared pages). */
@@ -178,6 +185,8 @@ void vm_system_init(const struct bootinfo *bi)
     for (unsigned i = 0; i < priv_count; i++)
         vm->priv[i] = (uint32_t)priv_page[i] * PAGE_SIZE;   /* identity */
     vpic_init(&vm->pic, dos_mask1, dos_mask2);
+    vpit_init(&vm->pit);
+    vm->set = vm_defaults;
     inst_owner = vm;
     focus = NULL;
     irq_ready = true;
@@ -229,6 +238,12 @@ static void vm_thread_main(void *arg)
 static void vm_free_resources(struct vm *vm)
 {
     redir_vm_end(vm);
+    vdev_vm_gone(vm);
+    dpmi_vm_gone(vm);
+    vmx_vm_gone(vm);
+    for (unsigned irq = 0; irq < 16; irq++)     /* IRQs it never acknowledged */
+        if (vm->pic.inflight & (1u << irq))
+            pic_unmask(irq);
     free_frames(vm->priv, priv_count);
     free_frames(vm->video, VM_VIDEO_PAGES);
     if (vm->pt0_phys) pmm_free(vm->pt0_phys);
@@ -238,6 +253,12 @@ static void vm_free_resources(struct vm *vm)
 }
 
 struct vm *vm_create(const char *name, void (*body)(struct vm *), void *arg)
+{
+    return vm_create_with(name, body, arg, &vm_defaults);
+}
+
+struct vm *vm_create_with(const char *name, void (*body)(struct vm *), void *arg,
+                          const struct vm_settings *set)
 {
     if (!ready)
         return NULL;
@@ -274,6 +295,9 @@ struct vm *vm_create(const char *name, void (*body)(struct vm *), void *arg)
     map_video(vm, false);
 
     vpic_init(&vm->pic, dos_mask1, dos_mask2);
+    vpit_init(&vm->pit);
+    vm->set = *set;
+    vmset_apply_memory(vm);
     vm->body = body;
     vm->arg = arg;
     vm->thread = thread_create(vm->name, vm_thread_main, vm, vm);
@@ -303,6 +327,7 @@ void vm_reap(void)
         irq_restore(f);
         vm_free_resources(vm);
         memset(vm, 0, sizeof *vm);
+        vpit_vm_gone();                     /* the real timer may slow down */
     }
 }
 
@@ -329,16 +354,21 @@ struct vm *vm_current(void)
 
 void vm_switch_to(struct vm *vm)
 {
-    if (!vm)
+    vmx_install(vm);                    /* its extended memory, or none (ring-3 threads) */
+    if (!vm) {
+        dpmi_install_ldt(NULL);
         return;
+    }
     volatile uint32_t *pd = (volatile uint32_t *)PD_WINDOW;
     if ((pd[0] & PAGE_MASK) != vm->pt0_phys) {
         pd[0] = vm->pt0_phys | PTE_V86;
         tlb_flush();
     }
     inst_swap_to(vm);
+    vdev_switch(vm);                    /* its devices' ports open, others' trapped */
+    dpmi_install_ldt(vm);               /* its DPMI client's LDT, or none */
     if (vm->active)
-        kernel_tss.esp0 = vm->kernel_esp;
+        kernel_tss.esp0 = vm->kernel_esp - 16;
 }
 
 void *vm_ptr(struct vm *vm, uint32_t linear)
@@ -381,6 +411,7 @@ void vm_set_focus(struct vm *target)
     }
     uint8_t *real = KLOW(VM_VIDEO_PAGE * PAGE_SIZE);
 
+    vmouse_focus(old, false);                       /* the mouse cursor off its screen */
     if (old) {                                      /* old VM to its buffer */
         for (unsigned i = 0; i < VM_VIDEO_PAGES; i++)
             memcpy(phys_to_virt(old->video[i]), real + i * PAGE_SIZE, PAGE_SIZE);
@@ -397,6 +428,7 @@ void vm_set_focus(struct vm *target)
             memcpy(real + i * PAGE_SIZE, phys_to_virt(target->video[i]), PAGE_SIZE);
         map_video(target, true);
         set_cursor_from_bda(target);
+        vmouse_focus(target, true);
     } else if (vga_console_gfx()) {
         vga_console_resume();                       /* the desktop, exactly */
     } else {
@@ -428,7 +460,7 @@ void vm_check(const char *where)
     uint32_t pde0 = ((volatile uint32_t *)PD_WINDOW)[0] & PAGE_MASK;
     bool bad_inst = ready && inst_owner != vm;
     bool bad_pt   = pde0 != vm->pt0_phys;
-    bool bad_esp0 = vm->active && kernel_tss.esp0 != vm->kernel_esp;
+    bool bad_esp0 = vm->active && kernel_tss.esp0 != vm->kernel_esp - 16;
     if (bad_inst || bad_pt || bad_esp0)
         panic("VM state mismatch %s: thread %s, VM %d; instance owner VM %d, "
               "PDE0 %08X (VM %08X), ESP0 %08X (VM %08X)",
@@ -446,19 +478,22 @@ void vm_raise_irq(struct vm *vm, unsigned irq)
 }
 
 /* Device IRQs nobody virtualizes go to the System VM, which loaded the
- * drivers for them. */
+ * drivers for them -- unless a VM owns the device (vdev.c). */
 void vm_hw_irq(unsigned irq)
 {
     if (!irq_ready)
         return;
-    vpic_hw_irq(&system_vm->pic, irq);
-    thread_wake(system_vm->thread);
+    struct vm *vm = vdev_irq_owner(irq);    /* a COM or LPT port's owner, or the System VM */
+    vpic_hw_irq(&vm->pic, irq);
+    thread_wake(vm->thread);
 }
 
-/* Share a timer tick with every VM. A VM whose previous tick is still
- * undelivered gets its BIOS tick count advanced directly. Waking every VM
- * also makes VMs waiting for DOS or an IRQ re-check. */
-bool vm_timer_tick(void)
+/* A real timer interrupt (clocks PIT clocks long; tick: the kernel's
+ * 18.2 Hz tick is in it). Each VM whose own timer period ended gets a
+ * virtual IRQ 0; a VM at the BIOS rate whose previous one is still
+ * undelivered gets its BIOS tick count advanced directly instead. Every
+ * kernel tick also wakes every VM, so VMs waiting for DOS re-check. */
+bool vm_timer_irq(uint32_t clocks, bool tick)
 {
     if (!irq_ready)
         return false;
@@ -466,14 +501,16 @@ bool vm_timer_tick(void)
         struct vm *vm = &vms[i];
         if (vm->state != VM_RUNNING)
             continue;
-        if (!vpic_raise(&vm->pic, 0)) {
+        unsigned n = vpit_due(&vm->pit, clocks);
+        if (n && !vpic_raise(&vm->pic, 0) && vm->pit.div == 65536) {
             uint32_t *ticks = vm_ptr(vm, 0x46C);
             if (++*ticks >= 0x1800B0) {
                 *ticks = 0;
                 *(uint8_t *)vm_ptr(vm, 0x470) = 1;
             }
         }
-        thread_wake(vm->thread);
+        if (n || tick)
+            thread_wake(vm->thread);
     }
     return true;
 }

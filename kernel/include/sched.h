@@ -36,6 +36,7 @@ struct thread {
     uint32_t    deadline;       /* ... until this tick (0: no limit) */
     bool        woken;          /* ... and a SYS_FUTEX_WAKE came */
     bool        killed;         /* TerminateThread: ends on its way to ring 3 */
+    bool        in_syscall;     /* inside a system call: its process's pages stay in (pager.c) */
     int         kill_code;
 };
 
@@ -45,6 +46,8 @@ void sched_init(struct vm *system_vm);
 struct thread *thread_create(const char *name, void (*fn)(void *), void *arg,
                              struct vm *vm);   /* created blocked */
 void thread_wake(struct thread *t);
+struct thread *thread_get(int i);              /* by slot, or NULL */
+struct thread *thread_of_guard(uint32_t addr); /* whose stack guard page addr is in */
 __attribute__((noreturn)) void thread_exit(void);
 bool thread_reap(struct thread *t);            /* free a dead thread */
 

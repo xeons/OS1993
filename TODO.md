@@ -200,26 +200,49 @@ and file systems); DOS reaches their volumes through the redirector.
 
 ## DOS virtual machines
 
-- [ ] Mouse for DOS sessions: virtual PS/2 aux device and/or an INT 33h
-      driver in the VM.
-- [ ] **VCPI / DPMI host**, so DOS extenders (DOS/4GW etc.) run in VMs;
-      today a VM that tries to enter protected mode is stopped.
-- [ ] XMS inside VMs; INT 15h AH=87h block moves.
-- [ ] Coexisting with EMM386 (VCPI or the GEMMIS interface); today the
-      loader refuses to start under a memory manager.
-- [ ] Virtual PIT for programs that reprogram the timer.
-- [ ] Virtual serial and printer ports; IRQ ownership per device instead of
-      sending every device IRQ to the System VM.
-- [ ] Per-VM settings (memory size, which devices it may use).
-- [ ] Idle detection for VMs that busy-poll the keyboard.
+- [x] Mouse for DOS sessions: an INT 33h driver in the monitor (vmouse.c):
+      functions 00h-26h, the software text cursor, event handlers called
+      through a monitor breakpoint; absolute under the VMware pointer.
+- [x] **DPMI host** (dpmi.c), so DOS extenders run in VMs: DPMI 0.9, an LDT
+      per client, interrupts reflected through stubs that keep the DOS
+      critical section, real-mode calls and callbacks, raw switches, memory
+      from the VM's extended memory window, espfix for 16-bit stacks.
+      DOS/4GW and DOS32A programs run (`make qemu-dpmi`).
+- [x] XMS inside VMs (xms.c: XMS 3.0 per VM, blocks in a 64 MB window that
+      is swapped with the VM); INT 15h AH=87h/88h.
+- [x] Coexisting with EMM386 through VCPI: the loader builds its tables
+      through XMS moves and switches with DE0Ch, the manager's HLT-stub
+      vectors go to the BIOS meanwhile, and OS1993 goes back to V86 mode
+      under it (`make qemu-emm386`, JEMM386).
+- [x] Virtual PIT for programs that reprogram the timer (vpit.c).
+- [x] Serial and printer ports with one owner each, and IRQ ownership per
+      device (vdev.c).
+- [x] Per-VM settings: OS1993.INI `[DOS]` (memory, XMS, DPMI, devices, idle,
+      mouse) for each new session, or the GUI's (`StartDosSessionEx`).
+- [x] Idle detection for VMs that busy-poll the keyboard.
+- [ ] Follow-ups: graphics modes and the CRTC for background VMs (the VDD is
+      text only); EMS (LIM 4.0) for sessions; GEMMIS, so the memory
+      manager's own breakpoints could be emulated instead of bypassed (its
+      DMA buffering is off while OS1993 runs; INT 13h goes to the BIOS's
+      diskette entry point, which is all disks only on BIOSes such as
+      SeaBIOS); the DPMI host's virtual memory (0x0600 locking is a no-op,
+      client memory isn't swapped), DPMI 1.0 calls and more than one client
+      per VM; a dialog in the shell for session settings; the Idle setting
+      also for INT 21h AH=0Bh/06h polling and port 60h loops.
 
 ## Kernel
 
-- [ ] Demand paging and a swap file.
-- [ ] Double-fault task gate, so a kernel stack guard page becomes safe.
-- [ ] Native FAT driver to take disk I/O off DOS gradually (as 32-bit File
-      Access did in Windows for Workgroups 3.11).
-- [ ] A kernel debugger on COM1 (breakpoints, memory dumps), WDEB386-style.
+- [x] Demand paging and a swap file (pager.c): programs' private memory is
+      demand-zero, and written out to WIN386.SWP by a clock hand when frames
+      run low.
+- [x] Double-fault task gate, and guard pages under the kernel thread stacks.
+- [x] Native FAT driver to take disk I/O off DOS (done earlier: fat.c, the
+      redirector and INT 13h emulation; C: is taken over too).
+- [x] A kernel debugger on COM1 (kdbg.c), WDEB386-style: `OS1993 /D`.
+- [ ] Follow-ups: swapping VM memory (DOS sessions' private pages and DPMI
+      memory stay resident); a symbol table for the debugger (it shows
+      addresses only) and a disassembler; breaking into the debugger from
+      the keyboard, not only from the serial line.
 
 ## Testing and tooling
 

@@ -49,6 +49,17 @@ isr_common:
         add     esp, 8                  ; vector number + error code
         iretd
 
+; The double fault arrives through a task gate: a task switch to df_tss
+; (gdt.c), on a stack of its own, with the CPU's error code pushed there.
+; The faulting state was saved in kernel_tss.
+        extern  double_fault
+        global  double_fault_entry
+double_fault_entry:
+        cli
+        call    double_fault            ; never returns
+.hang:  hlt
+        jmp     .hang
+
         section .rodata
         global  isr_stub_table
 isr_stub_table:

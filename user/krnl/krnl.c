@@ -14,7 +14,8 @@ void OutputDebugString(const char *s)       { sys_print(s); }
 uint32_t GetTickCount(void)                 { return sys_ticks() * 55; }  /* 18.2 Hz */
 bool Beep(unsigned freq, unsigned ms)       { sys_beep(freq, ms); return true; }   /* doesn't wait */
 const struct user_info *GetStartupInfo(void){ return (const struct user_info *)USER_INFO; }
-int  StartDosSession(void)                  { return sys_new_session(); }
+int  StartDosSession(void)                  { return sys_new_session(NULL); }
+int  StartDosSessionEx(const struct vm_settings *s) { return sys_new_session(s); }
 bool GetInputEvent(struct user_event *e)    { return sys_get_event(e) == 1; }
 bool HasMouse(void)                         { return sys_mouse() != 0; }
 static void (*before_wait)(void), (*after_wait)(void);

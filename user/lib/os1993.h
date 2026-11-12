@@ -40,6 +40,8 @@ bool     WritePrivateProfileString(const char *section, const char *key, const c
                                    const char *file);  /* value NULL: remove; key NULL: the section */
 const struct user_info *GetStartupInfo(void);
 int      StartDosSession(void);                 /* -> VM number, or -1 */
+struct vm_settings;                             /* <user.h>: memory, devices, mouse, idle */
+int      StartDosSessionEx(const struct vm_settings *s);   /* NULL: OS1993.INI's [DOS] */
 
 typedef struct systime SYSTEMTIME;
 void     GetLocalTime(SYSTEMTIME *t);

@@ -26,7 +26,9 @@ void panic(const char *fmt, ...);
 
 /* vmm.c */
 struct vm;
-struct vm *dos_new_session(void);       /* start a DOS session VM, focused */
+struct vm_settings;
+struct vm *dos_new_session(const struct vm_settings *set);  /* a DOS session VM, focused;
+                                           set NULL: OS1993.INI's settings */
 
 /* vmm.c */
 __attribute__((noreturn))

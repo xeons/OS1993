@@ -20,6 +20,7 @@
 #include "fs.h"
 #include "disk.h"
 #include "vm.h"
+#include "kdbg.h"
 
 const struct bootinfo *g_bootinfo;
 static struct bootinfo boot_copy;   /* the original lives in VM memory */
@@ -69,12 +70,16 @@ static void check_paging(const struct bootinfo *bi)
 
 void kernel_shutdown(uint8_t exit_code)
 {
+    v86_vcpi_dos_rehook();
+    pager_shutdown();
     fs_shutdown();                      /* everything on the disks (interrupts still on) */
     cpu_cli();
     pic_mask_all();
+    vpit_shutdown();                    /* the BIOS's 18.2 Hz again */
     ne2000_stop();
     mouse_shutdown();                   /* or DOS's keyboard would jam */
     vm_restore_dos();                   /* the original DOS memory and screen */
+    v86_vcpi_rehook();                  /* a memory manager's hooks, if it was there */
     redir_restore();                    /* DOS's own drive letters back */
     klog("VMM: returning to DOS (exit code %u)\n", exit_code);
     serial_flush();
@@ -92,12 +97,15 @@ static void show_vm_line(void)
     con_write_at(CON_ROWS - 2, 0, INFO_ATTR, line);
 }
 
-struct vm *dos_new_session(void)
+struct vm *dos_new_session(const struct vm_settings *given)
 {
     static int serial;
     char name[16];
+    struct vm_settings set;
+    if (given) set = *given;
+    else       vmset_load(&set);
     ksnprintf(name, sizeof name, "DOS %d", ++serial);
-    struct vm *vm = vm_create(name, dos_session_body, NULL);
+    struct vm *vm = vm_create_with(name, dos_session_body, NULL, &set);
     if (!vm) {
         kprintf("  Cannot start another DOS session: out of memory or VM slots.\n");
         return NULL;
@@ -137,6 +145,7 @@ void kmain(const struct bootinfo *bi)
 
     gdt_init();
     ok("Global descriptor table and TSS");
+    kdbg_init(bi);
     idt_init();
     ok("Interrupt descriptor table");
     pic_init(IRQ_BASE, IRQ_BASE + 8);
@@ -159,8 +168,10 @@ void kmain(const struct bootinfo *bi)
     sched_init(system_vm);
     ok("V86 monitor, System VM and scheduler");
     dosmgr_init();
+    v86_vcpi_dos_unhook();                          /* (under a memory manager) */
     fs_init();                                      /* DOS's drive letters: before the snapshot */
     vm_finish_init();
+    pager_init((uint32_t)vmset_ini_int("386Enh", "SwapFile", 8192));   /* KB; 0: none */
     dosmgr_started();
     ok("DOS shared between VMs (DOSMGR)");
     {
@@ -220,7 +231,7 @@ void kmain(const struct bootinfo *bi)
         }
         int sc = user_running() ? -1 : keyboard_read();    /* the GUI reads keys itself */
         if (sc == SC_N) {
-            dos_new_session();
+            dos_new_session(NULL);
         } else if (sc == SC_G) {
             start_gui();
             gui_was_running = user_running();

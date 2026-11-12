@@ -7,7 +7,7 @@
 #   make check486   verify nothing contains post-486 or FPU instructions
 #   make qemu       boot FreeDOS 1.3 in QEMU with OS1993 on C: (real DOS)
 #   make qemu-test  the same, headless: run OS1993 /T and check the results
-#   make qemu-emm386  OS1993 must refuse to run with JEMM386 loaded
+#   make qemu-emm386  under JEMM386: OS1993 starts through VCPI, runs the self-tests, goes back
 #   make qemu-sessions  type into two concurrent DOS sessions (QEMU sendkey)
 #   make qemu-vga   check the VGA driver with QEMU screendumps
 #   make qemu-wm    drive the window manager and every control (mouse, keys)
@@ -19,11 +19,15 @@
 #   make qemu-files file access: Paint's Open/Save, the file dialogs, the disk
 #   make qemu-notepad  Notepad and the multi-line edit control, the clipboard
 #   make qemu-explorer Explorer, the tree view and the list view (its four views)
+#   make qemu-gui      the newer GUI parts: scientific Calculator, Print, Paint's clipboard, Explorer's files
 #   make qemu-tasklist Ctrl+Alt+Del: Close Program, and the VMM's screen for a hung GUI
 #   make qemu-vesa     the VBE display driver: higher resolutions and colour depths
 #   make qemu-crt      the C runtime (CRT.DLL, libcrt.a) and its protections
 #   make qemu-threads  threads, synchronization, virtual memory, heaps, processes, file calls
 #   make qemu-net      the NE2000, TCP/IP, WSOCK.DLL, PING and IPCONFIG
+#   make qemu-kdbg     the kernel debugger on COM1 (OS1993 /D) and the double-fault task
+#   make qemu-dosvm    DOS sessions' devices: timer, idle, COM/LPT, mouse, XMS, settings
+#   make qemu-dpmi     the DPMI host: DOSVM D, a DOS/4GW program, DOS32A (needs Open Watcom)
 #   make qemu-fat      the VMM's own disks: IDE, FAT32/FAT16, long names, the DOS redirector
 #   make clean
 
@@ -34,6 +38,7 @@ AR      := i686-elf-ar
 NASM    := nasm
 DOSBOX  := dosbox-x
 QEMU    := qemu-system-i386
+WATCOM  ?= /opt/watcom
 
 BUILD   := build
 
@@ -113,7 +118,7 @@ KERNEL_ASM := $(wildcard kernel/*.asm)
 KERNEL_OBJ := $(patsubst kernel/%.asm,$(BUILD)/kernel/%.o,$(KERNEL_ASM)) \
               $(patsubst kernel/%.c,$(BUILD)/kernel/%.o,$(KERNEL_C))
 
-.PHONY: all run test check486 qemu qemu-test qemu-emm386 qemu-sessions qemu-vga qemu-wm qemu-absmouse qemu-menu qemu-controls qemu-msgbox qemu-shell qemu-files qemu-notepad qemu-explorer qemu-tasklist qemu-vesa qemu-crt qemu-threads qemu-net qemu-fat clean
+.PHONY: all run test check486 qemu qemu-test qemu-emm386 qemu-sessions qemu-vga qemu-wm qemu-absmouse qemu-menu qemu-controls qemu-msgbox qemu-shell qemu-files qemu-notepad qemu-explorer qemu-gui qemu-tasklist qemu-vesa qemu-crt qemu-threads qemu-net qemu-fat qemu-kdbg qemu-dosvm qemu-dpmi clean
 
 all: $(BUILD)/OS1993.COM $(BUILD)/VMM.BIN $(MODULES)
 
@@ -277,15 +282,18 @@ qemu-test: all $(QEMU_ROM)
 	@MTOOLS_SKIP_CHECK=1 mcopy -o -i $(QEMU_IMG) ::/OS1993/LOADER.LOG $(BUILD)/qemu/ 2>/dev/null || true
 	@tools/check-test.sh $(BUILD)/qemu
 
-qemu-emm386: all
+qemu-emm386: all $(QEMU_ROM)
 	@mkdir -p $(BUILD)/qemu && rm -f $(BUILD)/qemu/*.LOG
 	@tools/mkfreedos.sh emm386 autotest
-	timeout -s KILL 120 $(QEMU) $(QEMU_ARGS) -display none || true
+	timeout -s KILL 120 $(QEMU) $(QEMU_ARGS) -display none -no-reboot || true
 	@MTOOLS_SKIP_CHECK=1 mcopy -o -i $(QEMU_IMG) ::/OS1993/LOADER.LOG $(BUILD)/qemu/ 2>/dev/null || true
-	@tr -d '\r' < $(BUILD)/qemu/LOADER.LOG
-	@tr -d '\r' < $(BUILD)/qemu/LOADER.LOG | grep -q "virtual 8086 mode" && \
-	    echo "  PASS  loader refused to run under JEMM386" || \
-	    { echo "  FAIL  loader did not refuse JEMM386"; exit 1; }
+	@tr -d '\r' < $(BUILD)/qemu/LOADER.LOG | grep -q "hands over through VCPI" && \
+	    echo "  PASS  JEMM386 is running: the loader went through VCPI" || \
+	    { echo "  FAIL  the loader did not use VCPI"; exit 1; }
+	@grep -aq "the memory manager's (C900" $(BUILD)/qemu/SERIAL.LOG && \
+	    echo "  PASS  the memory manager's HLT-stub vectors went to the BIOS meanwhile" || \
+	    { echo "  FAIL  the memory manager's vectors were left alone"; exit 1; }
+	@tools/check-test.sh $(BUILD)/qemu
 
 qemu-sessions: all
 	@tools/qemu-sessions-test.py
@@ -320,6 +328,9 @@ qemu-notepad: all
 qemu-explorer: all
 	@tools/qemu-explorer-test.py
 
+qemu-gui: all
+	@tools/qemu-gui-test.py
+
 qemu-tasklist: all
 	@tools/qemu-tasklist-test.py
 
@@ -335,7 +346,24 @@ qemu-threads: all $(QEMU_ROM)
 qemu-net: all $(QEMU_ROM)
 	@tools/qemu-net-test.py
 
+qemu-kdbg: all
+	@tools/qemu-kdbg-test.py
+
+qemu-dosvm: all $(BUILD)/DOSVM.COM
+	@tools/qemu-dosvm-test.py
+
+$(BUILD)/watcom/DPMITEST.EXE: test/dos/dpmitest.c
+	@mkdir -p $(dir $@)
+	cd $(dir $@) && WATCOM=$(WATCOM) PATH=$(WATCOM)/binl:$$PATH INCLUDE=$(WATCOM)/h \
+	    $(WATCOM)/binl/wcl386 -q -bt=dos -l=dos4g -fe=DPMITEST.EXE $(abspath $<)
+
+qemu-dpmi: all $(BUILD)/DOSVM.COM $(BUILD)/watcom/DPMITEST.EXE
+	@tools/qemu-dpmi-test.py
+
 $(BUILD)/LFNTEST.COM: test/dos/lfntest.asm
+	nasm -f bin -o $@ $<
+
+$(BUILD)/DOSVM.COM: test/dos/dosvm.asm
 	nasm -f bin -o $@ $<
 
 qemu-fat: all $(QEMU_ROM) $(BUILD)/LFNTEST.COM

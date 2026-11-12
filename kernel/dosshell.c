@@ -90,8 +90,8 @@ void dos_session_body(struct vm *vm)
     else if (vm->result > 0)
         klog("VMM: EXEC of COMMAND.COM in VM %d failed, DOS error %d\n", vm->id, vm->result);
     else
-        klog("VMM: DOS session in VM %d ended (exit code %u, termination type %u, %u keys)\n",
-             vm->id, code, last_term_type, vm->keys);
+        klog("VMM: DOS session in VM %d ended (exit code %u, termination type %u, %u keys, idled %u times)\n",
+             vm->id, code, last_term_type, vm->keys, vm->idled);
     if (vm->result != 0 || code != 0)
         dosmgr_dump_trace(vm);              /* what DOS saw before it went wrong */
 }

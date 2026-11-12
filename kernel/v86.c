@@ -5,9 +5,10 @@
  * PUSHF, POPF, INT n, IRET) and HLT fault with #GP, and we emulate them.
  * Each VM's interrupt flag is virtual (vm->vif); the real IF stays on so
  * hardware interrupts always reach the kernel. Port I/O is checked against
- * the TSS I/O bitmap: only the PIC (20h/21h/A0h/A1h) and keyboard
- * controller (60h/64h) ports trap, to the per-VM virtual devices, and an
- * IDE channel the VMM drives itself (ata.c) reads as empty.
+ * the TSS I/O bitmap: the PIC (20h/21h/A0h/A1h), keyboard controller
+ * (60h/64h) and timer (40h/43h) ports trap to the per-VM virtual devices,
+ * COM and LPT ports to their owner arbitration (vdev.c), and an IDE
+ * channel the VMM drives itself (ata.c) reads as empty.
  *
  * A kernel V86 call (v86_int) pushes an INT-style frame whose return
  * address is an ARPL instruction in the loader's segment. ARPL is invalid
@@ -17,11 +18,12 @@
  * A VM that executes HLT with nothing to deliver blocks its thread until an
  * interrupt is raised for it, so idle VMs cost nothing.
  *
- * Not yet emulated (the VM is stopped with a message): code that tries to
- * enter protected mode itself (LMSW, MOV CRn, LGDT), e.g. DOS extenders or
- * a real HIMEM's block move. That needs VCPI/DPMI support.
+ * Code that tries to enter protected mode by itself (LMSW, MOV CRn, LGDT)
+ * stops the VM with a message: VMs get DPMI (dpmi.c) and XMS (xms.c) from
+ * the VMM instead, and a DOS extender that sees V86 mode asks for them.
  */
 #include "kernel.h"
+#include "devices.h"
 #include "disk.h"
 #include "fs.h"
 #include "gdt.h"
@@ -32,11 +34,17 @@
 #include "vm.h"
 
 /* The loader's segment, identical in every VM's address space. */
+#define BRK_AREA 64                 /* at the end of the transfer buffer: monitor breakpoints */
 static struct {
     bool     ready;
     uint16_t seg, stub_off, stack_top;
     uint16_t buf_off, buf_size;
+    uint16_t brk_base;
+    v86_brk_fn brk[BRK_MAX];
 } g;
+
+uint16_t v86_brk_off(int n) { return (uint16_t)(g.brk_base + 2 * n); }
+void v86_set_brk(int n, v86_brk_fn fn) { g.brk[n] = fn; }
 
 static inline uint8_t *lin(uint32_t seg, uint32_t off)
 {
@@ -58,6 +66,9 @@ static uint16_t pop16(struct regs *r)
     return v;
 }
 
+void v86_push16(struct regs *r, uint16_t v) { push16(r, v); }
+uint16_t v86_pop16(struct regs *r) { return pop16(r); }
+
 static void push32(struct regs *r, uint32_t v)
 {
     push16(r, (uint16_t)(v >> 16));
@@ -77,11 +88,15 @@ static uint32_t vm_flags(const struct vm *vm, const struct regs *r)
     return f | (vm->vif ? EFLAGS_IF : 0) | vm->vflags;
 }
 
+/* IOPL reads as 3 and can't be changed, as in V86 mode under EMM386: a
+ * program that tries to clear it (the usual test for real mode) learns it
+ * is in V86 mode, and a DOS extender then looks for VCPI or DPMI instead
+ * of switching modes itself. */
 static void set_vm_flags(struct vm *vm, struct regs *r, uint32_t f)
 {
     const uint32_t mask = 0x0DD5;   /* CF PF AF ZF SF TF DF OF */
     vm->vif = f & EFLAGS_IF;
-    vm->vflags = (uint16_t)(f & (EFLAGS_IOPL | EFLAGS_NT));
+    vm->vflags = (uint16_t)((f & EFLAGS_NT) | EFLAGS_IOPL);
     r->eflags = (r->eflags & ~mask) | (f & mask) | EFLAGS_IF | EFLAGS_VM;
 }
 
@@ -103,16 +118,61 @@ static void reflect_int(struct vm *vm, struct regs *r, uint8_t n)
     reflect_int_to(vm, r, n, (uint16_t)r->cs, (uint16_t)r->eip);
 }
 
+uint32_t v86_vm_flags(const struct vm *vm, const struct regs *r) { return vm_flags(vm, r); }
+void v86_set_vm_flags(struct vm *vm, struct regs *r, uint32_t f) { set_vm_flags(vm, r, f); }
+void v86_reflect(struct vm *vm, struct regs *r, uint8_t n) { reflect_int(vm, r, n); }
+
 void v86_deliver(struct regs *r)
 {
     struct vm *vm = vm_current();
     if (!(r->eflags & EFLAGS_VM) || !vm->vif)
         return;
+    if (vm->dpmi) {                             /* its client may have hooked the vector */
+        dpmi_deliver(r);
+        if (!(r->eflags & EFLAGS_VM) || !vm->vif)
+            return;
+    }
     int vec = vpic_ack(&vm->pic);
     if (vec >= 0) {
         vm->delivered[vec]++;
         reflect_int(vm, r, (uint8_t)vec);
+        return;
     }
+    vmouse_deliver(vm, r);                      /* an INT 33h event handler to call? */
+}
+
+/* ---- idle detection ----------------------------------------------------- */
+
+/*
+ * A keyboard poll that found nothing (INT 16h AH=01h/11h, or the
+ * controller's status port). A VM that polls more than set.idle times in
+ * one timer tick is busy-waiting for a key: it sleeps until the next tick
+ * or a key, whichever comes first, and the other VMs get the time.
+ */
+void vm_idle_poll(struct vm *vm)
+{
+    if (!vm->set.idle || vm == system_vm)
+        return;
+    uint32_t t = timer_ticks();
+    if (t != vm->poll_tick) {
+        vm->poll_tick = t;
+        vm->polls = 0;
+    }
+    if (++vm->polls < vm->set.idle)
+        return;
+    vm->polls = 0;
+    uint32_t f = irq_save();
+    if (!vpic_has_deliverable(&vm->pic) && vm->kbd.head == vm->kbd.tail && !vm->kbd.full) {
+        vm->idled++;
+        current->state = T_BLOCKED;         /* the tick, or a key, wakes it */
+        schedule();
+    }
+    irq_restore(f);
+}
+
+static bool kbd_empty(struct vm *vm)
+{
+    return LOWMEM16(0x41A) == LOWMEM16(0x41C) && vm->kbd.head == vm->kbd.tail && !vm->kbd.full;
 }
 
 /* ---- ending a call ----------------------------------------------------- */
@@ -132,6 +192,7 @@ static void crash(struct vm *vm, const struct regs *r, const char *why)
          ((volatile uint32_t *)PD_WINDOW)[0]);
     klog("V86:   VM %d pt0=%08X, DOS depth %d, idle %d\n",
          vm->id, vm->pt0_phys, vm->dos_depth, vm->int28_depth);
+    dosmgr_dump_trace(vm);
     vpic_reset_in_service(&vm->pic);
     vm->dos_depth = 0;
     vm->int28_depth = 0;
@@ -156,16 +217,27 @@ static uint8_t port_in8(struct vm *vm, uint16_t p)
 {
     if (vpic_port(p)) return vpic_in(&vm->pic, p);
     if (vkbd_port(p)) return vkbd_in(vm, p);
+    if (vpit_port(p)) return vpit_in(vm, p);
+    if (vdev_port(p)) return vdev_in(vm, p);
     if (ata_port_owned(p)) return 0xFF;         /* the VMM's disk channel: nothing there */
     return inb(p);
 }
 
 static void port_out8(struct vm *vm, uint16_t p, uint8_t v)
 {
-    if (vpic_port(p))      vpic_out(&vm->pic, p, v);
+    if (vpic_port(p)) {
+        vpic_out(&vm->pic, p, v);
+        if (p & 1)
+            vdev_imr_changed(vm);               /* its devices' IRQs, on the real PIC */
+    }
     else if (vkbd_port(p)) vkbd_out(vm, p, v);
+    else if (vpit_port(p)) vpit_out(vm, p, v);
+    else if (vdev_port(p)) vdev_out(vm, p, v);
     else if (!ata_port_owned(p)) outb(p, v);
 }
+
+uint8_t v86_port_in8(struct vm *vm, uint16_t port) { return port_in8(vm, port); }
+void v86_port_out8(struct vm *vm, uint16_t port, uint8_t v) { port_out8(vm, port, v); }
 
 static uint32_t port_in(struct vm *vm, uint16_t port, int size)
 {
@@ -187,6 +259,8 @@ static void set_acc(struct regs *r, int size, uint32_t v)
     else if (size == 2) r->eax = (r->eax & ~0xFFFFu) | (v & 0xFFFF);
     else                r->eax = v;
 }
+
+static bool mm_breakpoint(struct vm *vm, struct regs *r, uint16_t at);
 
 /* ---- #GP: instruction emulation ---------------------------------------- */
 
@@ -245,13 +319,33 @@ static void emulate(struct vm *vm, struct regs *r)
             r->eip = next;                      /* the redirector answered (redir.c) */
             return;
         }
+        if (vm->dpmi && (n == 0x20 || n == 0x21))
+            dpmi_rm_int(vm, r, n);              /* its client's program ending? */
+        if ((n == 0x2F && (xms_int2f(vm, r) || dpmi_int2f(vm, r))) || (n == 0x15 && xms_int15(vm, r))) {
+            r->eip = next;                      /* XMS and extended memory (xms.c) */
+            return;
+        }
+        if (n == 0x67 && (g_bootinfo->flags & BI_FLAG_VCPI)) {
+            r->eip = next;                      /* the memory manager sleeps: no EMS, no VCPI */
+            r->eax = (r->eax & 0xFFFF00FFu) | 0x8400;
+            return;
+        }
+        if (n == 0x33 && vmouse_int33(vm, r)) {
+            r->eip = next;                      /* the virtual mouse driver (vmouse.c) */
+            return;
+        }
         struct disk *d;
         if (n == 0x13 && (r->edx & 0x80) && (d = ata_bios_disk((uint8_t)r->edx))) {
             r->eip = next;                      /* the VMM's disk: it does the call (int13.c) */
             int13_emulate(d, r);
             return;
         }
-        switch (dosmgr_int(vm, r, n, next)) {
+        uint8_t ah = (uint8_t)(r->eax >> 8);
+        bool empty_poll = n == 0x16 && (ah == 0x01 || ah == 0x11) && kbd_empty(vm);
+        int how = dosmgr_int(vm, r, n, next);
+        if (how != DOSMGR_DONE && empty_poll)
+            vm_idle_poll(vm);                   /* busy-waiting for a key? */
+        switch (how) {
         case DOSMGR_DONE:
             return;
         case DOSMGR_HOOK:                       /* DOS returns to our breakpoint */
@@ -283,6 +377,8 @@ static void emulate(struct vm *vm, struct regs *r)
         return;
     }
     case 0xF4:                                  /* HLT: block until an IRQ */
+        if (mm_breakpoint(vm, r, (uint16_t)(ip - 1)))
+            return;                             /* (a sleeping memory manager's) */
         r->eip = ip;
         if (!vm->vif)
             crash(vm, r, "HLT with interrupts disabled");
@@ -316,6 +412,7 @@ static void log_reflected(struct vm *vm, const struct regs *r)
          "DOS depth %d, idle %d -- reflected\n",
          vm->id, r->int_no, r->cs & 0xFFFF, r->eip & 0xFFFF, c[0], c[1], c[2], c[3],
          r->user_ss & 0xFFFF, r->user_esp & 0xFFFF, vm->dos_depth, vm->int28_depth);
+
 }
 
 void v86_exception(struct regs *r)
@@ -331,6 +428,14 @@ void v86_exception(struct regs *r)
     case 6:                                     /* #UD */
         if ((r->cs & 0xFFFF) == g.seg && (r->eip & 0xFFFF) == g.stub_off)
             complete(vm, r);
+        if ((r->cs & 0xFFFF) == g.seg && (r->eip & 0xFFFF) >= g.brk_base &&
+            (r->eip & 0xFFFF) < (uint32_t)(g.brk_base + 2 * BRK_MAX) && !((r->eip - g.brk_base) & 1)) {
+            int n = (int)((r->eip & 0xFFFF) - g.brk_base) / 2;
+            if (!g.brk[n])
+                crash(vm, r, "monitor breakpoint with no service");
+            g.brk[n](vm, r, n);                 /* an entry point, or a callback's return */
+            break;
+        }
         if ((r->cs & 0xFFFF) == g.seg && (r->eip & 0xFFFF) == (uint16_t)(g.stub_off + 2)) {
             if (!dosmgr_return(vm, r))          /* a DOS call returned */
                 crash(vm, r, "unexpected return from DOS");
@@ -353,6 +458,132 @@ void v86_exception(struct regs *r)
     v86_deliver(r);
 }
 
+/* ---- under a memory manager (VCPI) ----------------------------------------- */
+
+/*
+ * EMM386-style memory managers hook interrupts with real-mode stubs that
+ * are rows of HLT instructions: breakpoints into their own monitor, asleep
+ * while OS1993 runs. Such a vector goes back to the BIOS's fixed entry
+ * point for it (every PC BIOS keeps them, for compatibility) for as long
+ * as OS1993 runs, and the memory manager's comes back at the end. VDS
+ * (INT 4Bh) is the memory manager's alone: its flag in the BIOS data area
+ * goes off.
+ */
+static uint32_t mm_saved[256];
+static bool mm_unhooked;
+static uint16_t mm_seg;                     /* the memory manager's real-mode segment */
+static uint16_t mm_bios[256];               /* its breakpoint at offset n -> a BIOS entry (F000:x) */
+
+static void vcpi_unhook(void)
+{
+    uint16_t mm = LOWMEM16(0x67 * 4 + 2);
+    if (!mm)
+        return;
+    static const struct { uint8_t vec; uint16_t off; } bios[] = {
+        { 0x13, 0xEC59 }, { 0x40, 0xEC59 }, { 0x15, 0xF859 }, { 0x19, 0xE6F2 }, { 0x4B, 0xFF53 },
+    };
+    for (unsigned v = 0; v < 256; v++) {
+        if (LOWMEM16(v * 4 + 2) != mm || v == 0x67)
+            continue;
+        mm_saved[v] = LOWMEM32(v * 4);
+        unsigned i = 0;
+        while (i < ARRAY_SIZE(bios) && bios[i].vec != v) i++;
+        if (i < ARRAY_SIZE(bios)) {
+            if ((mm_saved[v] & 0xFFFF) < 256)
+                mm_bios[mm_saved[v] & 0xFFFF] = bios[i].off;
+            LOWMEM16(v * 4) = bios[i].off;
+            LOWMEM16(v * 4 + 2) = 0xF000;
+            klog("V86: INT %02Xh: the memory manager's (%04X:%04X) -> the BIOS's, F000:%04X\n",
+                 v, mm, mm_saved[v] & 0xFFFF, bios[i].off);
+        } else {
+            klog("V86: INT %02Xh stays the memory manager's (%04X:%04X)\n", v, mm, mm_saved[v] & 0xFFFF);
+            mm_saved[v] = 0;
+        }
+    }
+    LOWMEM8(0x47B) &= (uint8_t)~0x20;           /* no VDS */
+    mm_seg = mm;
+    mm_unhooked = true;
+}
+
+/*
+ * V86 code ran into one of the memory manager's HLT breakpoints anyway --
+ * through a pointer saved before we moved the vectors, or through the XMS
+ * entry point, which EMM386-style managers hook to emulate A20. An
+ * interrupt's breakpoint goes on to the BIOS (the INT frame is already on
+ * the stack); anything else is taken for the XMS hook: A20 is always on
+ * under OS1993, so its calls succeed, and the rest are refused.
+ */
+static bool mm_breakpoint(struct vm *vm, struct regs *r, uint16_t at)
+{
+    if (!mm_seg || (uint16_t)r->cs != mm_seg || at >= 256)
+        return false;
+    if (mm_bios[at]) {
+        r->cs = 0xF000;
+        r->eip = mm_bios[at];
+        return true;
+    }
+    uint8_t ah = (uint8_t)(r->eax >> 8);
+    static bool told;
+    if (!told) {
+        told = true;
+        klog("V86: VM %d: the memory manager's breakpoint at %04X:%04X, AH=%02X: taken for its XMS hook\n",
+             vm->id, mm_seg, at, ah);
+    }
+    if (ah >= 0x03 && ah <= 0x07) {             /* A20: on, always */
+        r->eax = (r->eax & 0xFFFF0000u) | 1;
+        r->ebx &= ~0xFFu;
+    } else {
+        r->eax &= 0xFFFF0000u;
+        r->ebx = (r->ebx & ~0xFFu) | 0x80;      /* not implemented */
+    }
+    r->eip = pop16(r);                          /* RETF */
+    r->cs = pop16(r);
+    return true;
+}
+
+/* DOS's own pointer to the disk handler (INT 2Fh AH=13h), which the memory
+ * manager hooked for its DMA buffers: to the original while OS1993 runs. */
+static uint16_t dos13_seg, dos13_off, dos13_hseg, dos13_hoff;
+
+void v86_vcpi_dos_unhook(void)
+{
+    uint16_t mm = LOWMEM16(0x67 * 4 + 2);
+    if (!mm_unhooked || !mm)
+        return;
+    struct v86_regs r = { .eax = 0x1300 };          /* DS:DX = 0:0 for a moment ... */
+    if (v86_int(0x2F, &r) != 0)
+        return;
+    uint16_t ds = r.ds, dx = (uint16_t)r.edx, es = r.es, bx = (uint16_t)r.ebx;
+    if (ds == mm && es) {                           /* ... the memory manager's: the original */
+        dos13_seg = ds; dos13_off = dx; dos13_hseg = es; dos13_hoff = bx;
+        r = (struct v86_regs){ .eax = 0x1300, .ds = es, .edx = bx, .es = es, .ebx = bx };
+        klog("V86: DOS's disk handler: the memory manager's (%04X:%04X) -> %04X:%04X\n", ds, dx, es, bx);
+    } else {                                        /* someone else's: put it back */
+        r = (struct v86_regs){ .eax = 0x1300, .ds = ds, .edx = dx, .es = es, .ebx = bx };
+    }
+    v86_int(0x2F, &r);
+}
+
+void v86_vcpi_dos_rehook(void)
+{
+    if (!dos13_seg || vm_current() != system_vm)
+        return;
+    struct v86_regs r = { .eax = 0x1300, .ds = dos13_seg, .edx = dos13_off, .es = dos13_hseg, .ebx = dos13_hoff };
+    v86_int(0x2F, &r);
+    dos13_seg = 0;
+}
+
+/* At the end, with the System VM's own IVT live again. */
+void v86_vcpi_rehook(void)
+{
+    if (!mm_unhooked)
+        return;
+    for (unsigned v = 0; v < 256; v++)
+        if (mm_saved[v])
+            LOWMEM32(v * 4) = mm_saved[v];
+    LOWMEM8(0x47B) |= 0x20;
+}
+
 /* ---- public API -------------------------------------------------------- */
 
 void v86_init(const struct bootinfo *bi)
@@ -362,6 +593,12 @@ void v86_init(const struct bootinfo *bi)
     g.stack_top = bi->v86_stack_top;
     g.buf_off   = bi->buf_off;
     g.buf_size  = bi->buf_size;
+    g.brk_base  = (uint16_t)(g.buf_off + g.buf_size - BRK_AREA);
+    for (int i = 0; i < BRK_MAX; i++) {         /* ARPLs: the System VM's copy, then every VM's */
+        uint8_t *b = lin(g.seg, v86_brk_off(i));
+        b[0] = 0x63;
+        b[1] = 0xC0;
+    }
 
     /* Let ring 3 (V86) code reach the first 1 MB + HMA; the kernel's own
      * pages stay supervisor-only, so a VM can't touch them. */
@@ -369,14 +606,22 @@ void v86_init(const struct bootinfo *bi)
     volatile uint32_t *pde = (volatile uint32_t *)PD_WINDOW;
     for (unsigned i = 0; i < VM_V86_PAGES; i++)
         pte[i] |= PTE_U;
+    for (unsigned i = VM_V86_PAGES; i < 1024; i++)
+        pte[i] &= ~PTE_U;                       /* (a VCPI server's own pages, up here) */
     pde[0] |= PTE_U;
     tlb_flush();
 
     /* Virtualized ports; everything else goes straight to the hardware. */
-    static const uint16_t trapped[] = { 0x20, 0x21, 0xA0, 0xA1, 0x60, 0x64 };
+    static const uint16_t trapped[] = { 0x20, 0x21, 0xA0, 0xA1, 0x60, 0x64, 0x40, 0x43 };
     for (unsigned i = 0; i < ARRAY_SIZE(trapped); i++)
         tss_trap_port(trapped[i], true);
+    vdev_init();                                /* COM and LPT: one owner each */
+    vmouse_init();
+    xms_init();
+    dpmi_init();
 
+    if (bi->flags & BI_FLAG_VCPI)
+        vcpi_unhook();                          /* the memory manager's HLT stubs */
     vm_system_init(bi);
 
     /* IRQs DOS had enabled now reach the VMs through the virtual PICs. */
@@ -408,7 +653,7 @@ static int run(struct v86_regs *r, uint16_t cs, uint16_t ip, unsigned frame_word
 
     vm->out = r;
     vm->vif = vif;
-    vm->vflags = 0;
+    vm->vflags = EFLAGS_IOPL;
     vm->error[0] = '\0';
     vm->active = true;
     int rc = v86_enter(&f, &vm->kernel_esp);
@@ -442,4 +687,4 @@ const char *v86_last_error(void)      { return vm_current()->error; }
 uint32_t v86_delivered(uint8_t vec)   { return vm_current()->delivered[vec]; }
 uint16_t v86_buf_seg(void)  { return g.seg; }
 uint16_t v86_buf_off(void)  { return g.buf_off; }
-uint16_t v86_buf_size(void) { return g.buf_size; }
+uint16_t v86_buf_size(void) { return (uint16_t)(g.buf_size - BRK_AREA); }

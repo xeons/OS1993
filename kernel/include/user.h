@@ -95,6 +95,27 @@ struct user_info {                      /* at USER_INFO, pointed to by EBX */
     char     args[ARGS_MAX];            /* command line arguments */
 };
 
+/* What a DOS session may have, like a PIF file's settings (SYS_NEW_SESSION;
+ * kernel/vmset.c reads OS1993.INI [DOS] for them otherwise). */
+#define VMDEV_COM1  0x01
+#define VMDEV_COM2  0x02
+#define VMDEV_COM3  0x04
+#define VMDEV_COM4  0x08
+#define VMDEV_LPT1  0x10
+#define VMDEV_LPT2  0x20
+#define VMDEV_LPT3  0x40
+#define VMDEV_ALL   0x7F
+
+struct vm_settings {
+    uint16_t mem_kb;            /* conventional memory it may use (0: all there is) */
+    uint16_t xms_kb;            /* XMS (extended memory) */
+    uint16_t dpmi_kb;           /* DPMI memory for protected-mode programs */
+    uint8_t  devices;           /* VMDEV_*: ports it may own */
+    uint8_t  idle;              /* empty keyboard polls per tick before it is idled (0: never) */
+    uint8_t  mouse;             /* INT 33h */
+    uint8_t  reserved[3];
+};
+
 /* Local time from the real-time clock (SYS_TIME); fields as in SYSTEMTIME */
 struct systime {
     uint16_t year, month, day_of_week, day;
@@ -125,7 +146,8 @@ struct user_event {
 #define SYS_YIELD       3
 #define SYS_WAIT_TICK   4               /* sleep until the next timer tick */
 #define SYS_GET_KEY     5               /* -> scancode, or -1 */
-#define SYS_NEW_SESSION 6               /* start a DOS session -> VM id, or -1 */
+#define SYS_NEW_SESSION 6               /* start a DOS session -> VM id, or -1;
+                                           EBX = struct vm_settings *, or 0 (OS1993.INI's) */
 #define SYS_GET_EVENT   7               /* EBX = struct user_event * -> 1, or 0 */
 #define SYS_MOUSE       8               /* -> 1 if there is a mouse */
 #define SYS_EXEC        9               /* EBX = program, ECX = args -> pid, or -1 */
@@ -403,7 +425,13 @@ bool user_range_ok(uint32_t p, uint32_t len);       /* mapped user memory? */
 bool user_writable(uint32_t p, uint32_t len);       /* ... that the kernel may write */
 bool user_string(uint32_t p, char *out, size_t size);  /* copy in a string */
 struct process;
-void proc_switch(struct process *p);    /* scheduler: install its address space */
+void proc_switch(struct process *p);
+void proc_uninstall(void);
+uint32_t user_proc_pde(int i, uint32_t n);    /* pager.c */
+bool user_proc_installed(int i);
+bool user_proc_swappable(int i);              /* no process's user PDEs (a DPMI client runs) */
+void user_dbg_list(void (*out)(const char *, ...));     /* kdbg.c */
+void user_dbg_memory(void (*out)(const char *, ...));    /* scheduler: install its address space */
 
 /* Start a ring-3 session with its first process (the shell), loaded from
  * the directory VMM.BIN came from. Returns 0, or -1 if it couldn't be

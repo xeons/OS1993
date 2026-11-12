@@ -32,7 +32,8 @@ IMG = os.path.join(BUILD, "freedos.img")
 
 KEYS = {" ": "spc", "\n": "ret", ".": "dot", ",": "comma", "-": "minus", "/": "slash",
         "\t": "tab", "=": "equal", "+": "shift-equal", "*": "shift-8", "%": "shift-5", "@": "shift-2",
-        "\\": "backslash", ":": "shift-semicolon", ">": "shift-dot", "~": "shift-grave_accent"}
+        "\\": "backslash", ":": "shift-semicolon", ">": "shift-dot", "~": "shift-grave_accent",
+        "[": "bracket_left", "]": "bracket_right"}
 
 
 def near(rgb, want, tol=4):
@@ -94,7 +95,10 @@ class Checker:
 
 
 class Machine:
-    def __init__(self, variant="normal", mode="autorun", vmport=False, hostfwd=(), data_disk=None, files=None, data_index=2, big_disk=None):
+    def __init__(self, variant="normal", mode="autorun", vmport=False, hostfwd=(), data_disk=None, files=None, data_index=2, big_disk=None, serial_sock=False, extra=(), binaries=None):
+        self.binaries = binaries or {}              # {name: host path} for C:\OS1993
+        self.serial_sock = serial_sock              # COM1 both ways (the kernel debugger)
+        self.extra = list(extra)                    # more QEMU arguments
         self.variant, self.mode, self.vmport = variant, mode, vmport
         self.hostfwd = hostfwd                      # e.g. ("tcp:127.0.0.1:5555-:7",)
         self.data_disk = data_disk                  # an image for another IDE position
@@ -113,7 +117,10 @@ class Machine:
                 f.write(text)
             subprocess.run(["mcopy", "-o", "-i", IMG + "@@32256", path, "::/OS1993/" + name], check=True,
                            env=dict(os.environ, MTOOLS_SKIP_CHECK="1"))
-        for f in ("monitor.sock", "qmp.sock", "SERIAL.LOG"):
+        for name, path in self.binaries.items():
+            subprocess.run(["mcopy", "-o", "-i", IMG + "@@32256", path, "::/OS1993/" + name], check=True,
+                           env=dict(os.environ, MTOOLS_SKIP_CHECK="1"))
+        for f in ("monitor.sock", "qmp.sock", "SERIAL.LOG", "serial.sock"):
             if os.path.exists(f):
                 os.unlink(f)
         rom = vga_rom_dir()
@@ -122,7 +129,10 @@ class Machine:
             # PS/2 path that mouse_move can drive.
             "qemu-system-i386", "-M", "isapc,vmport=on" if self.vmport else "isapc,vmport=off",
             "-cpu", "486", "-m", "16", "-vga", "std", "-L", rom, "-L", "/usr/share/qemu",
-            "-drive", f"file={IMG},format=raw,if=ide,index=0", "-serial", "file:SERIAL.LOG",
+            "-drive", f"file={IMG},format=raw,if=ide,index=0",
+            *(["-chardev", "socket,id=com1,path=serial.sock,server=on,wait=off,logfile=SERIAL.LOG",
+               "-serial", "chardev:com1"] if self.serial_sock else ["-serial", "file:SERIAL.LOG"]),
+            *self.extra,
             *(["-drive", f"file={self.data_disk},format=raw,if=ide,index={self.data_index}"] if self.data_disk else []),
             *(["-drive", f"file={self.big_disk},format=raw,if=ide,index=3"] if self.big_disk else []),
             # an NE2000 on QEMU's user-mode network: DHCP, gateway 10.0.2.2 (the host)
@@ -144,6 +154,23 @@ class Machine:
                 break
             except OSError:
                 time.sleep(0.1)
+        if self.serial_sock:
+            self.ser = socket.socket(socket.AF_UNIX)
+            for _ in range(50):
+                try:
+                    self.ser.connect("serial.sock")
+                    break
+                except OSError:
+                    time.sleep(0.1)
+            import threading
+
+            def drain():                            # what QEMU sends is in the logfile
+                try:
+                    while self.ser.recv(4096):
+                        pass
+                except OSError:
+                    pass
+            threading.Thread(target=drain, daemon=True).start()
         self.qmp_file = self.qmp.makefile("rw")
         self.qmp_file.readline()                    # greeting
         self.qmp_cmd({"execute": "qmp_capabilities"})
@@ -175,6 +202,11 @@ class Machine:
         if self.qemu.poll() is None:
             self.qemu.kill()
         return False
+
+    # COM1 input (serial_sock=True); what the guest sends lands in SERIAL.LOG.
+    def serial_send(self, text, pause=0.3):
+        self.ser.sendall(text.encode())
+        time.sleep(pause)
 
     def cmd(self, c, pause=0.25):
         self.mon.sendall((c + "\n").encode())
@@ -272,6 +304,19 @@ class Machine:
                 return read_ppm(path)
             time.sleep(0.1)
         raise RuntimeError(f"no screendump {name}")
+
+    # A file from C:\OS1993 on the disk image, after the run.
+    def fetch(self, name):
+        out = os.path.join(QDIR, name)
+        if os.path.exists(out):
+            os.unlink(out)
+        subprocess.run(["mcopy", "-n", "-o", "-i", IMG + "@@32256", "::/OS1993/" + name, out],
+                       env=dict(os.environ, MTOOLS_SKIP_CHECK="1"), capture_output=True)
+        try:
+            with open(out, errors="replace") as f:
+                return f.read()
+        except FileNotFoundError:
+            return ""
 
     def wait_exit(self, timeout=20):
         try:

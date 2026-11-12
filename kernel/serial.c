@@ -45,3 +45,13 @@ void serial_puts(const char *s)
     while (*s)
         serial_putc(*s++);
 }
+
+bool serial_present(void) { return present; }
+
+/* A byte from COM1, or -1 if none has arrived. */
+int serial_getc(void)
+{
+    if (!present || !(inb(COM1 + 5) & 0x01))
+        return -1;
+    return inb(COM1);
+}

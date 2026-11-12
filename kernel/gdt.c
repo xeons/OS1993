@@ -6,12 +6,18 @@
  *   0x18  TSS: ESP0 for traps out of V86 mode and ring 3, I/O permission bitmap
  *   0x20  ring 3 code, flat  (selector 0x23 with RPL 3)
  *   0x28  ring 3 data, flat  (selector 0x2B)
+ *   0x30  ring 3 data at the running thread's TIB (FS, selector 0x33)
+ *   0x38  the double-fault TSS: a task of its own, with its own stack, so a
+ *         kernel stack overflow (which faults again pushing the #PF frame)
+ *         still reaches a handler
+ *   0x40  the LDT of the running DPMI client (dpmi.c)
  *
  * Ring-3 segments cover all 4 GB; paging keeps user code out of kernel pages.
  */
 #include "gdt.h"
 #include "mm.h"
 #include "kernel.h"
+#include "io.h"
 
 struct gdt_entry {
     uint16_t limit_lo;
@@ -22,8 +28,18 @@ struct gdt_entry {
     uint8_t  base_hi;
 } __attribute__((packed));
 
-static struct gdt_entry gdt[7];
+static struct gdt_entry gdt[9];
 struct tss kernel_tss;
+
+/* The double-fault task: no I/O bitmap, its own stack. */
+static struct {
+    uint32_t link, esp0, ss0, esp1, ss1, esp2, ss2;
+    uint32_t cr3, eip, eflags, eax, ecx, edx, ebx, esp, ebp, esi, edi;
+    uint32_t es, cs, ss, ds, fs, gs, ldt;
+    uint16_t trap, iomap_base;
+} df_tss;
+static uint8_t df_stack[8192] __attribute__((aligned(16)));
+extern void double_fault_entry(void);       /* isr.asm */
 
 static void gdt_set(int i, uint32_t base, uint32_t limit, uint8_t access, uint8_t flags)
 {
@@ -52,6 +68,15 @@ void gdt_init(void)
     gdt_set(TSS_SEL >> 3, (uint32_t)(uintptr_t)&kernel_tss, sizeof kernel_tss - 1,
             0x89, 0x00);                                /* available 386 TSS */
 
+    df_tss.cr3 = read_cr3();
+    df_tss.eip = (uint32_t)(uintptr_t)double_fault_entry;
+    df_tss.eflags = 0x2;                                /* interrupts off */
+    df_tss.esp = df_tss.esp0 = (uint32_t)(uintptr_t)(df_stack + sizeof df_stack);
+    df_tss.cs = KCODE_SEL;
+    df_tss.ss = df_tss.ss0 = df_tss.ds = df_tss.es = df_tss.fs = df_tss.gs = KDATA_SEL;
+    df_tss.iomap_base = sizeof df_tss;                  /* none */
+    gdt_set(DFTSS_SEL >> 3, (uint32_t)(uintptr_t)&df_tss, sizeof df_tss - 1, 0x89, 0x00);
+
     static struct dtr gdtr;
     gdtr.limit = sizeof gdt - 1;
     gdtr.base  = (uint32_t)(uintptr_t)gdt;
@@ -65,6 +90,13 @@ void gdt_init(void)
 void gdt_set_tls(uint32_t base)
 {
     gdt_set(UTLS_SEL >> 3, base, PAGE_SIZE - 1, 0xF2, 0x40);
+}
+
+/* The LDT descriptor (a DPMI client's LDT, or none). */
+void gdt_set_ldt(uint32_t base, uint32_t limit)
+{
+    if (limit) gdt_set(LDT_SEL >> 3, base, limit, 0x82, 0x00);
+    else       gdt_set(LDT_SEL >> 3, 0, 0, 0, 0);
 }
 
 void tss_trap_port(uint16_t port, bool trap)

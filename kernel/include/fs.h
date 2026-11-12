@@ -55,6 +55,7 @@ struct fs_find {                        /* a search in progress */
 
 void fs_lock(void);
 void fs_unlock(void);
+bool fs_locked_by_me(void);             /* the running thread holds the file system */
 
 void fs_init(void);                     /* probe, mount, letters (before the VM snapshot) */
 void fs_shutdown(void);                 /* write everything back; disks back to the BIOS */

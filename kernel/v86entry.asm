@@ -45,7 +45,9 @@ v86_enter:
         cli
         mov     edx, [esp + 28]
         mov     [edx], esp              ; this VM's saved kernel state
-        mov     [kernel_tss + 4], esp   ; TSS.ESP0: traps from V86 land here
+        lea     ecx, [esp - 16]         ; TSS.ESP0: traps from V86 land here, 16 bytes
+        mov     [kernel_tss + 4], ecx   ; lower: a ring-3 (DPMI) frame then has room to
+                                        ; become a V86 one in place (dpmi.c)
         mov     eax, [esp + 24]
         push    dword [eax + F_GS]      ; V86 IRET frame
         push    dword [eax + F_FS]

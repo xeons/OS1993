@@ -5,7 +5,7 @@
 #include "kernel.h"
 #include "mm.h"
 
-#define TEST_VA  0xE0000000u
+#define TEST_VA  0xF0000000u
 #define NFRAMES  64
 #define NALLOCS  200
 

@@ -30,6 +30,7 @@
 #include <stdint.h>
 
 #include "bootinfo.h"
+#include "user.h"
 
 #define VM_MAX          8
 #define VM_LOW_PAGES    0xA0        /* conventional memory ends at 640 KB */
@@ -63,7 +64,55 @@ struct vkbd {
     bool    full;               /* status bit 0: output buffer full */
 };
 
+/* Virtual 8253 channel 0 (vpit.c) */
+struct vpit {
+    uint32_t div;               /* reload value: 1..65536 */
+    uint32_t acc;               /* PIT clocks since its last IRQ 0 */
+    uint32_t start;             /* PIT clock when the count was loaded */
+    uint16_t latch;
+    uint8_t  access, mode;      /* 1 lo, 2 hi, 3 lo/hi; counting mode 0-5 */
+    uint8_t  low, status;
+    bool     write_hi, latched, latch_hi, status_latched;
+};
+
+/* Virtual mouse (vmouse.c): the INT 33h driver's state */
+struct vmouse_saved {
+    uint32_t eax, ebx, ecx, edx, esi, edi, ebp;
+    uint32_t ds, es, cs, eip, ss, esp, flags;
+};
+struct vmouse {
+    bool     reset, in_handler;
+    int8_t   shown;                 /* 0: visible, below: hidden */
+    uint8_t  buttons;
+    int16_t  x, y, min_x, max_x, min_y, max_y;
+    int16_t  mick_x, mick_y, ratio_x, ratio_y;
+    int      frac_x, frac_y;
+    uint16_t press[3], release[3];
+    int16_t  press_x[3], press_y[3], release_x[3], release_y[3];
+    uint16_t screen_mask, cursor_mask;
+    uint16_t mask, pending;         /* events the handler wants, and those due */
+    uint32_t handler;               /* seg:off */
+    int32_t  saved_cell;            /* under the cursor, or -1 */
+    uint16_t drawn;
+    uint32_t saved_ptr;             /* its VM address */
+    struct vmouse_saved saved;      /* the VM while its handler runs */
+};
+
+/* A VM's extended memory window (vmx.c): XMS blocks and DPMI memory */
+#define VMX_BASE    0xE0000000u
+#define VMX_SIZE    0x04000000u     /* 64 MB */
+#define VMX_PDES    (VMX_SIZE >> 22)
+#define VMX_BLOCKS  64
+#define VMX_XMS     0
+#define VMX_DPMI    1
+struct vmx_block {
+    uint32_t base, size;            /* size 0: a free slot */
+    uint8_t  owner, locks;
+};
+
 enum vm_state { VM_FREE, VM_READY, VM_RUNNING, VM_FINISHED };
+
+/* struct vm_settings and VMDEV_*: user.h (the GUI passes them too) */
 
 /* A DOS call in progress (dosmgr.c) */
 struct dos_call {
@@ -94,12 +143,27 @@ struct vm {
 
     struct vpic   pic;
     struct vkbd   kbd;
+    struct vpit   pit;
+    struct vmouse mouse;
+
+    /* Extended memory (vmx.c) and its XMS handles (xms.c) */
+    struct vmx_block vmx[VMX_BLOCKS];
+    uint32_t      vmx_pt[VMX_PDES];         /* page tables of the window */
+    int           vmx_pts;
+    uint32_t      xms_handle[32];           /* handle n+1 -> block address (0: free) */
+    struct dpmi  *dpmi;                     /* its DPMI client (dpmi.c), or NULL */
 
     /* DOS critical section (dosmgr.c) */
     struct dos_call dos[VM_DOS_NEST];
     int           dos_depth;
     int           int28_depth;              /* idling inside DOS */
     uint32_t      keys;                     /* scancodes delivered */
+    struct vm_settings set;
+
+    /* Idle detection: keyboard polls that found nothing, this tick */
+    uint32_t      poll_tick;
+    uint16_t      polls;
+    uint32_t      idled;                    /* times it was put to sleep for polling */
     struct { uint16_t ax, bx, cx, dx, ret_ax, ret_fl, cs, ip; uint32_t tick; } trace[48];
     unsigned      trace_n;                  /* DOS call trace (debugging) */
 
@@ -111,11 +175,14 @@ struct vm {
 };
 
 extern struct vm *const system_vm;
+extern struct vm_settings vm_defaults;
 
 void vm_system_init(const struct bootinfo *bi);   /* the System VM */
 bool vm_add_instance(uint32_t linear, uint32_t len);
 void vm_finish_init(void);                  /* snapshot; VMs can be created */
 struct vm *vm_create(const char *name, void (*body)(struct vm *), void *arg);
+struct vm *vm_create_with(const char *name, void (*body)(struct vm *), void *arg,
+                          const struct vm_settings *set);
 void vm_start(struct vm *vm);
 void vm_reap(void);                         /* free finished VMs */
 int  vm_count(void);                        /* DOS VMs, excluding the System VM */
@@ -132,7 +199,7 @@ void vm_focus_next(void);
 /* Interrupt routing */
 void vm_raise_irq(struct vm *vm, unsigned irq);
 void vm_hw_irq(unsigned irq);               /* a VM-owned hardware IRQ fired */
-bool vm_timer_tick(void);                   /* false before VMs exist */
+bool vm_timer_irq(uint32_t clocks, bool tick);  /* false before VMs exist */
 
 void vm_restore_dos(void);                  /* undo everything before exit */
 void vm_check(const char *where);           /* panic on state mismatch */
@@ -172,6 +239,7 @@ bool dosmgr_is_dos_int(uint8_t vec, uint8_t ah);
 bool dosmgr_busy_for(struct vm *vm);        /* another VM is inside DOS */
 bool dosmgr_holds(struct vm *vm);
 uint16_t dosmgr_current_psp(struct vm *vm);
+uint16_t dosmgr_first_mcb(void);
 uint32_t dosmgr_waits(void);
 void dosmgr_dump_trace(struct vm *vm);
 
@@ -181,5 +249,74 @@ bool vkbd_port(uint16_t port);
 uint8_t vkbd_in(struct vm *vm, uint16_t port);
 void vkbd_out(struct vm *vm, uint16_t port, uint8_t val);
 void keyboard_forward(struct vm *vm);       /* console type-ahead to a VM */
+
+/* vpit.c: each VM's timer channel 0 */
+void     vpit_init(struct vpit *p);
+uint32_t vpit_real_div(void);
+void     vpit_period(void);
+uint32_t vpit_clock(void);
+void     vpit_vm_gone(void);
+void     vpit_shutdown(void);
+bool     vpit_port(uint16_t port);
+uint8_t  vpit_in(struct vm *vm, uint16_t port);
+void     vpit_out(struct vm *vm, uint16_t port, uint8_t v);
+unsigned vpit_due(struct vpit *p, uint32_t clocks);
+
+/* vdev.c: serial and printer ports, one owner each */
+void     vdev_init(void);
+bool     vdev_port(uint16_t port);
+uint8_t  vdev_in(struct vm *vm, uint16_t port);
+void     vdev_out(struct vm *vm, uint16_t port, uint8_t v);
+void     vdev_switch(struct vm *vm);
+void     vdev_imr_changed(struct vm *vm);
+struct vm *vdev_irq_owner(unsigned irq);
+void     vdev_vm_gone(struct vm *vm);
+
+/* vmouse.c: INT 33h for DOS sessions */
+struct regs;
+void vmouse_init(void);
+bool vmouse_int33(struct vm *vm, struct regs *r);
+void vmouse_input(struct vm *vm, int dx, int dy, bool abs, uint8_t buttons);
+void vmouse_deliver(struct vm *vm, struct regs *r);
+void vmouse_focus(struct vm *vm, bool on);
+
+/* vmx.c: the extended memory window */
+void     vmx_install(struct vm *vm);
+uint32_t vmx_alloc(struct vm *vm, uint32_t size, int owner);
+bool     vmx_free(struct vm *vm, uint32_t lin);
+uint32_t vmx_size(struct vm *vm, uint32_t lin);
+uint32_t vmx_resize(struct vm *vm, uint32_t lin, uint32_t size);
+int      vmx_lock(struct vm *vm, uint32_t lin, int delta);
+uint32_t vmx_used(struct vm *vm, int owner);
+uint32_t vmx_avail(struct vm *vm, int owner);
+void    *vmx_ptr(struct vm *vm, uint32_t lin, uint32_t len);
+void     vmx_vm_gone(struct vm *vm);
+
+/* xms.c: XMS and INT 15h for DOS sessions */
+void xms_init(void);
+bool xms_int2f(struct vm *vm, struct regs *r);
+bool xms_int15(struct vm *vm, struct regs *r);
+
+/* vmset.c: per-VM settings */
+void vmset_load(struct vm_settings *s);     /* OS1993.INI [DOS], over vm_defaults */
+bool vmset_valid(const struct vm_settings *s);
+void vmset_apply_memory(struct vm *vm);     /* the conventional memory limit */
+int  vmset_ini_int(const char *section, const char *key, int def);
+
+/* dpmi.c: the DPMI host */
+void dpmi_init(void);
+bool dpmi_int2f(struct vm *vm, struct regs *r);
+void dpmi_rm_int(struct vm *vm, struct regs *r, uint8_t n);
+void dpmi_trap(struct regs *r);
+void dpmi_deliver(struct regs *r);
+void dpmi_espfix(struct regs *r);
+bool dpmi_client(struct vm *vm);
+void dpmi_install_ldt(struct vm *vm);
+void dpmi_vm_gone(struct vm *vm);
+
+/* v86.c */
+uint8_t v86_port_in8(struct vm *vm, uint16_t port);
+void    v86_port_out8(struct vm *vm, uint16_t port, uint8_t v);
+void vm_idle_poll(struct vm *vm);           /* a keyboard poll found nothing */
 
 #endif

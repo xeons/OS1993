@@ -33,7 +33,7 @@ def ended(m, n):
 
 
 def main():
-    with Machine() as m:
+    with Machine(files={"OS1993.INI": "[386Enh]\nSwapFile=12288\n"}) as m:
         if not m.wait_log("PS/2 mouse"):
             raise SystemExit("  FAIL  VMM did not boot")
         check(m.start_gui(), "the shell started")
@@ -76,6 +76,16 @@ def main():
         log = m.log()
         check("USER: THRTEST.BIN exited with code 9" in log and "THR: the first thread went on" not in log,
               "exit() in a second thread ends the whole process")
+
+        # demand paging: 16 MB committed on a 16 MB machine, through a 12 MB swap file
+        check("PAGER: swap file C:\\OS1993\\WIN386.SWP" in m.log(), "a swap file next to VMM.BIN")
+        run(m, "thrtest.bin swap 16")
+        ended(m, n + 5)
+        log = m.log()
+        check("THR: swap: 16 MB written and read back twice, 0 bad pages" in log and
+              "USER: THRTEST.BIN exited with code 0" in log, "16 MB committed on a 16 MB machine, written and read back twice")
+        check("PAGER: memory is short: writing pages to the swap file" in log and
+              "PAGER: reading pages back from the swap file" in log, "... through the swap file")
 
         for k in ("ctrl-esc", "p", "c"):
             m.key(k)

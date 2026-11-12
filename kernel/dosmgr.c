@@ -34,6 +34,7 @@
 
 static struct {
     bool     on;
+    uint16_t first_mcb;             /* the start of DOS's memory chain */
     uint32_t sda;                   /* linear address of the SDA */
     uint32_t waits;                 /* times a VM had to wait for DOS */
 } dm;
@@ -46,6 +47,7 @@ static uint32_t far_lin(uint16_t seg, uint16_t off)
 }
 
 bool dosmgr_enabled(void) { return dm.on; }
+uint16_t dosmgr_first_mcb(void) { return dm.first_mcb; }
 
 uint16_t dosmgr_current_psp(struct vm *vm)
 {
@@ -337,6 +339,7 @@ void dosmgr_init(void)
     r = (struct v86_regs){ .eax = 0x5200 };     /* List of Lists */
     call21(&r);
     uint32_t lol = far_lin(r.es, (uint16_t)r.ebx);
+    dm.first_mcb = *(uint16_t *)vm_ptr(system_vm, lol - 2);
     uint16_t cds_off = *(uint16_t *)vm_ptr(system_vm, lol + 0x16);
     uint16_t cds_seg = *(uint16_t *)vm_ptr(system_vm, lol + 0x18);
     uint8_t lastdrive = *(uint8_t *)vm_ptr(system_vm, lol + 0x21);

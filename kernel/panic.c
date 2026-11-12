@@ -7,6 +7,9 @@
 #include "interrupts.h"
 #include "io.h"
 #include "vga.h"
+#include "gdt.h"
+#include "sched.h"
+#include "kdbg.h"
 
 static const char *const exc_names[32] = {
     "Divide Error", "Debug", "NMI", "Breakpoint", "Overflow",
@@ -44,6 +47,8 @@ static void fatal_end(void)
 
 void panic_exception(const struct regs *r)
 {
+    kdbg_set_fault_regs(r);
+    kdbg_panic("a fatal exception in the VMM");
     fatal_begin();
     const char *name = r->int_no < 32 && exc_names[r->int_no]
                      ? exc_names[r->int_no] : "Unknown";
@@ -66,6 +71,31 @@ void panic_exception(const struct regs *r)
     fatal_end();
 }
 
+/* The double-fault task (isr.asm): the state that faulted is in
+ * kernel_tss. A fault on a guard page is a kernel stack overflow. */
+__attribute__((noreturn))
+void double_fault(void)
+{
+    uint32_t cr2 = read_cr2();
+    struct thread *t = thread_of_guard(kernel_tss.esp);
+    if (!t) t = thread_of_guard(cr2);
+    klog("*** double fault at %04X:%08X ESP=%08X CR2=%08X\n",
+         kernel_tss.cs & 0xFFFF, kernel_tss.eip, kernel_tss.esp, cr2);
+    struct regs r = {
+        .eax = kernel_tss.eax, .ebx = kernel_tss.ebx, .ecx = kernel_tss.ecx, .edx = kernel_tss.edx,
+        .esi = kernel_tss.esi, .edi = kernel_tss.edi, .ebp = kernel_tss.ebp,
+        .ds = kernel_tss.ds, .es = kernel_tss.es, .fs = kernel_tss.fs, .gs = kernel_tss.gs,
+        .int_no = 8, .eip = kernel_tss.eip, .cs = kernel_tss.cs, .eflags = kernel_tss.eflags,
+        .user_esp = kernel_tss.esp, .user_ss = kernel_tss.ss,
+    };
+    kdbg_set_fault_regs(&r);
+    if (t)
+        panic("Kernel stack overflow in thread %s (EIP %08X, ESP %08X).",
+              t->name, kernel_tss.eip, kernel_tss.esp);
+    panic("Double fault at %04X:%08X (ESP %08X, CR2 %08X).",
+          kernel_tss.cs & 0xFFFF, kernel_tss.eip, kernel_tss.esp, cr2);
+}
+
 void panic(const char *fmt, ...)
 {
     char buf[160];
@@ -73,6 +103,8 @@ void panic(const char *fmt, ...)
     va_start(ap, fmt);
     kvsnprintf(buf, sizeof buf, fmt, ap);
     va_end(ap);
+    klog("*** panic: %s\n", buf);
+    kdbg_panic(buf);
     fatal_begin();
     kprintf("     The Virtual Machine Manager has stopped:\n\n     %s\n", buf);
     fatal_end();

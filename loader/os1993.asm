@@ -3,7 +3,9 @@
 ;
 ; Plays the role WIN.COM + WIN386.EXE's startup code played in 1993:
 ;
-;   1. verify a 486+ CPU running in real mode (not V86 under EMM386/QEMM)
+;   1. verify a 486+ CPU, in real mode -- or in V86 mode under a memory
+;      manager (EMM386, JEMM386, QEMM) that offers VCPI, which then hands
+;      the machine over for as long as OS1993 runs
 ;   2. allocate extended memory from HIMEM.SYS through the XMS interface
 ;   3. load VMM.BIN (from the same directory as this program) into it
 ;   4. switch to protected mode, build page tables, enable paging
@@ -12,8 +14,9 @@
 ; The kernel can later jump back to pm32_return, which unwinds everything
 ; and returns to the DOS prompt with the kernel's exit code as ERRORLEVEL.
 ;
-; Command line:  OS1993 [/T]
+; Command line:  OS1993 [/T] [/D]
 ;   /T   test mode: kernel exits on its own after ~2 seconds
+;   /D   the kernel debugger on COM1 (Ctrl+C on the line breaks in)
 ;
 ; Assemble: nasm -f bin -o OS1993.COM os1993.asm
 ; =============================================================================
@@ -25,6 +28,8 @@
 %define KHDR_MAGIC      0x334D4D56      ; "VMM3"  (see kernel/entry.asm)
 %define BI_MAGIC        0x3339534F      ; "OS93"  (see kernel/include/bootinfo.h)
 %define BI_FLAG_TEST    1
+%define BI_FLAG_DEBUG   2
+%define BI_FLAG_VCPI    4
 %define CHUNK           0x4000          ; file read / XMS move chunk size
 %define MIN_ARENA_KB    1024
 %define MIN_FREE        0x10000         ; free arena space required after tables
@@ -36,6 +41,8 @@ SEL_FCODE       equ     0x18            ; flat 32-bit code (kernel entry)
 SEL_FDATA       equ     0x20            ; flat 32-bit data
 SEL_CODE16      equ     0x28            ; 16-bit code, base = loader (return path)
 SEL_DATA16      equ     0x30            ; 16-bit data, base = loader (return path)
+SEL_TSS         equ     0x38            ; a TSS, for VCPI's switch to protected mode
+SEL_VCPI        equ     0x40            ; the VCPI server's three descriptors (DE01h)
 
 ; Kernel image header (first bytes of VMM.BIN)
 KH_MAGIC        equ     0
@@ -77,6 +84,8 @@ start:
         smsw    ax                      ; MSW.PE set while in real mode => V86
         test    al, 1
         jz      .real_mode
+        call    check_vcpi              ; a memory manager: does it speak VCPI?
+        jnc     .real_mode
         mov     dx, err_v86
         jmp     die
 .real_mode:
@@ -169,6 +178,10 @@ start:
 
         call    load_kernel
         call    layout_memory
+        cmp     byte [vcpi_mode], 0
+        je      .no_vcpi
+        call    vcpi_tables             ; page tables through XMS moves
+.no_vcpi:
 
         ; ---- prepare protected mode ----------------------------------------
         xor     eax, eax
@@ -198,6 +211,29 @@ start:
         cli
         mov     [rm_ss], ss
         mov     [rm_sp], sp
+        cmp     byte [vcpi_mode], 0
+        je      .raw
+        mov     eax, [loader_base]      ; VCPI: the server switches, paging on
+        mov     ebx, eax
+        add     ebx, loader_tss
+        mov     [gdt + SEL_TSS + 2], bx
+        shr     ebx, 16
+        mov     [gdt + SEL_TSS + 4], bl
+        mov     [gdt + SEL_TSS + 7], bh
+        mov     ebx, eax
+        add     ebx, gdtr
+        mov     [vs_gdtr], ebx
+        mov     ebx, eax
+        add     ebx, vcpi_idtr
+        mov     [vs_idtr], ebx
+        mov     ebx, [pd_phys]
+        mov     [vs_cr3], ebx
+        lea     esi, [eax + vcpi_switch]
+        mov     ax, 0xDE0C
+        int     0x67                    ; -> pm32_vcpi_entry
+        mov     dx, err_vcpi
+        jmp     die
+.raw:
         lgdt    [gdtr]
         mov     eax, cr0
         or      al, 1
@@ -263,8 +299,16 @@ pm32_entry:
         mov     eax, cr0
         or      eax, 0x80000000
         mov     cr0, eax
-        jmp     short .paging_on        ; flush the 386 prefetch queue
-.paging_on:
+        jmp     short kernel_jump       ; flush the 386 prefetch queue
+
+; VCPI's switch lands here: protected mode, paging on with our tables.
+pm32_vcpi_entry:
+        mov     ax, SEL_DATA32
+        mov     ds, ax
+        mov     ss, ax
+        movzx   esp, word [rm_sp]
+
+kernel_jump:
         mov     eax, [k_entry]
         mov     edx, [loader_base]
         lea     ebx, [edx + bootinfo]
@@ -287,6 +331,8 @@ pm32_return:
         mov     cx, SEL_DATA32
         mov     ds, cx
         mov     [exit_code], al
+        cmp     byte [vcpi_mode], 0
+        jne     vcpi_return
         mov     ecx, cr0
         and     ecx, 0x7FFFFFFF         ; paging off
         mov     cr0, ecx
@@ -321,6 +367,7 @@ rm_return:
         xor     esp, esp
         mov     sp, [rm_sp]
         lidt    [rm_idtr]
+rm_return_common:
         call    restore_pic
         sti
 
@@ -340,8 +387,199 @@ rm_return:
         int     0x21
 
 ; -----------------------------------------------------------------------------
+; Back to V86 mode under the memory manager: VCPI DE0Ch from protected mode.
+; Paging stays on with the kernel's tables, whose 0-4 MB are the System VM's
+; (the server's own map, which DE01h gave us). The stack holds the V86 state
+; the server IRETs to, under the far call's return address.
+; -----------------------------------------------------------------------------
+        bits    32
+vcpi_return:
+        mov     edx, [loader_base]
+        mov     cx, SEL_FDATA           ; zero-based: the server finds the frame by linear address
+        mov     ss, cx
+        lea     esp, [edx + vcpi_stack_top]
+        xor     eax, eax
+        mov     ax, [rm_jmp_seg]        ; the loader's segment
+        push    eax                     ; GS
+        push    eax                     ; FS
+        push    eax                     ; DS
+        push    eax                     ; ES
+        movzx   ebx, word [rm_ss]
+        push    ebx                     ; SS
+        movzx   ebx, word [rm_sp]
+        push    ebx                     ; ESP
+        push    dword 0                 ; EFLAGS (reserved)
+        push    eax                     ; CS
+        push    dword rm_vcpi_return    ; EIP
+        mov     ds, cx                  ; zero-based: the server reads its own data through DS
+        mov     es, cx
+        mov     ax, 0xDE0C
+        call    far [edx + vcpi_pm_entry]   ; never returns here
+
+        bits    16
+rm_vcpi_return:                         ; V86 mode again; the server set SS:SP
+        mov     ax, cs
+        mov     ds, ax
+        mov     es, ax
+        jmp     rm_return_common        ; (no LIDT: the server's IDT stays)
+
+; -----------------------------------------------------------------------------
 ; Subroutines (real mode)
 ; -----------------------------------------------------------------------------
+
+; In V86 mode: CF clear if a VCPI server is there (INT 67h AX=DE00h).
+check_vcpi:
+        push    es
+        xor     ax, ax
+        mov     es, ax
+        mov     ax, [es:0x67 * 4]
+        or      ax, [es:0x67 * 4 + 2]
+        pop     es
+        jz      .no                     ; no INT 67h handler at all
+        mov     ax, 0xDE00
+        int     0x67
+        test    ah, ah
+        jnz     .no
+        mov     byte [vcpi_mode], 1
+        or      dword [bi_flags], BI_FLAG_VCPI
+        mov     dx, msg_vcpi
+        call    print
+        clc
+        ret
+.no:    stc
+        ret
+
+; VCPI: the server's map of the first megabytes (DE01h), then the page
+; directory and tables built in `buffer` and moved into the arena with XMS:
+; in V86 mode there's no other way into extended memory.
+vcpi_tables:
+        push    es
+        push    ds
+        pop     es
+        mov     di, vcpi_pt             ; ES:DI: page table 0, as far as the server fills it
+        mov     si, gdt + SEL_VCPI      ; DS:SI: its three descriptors
+        mov     ax, 0xDE01
+        int     0x67
+        pop     es
+        test    ah, ah
+        jz      .got
+        mov     dx, err_vcpi
+        jmp     die
+.got:   mov     [vcpi_pm_entry], ebx
+        sub     di, vcpi_pt
+        shr     di, 2
+        mov     [vcpi_n], di            ; entries it filled
+
+        ; PT0: identity, the server's entries over it (ring 0 only above 1 MB + 64 KB)
+        mov     di, buffer
+        mov     eax, 0x003
+        mov     cx, 1024
+.id:    mov     [di], eax
+        add     di, 4
+        add     eax, 0x1000
+        loop    .id
+        xor     bx, bx
+.cp:    cmp     bx, [vcpi_n]
+        jae     .cpd
+        cmp     bx, 1024
+        jae     .cpd
+        mov     si, bx
+        shl     si, 2
+        mov     eax, [vcpi_pt + si]
+        cmp     bx, 0x110
+        jb      .low
+        and     al, 0xFB                ; no PTE_U: V86 code can't, DPMI clients mustn't
+.low:   mov     [buffer + si], eax
+        inc     bx
+        jmp     .cp
+.cpd:   mov     eax, [pt0_phys]
+        call    vcpi_put_page
+
+        ; the page directory
+        call    clear_page
+        mov     eax, [pt0_phys]
+        or      eax, 0x003
+        mov     [buffer], eax
+        mov     edx, [arena_virt]
+        shr     edx, 22
+        shl     dx, 2
+        mov     di, buffer
+        add     di, dx
+        mov     eax, [pta_phys]
+        or      eax, 0x003
+        mov     ecx, [n_pt]
+.pde:   mov     [di], eax
+        add     di, 4
+        add     eax, 0x1000
+        loop    .pde
+        mov     eax, [pd_phys]
+        or      eax, 0x003
+        mov     [buffer + 1023 * 4], eax
+        mov     eax, [pd_phys]
+        call    vcpi_put_page
+
+        ; the arena's page tables
+        xor     edx, edx                ; table number
+        mov     ebx, [arena_phys]
+        or      ebx, 0x003
+        mov     esi, [arena_pages]
+.pt:    call    clear_page
+        mov     di, buffer
+        mov     cx, 1024
+.pte:   test    esi, esi
+        jz      .ptd
+        mov     [di], ebx
+        add     ebx, 0x1000
+        dec     esi
+        add     di, 4
+        loop    .pte
+.ptd:   mov     eax, edx
+        shl     eax, 12
+        add     eax, [pta_phys]
+        push    ebx
+        push    esi
+        push    edx
+        call    vcpi_put_page
+        pop     edx
+        pop     esi
+        pop     ebx
+        inc     edx
+        cmp     edx, [n_pt]
+        jb      .pt
+        ret
+
+clear_page:
+        push    di
+        push    cx
+        push    eax
+        mov     di, buffer
+        xor     eax, eax
+        mov     cx, 1024
+        rep     stosd
+        pop     eax
+        pop     cx
+        pop     di
+        ret
+
+; XMS-move the 4 KB in `buffer` to physical address EAX in the arena.
+vcpi_put_page:
+        sub     eax, [arena_phys]
+        add     eax, [arena_skew]
+        mov     [mv_dst_off], eax
+        mov     dword [mv_len], 0x1000
+        mov     word [mv_src_handle], 0
+        mov     word [mv_src_off], buffer
+        mov     [mv_src_off + 2], ds
+        mov     dx, [xms_handle]
+        mov     [mv_dst_handle], dx
+        mov     si, xms_move
+        mov     ah, 0x0B
+        call    far [xms_entry]
+        cmp     ax, 1
+        je      .ok
+        mov     dx, err_xms
+        jmp     die
+.ok:    ret
 
 ; CF clear if 486 or better: only a 486 can set EFLAGS.AC (bit 18).
 check_486:
@@ -407,7 +645,11 @@ parse_cmdline:
         lodsb
         dec     cx
         and     al, 0xDF                ; upper case
-        cmp     al, 'T'
+        cmp     al, 'D'
+        jne     .not_d
+        or      dword [bi_flags], BI_FLAG_DEBUG
+        jmp     .next
+.not_d: cmp     al, 'T'
         jne     .next
         or      dword [bi_flags], BI_FLAG_TEST
         jmp     .next
@@ -713,13 +955,16 @@ msg_xms1        db  'XMS: allocated $'
 msg_xms2        db  ' KB, arena at physical $'
 msg_load        db  'Loading $'
 msg_go          db  'Starting the Virtual Machine Manager...', 13, 10, '$'
+msg_vcpi        db  'A memory manager is running: it hands over through VCPI.', 13, 10, '$'
 msg_back        db  'OS1993 has ended. Exit code $'
 msg_crlf        db  13, 10, '$'
 
 err_cpu         db  'OS1993 requires an 80486 or better processor.', 13, 10, '$'
 err_cpu486      db  'OS1993 requires an 80486 or better processor (this is a 386).', 13, 10, '$'
-err_v86         db  'The processor is in virtual 8086 mode. A memory manager such as', 13, 10
-                db  'EMM386 or QEMM is loaded; remove it from CONFIG.SYS and try again.', 13, 10, '$'
+err_v86         db  'The processor is in virtual 8086 mode, and the memory manager that', 13, 10
+                db  'put it there offers no VCPI. Remove it from CONFIG.SYS (or let it', 13, 10
+                db  'offer VCPI) and try again.', 13, 10, '$'
+err_vcpi        db  'The VCPI server refused the switch to protected mode.', 13, 10, '$'
 err_noxms       db  'No XMS driver found. Add DEVICE=HIMEM.SYS to CONFIG.SYS.', 13, 10, '$'
 err_nomem       db  'Not enough extended memory (at least 1024 KB free is required).', 13, 10, '$'
 err_xms         db  'XMS driver error.', 13, 10, '$'
@@ -776,7 +1021,27 @@ gdt:    dq      0
         db      0, 0x9A, 0x00, 0
         dw      0xFFFF, 0               ; 0x30 data16, 64K, loader based
         db      0, 0x92, 0x00, 0
+        dw      103, 0                  ; 0x38 TSS (VCPI wants one in TR)
+        db      0, 0x89, 0x00, 0
+        dq      0, 0, 0                 ; 0x40-0x50 the VCPI server's (DE01h)
 gdt_end:
+
+; ---- VCPI: the switch to protected mode (DE0Ch), its tables ----
+        align   4
+vcpi_switch:
+vs_cr3          dd  0
+vs_gdtr         dd  0                   ; linear address of the GDTR image
+vs_idtr         dd  0                   ; ... and of an IDTR (empty: interrupts stay off)
+                dw  0                   ; LDTR
+                dw  SEL_TSS             ; TR
+                dd  pm32_vcpi_entry     ; EIP
+                dw  SEL_CODE32          ; CS
+vcpi_idtr       dw  0
+                dd  0
+vcpi_pm_entry   dd  0                   ; the server's protected-mode entry (DE01h) ...
+                dw  SEL_VCPI            ; ... in its code segment
+vcpi_mode       db  0
+vcpi_n          dw  0
 
 ; Returning from a V86 call: ARPL is invalid in real/V86 mode, so it raises
 ; #UD and the kernel's V86 monitor regains control (the Win386 technique).
@@ -828,4 +1093,9 @@ v86_stack       resb 2048               ; stack for kernel-initiated V86 calls
 v86_stack_top:
 loader_stack    resb 1024
 loader_stack_top:
+        alignb  16
+vcpi_pt         resb 4096               ; VCPI DE01h: the server's page table 0
+loader_tss      resb 104
+vcpi_stack      resb 256
+vcpi_stack_top:
 bss_end:

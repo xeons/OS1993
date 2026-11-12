@@ -11,6 +11,8 @@
 #define UCODE_SEL 0x23      /* ring 3 code (index 4, RPL 3) */
 #define UDATA_SEL 0x2B      /* ring 3 data (index 5, RPL 3) */
 #define UTLS_SEL  0x33      /* ring 3 data at the running thread's TIB (index 6): FS */
+#define DFTSS_SEL 0x38      /* the double-fault task */
+#define LDT_SEL   0x40      /* the running DPMI client's LDT */
 
 struct dtr {                 /* operand of LGDT / LIDT */
     uint16_t limit;
@@ -39,5 +41,6 @@ void gdt_load(const struct dtr *gdtr);   /* entry.asm */
 void idt_load(const struct dtr *idtr);   /* entry.asm */
 void tss_trap_port(uint16_t port, bool trap);
 void gdt_set_tls(uint32_t base);         /* the running user thread's TIB */
+void gdt_set_ldt(uint32_t base, uint32_t limit);   /* limit 0: none */
 
 #endif

@@ -35,6 +35,8 @@ void fs_lock(void)
     }
 }
 
+bool fs_locked_by_me(void) { return owner && owner == current; }
+
 void fs_unlock(void)
 {
     uint32_t f = irq_save();

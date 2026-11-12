@@ -12,6 +12,7 @@
 #include "sched.h"
 #include "vm.h"
 #include "user.h"
+#include "kdbg.h"
 
 void net_tick(void);                    /* net.c */
 void ata_tick(void);                    /* ata.c */
@@ -43,10 +44,23 @@ void speaker_beep(unsigned hz, unsigned ms)
     if (!beep_off) beep_off = 1;
 }
 
+static uint32_t sub;                    /* PIT clocks toward the next 18.2 Hz tick */
+
+/* The real timer may run faster than 18.2 Hz for a VM that asked for it
+ * (vpit.c); the kernel's tick is counted out of it, every 65536 clocks. */
 static void timer_irq(struct regs *r)
 {
-    (void)r;
+    uint32_t clocks = vpit_real_div();
+    vpit_period();
+    sub += clocks;
+    bool tick = sub >= 65536;
+    if (!tick) {
+        vm_timer_irq(clocks, false);
+        return;
+    }
+    sub -= 65536;
     ticks++;
+    kdbg_poll(r);
     if (beep_off && (int32_t)(ticks - beep_off) >= 0) {
         outb(0x61, inb(0x61) & ~3);
         beep_off = 0;
@@ -56,7 +70,7 @@ static void timer_irq(struct regs *r)
     net_tick();
     ata_tick();
     cache_tick();
-    if (vm_timer_tick())
+    if (vm_timer_irq(clocks, true))
         return;                 /* shared with every VM (vm.c) */
     uint32_t t = LOWMEM32(BDA_TICKS) + 1;
     if (t >= TICKS_PER_DAY) {

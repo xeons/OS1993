@@ -189,6 +189,23 @@ void proc_switch(struct process *p)
     tlb_flush();
 }
 
+/* Take the installed process's private PDEs out of the directory (a DPMI
+ * client is about to run, with flat ring-3 segments). The shared region
+ * stays: the kernel draws through it from interrupts (focus switches). */
+void proc_uninstall(void)
+{
+    if (!installed)
+        return;
+    volatile uint32_t *pd = (volatile uint32_t *)PD_WINDOW;
+    for (int i = 1; i < USER_PDES; i++) {
+        installed->pde[i] = pd[i];
+        if (i < SHARED_FIRST || i > SHARED_LAST)
+            pd[i] = 0;
+    }
+    installed = NULL;
+    tlb_flush();
+}
+
 static bool map_zeroed(uint32_t va, uint32_t len)
 {
     for (uint32_t p = va; p < va + len; p += PAGE_SIZE) {
@@ -204,11 +221,34 @@ static bool map_zeroed(uint32_t va, uint32_t len)
 
 static void unmap_free(uint32_t va, uint32_t len)
 {
-    for (uint32_t p = va; p < va + len; p += PAGE_SIZE) {
-        uint32_t frame = vmm_unmap(p);
-        if (frame)
-            pmm_free(frame);
-    }
+    for (uint32_t p = va; p < va + len; p += PAGE_SIZE)
+        pager_release(p);                       /* a frame, a swap slot, or a demand-zero entry */
+}
+
+/* For the pager: process i's page directory entry n, wherever it is. */
+uint32_t user_proc_pde(int i, uint32_t n)
+{
+    struct process *p = &procs[i];
+    if (p->state == P_FREE || n >= USER_PDES)
+        return 0;
+    if (p == installed)
+        return ((volatile uint32_t *)PD_WINDOW)[n];
+    return p->pde ? p->pde[n] : 0;
+}
+
+bool user_proc_installed(int i) { return &procs[i] == installed; }
+
+/* May the pager take process i's pages now? Not while one of its threads
+ * is in a system call: the VMM may be using a buffer it checked. */
+bool user_proc_swappable(int i)
+{
+    struct process *p = &procs[i];
+    if (p->state != P_RUNNING || !p->pde)
+        return false;
+    for (int k = 0; k < THREADS_PER_PROC; k++)
+        if (p->th[k].t && p->th[k].t->in_syscall)
+            return false;
+    return true;
 }
 
 /* Free everything p mapped (p must be installed), page tables included. */
@@ -296,7 +336,7 @@ bool user_range_ok(uint32_t p, uint32_t len)
     if (p < USER_BASE || p >= USER_LIMIT || len > USER_LIMIT - p)
         return false;
     for (uint32_t a = PAGE_ALIGN_DOWN(p); a < p + len; a += PAGE_SIZE)
-        if (!vmm_translate(a, NULL))
+        if (!pager_resident(a))                 /* faulted in (demand zero, swapped) */
             return false;
     return true;
 }
@@ -714,31 +754,12 @@ static uint32_t vm_reserve(struct process *p, uint32_t addr, uint32_t size)
     return base;
 }
 
-static uint32_t pte_for(uint32_t prot) { return PTE_U | ((prot & VM_PROT_WRITE) ? PTE_W : 0); }
-
-/* Commit [addr, addr + size), or give committed pages the new protection. */
+/* Commit [addr, addr + size) as demand-zero pages, or give committed pages
+ * the new protection. */
 static int vm_commit(uint32_t addr, uint32_t size, uint32_t prot)
 {
-    for (uint32_t va = addr; va - addr < size; va += PAGE_SIZE) {
-        uint32_t pa;
-        if (vmm_translate(va, &pa)) {
-            vmm_unmap(va);
-            vmm_map(va, pa & PAGE_MASK, pte_for(prot));
-            continue;
-        }
-        uint32_t frame = pmm_alloc();
-        if (!frame || vmm_map(va, frame, PTE_W | PTE_U) != 0) {
-            if (frame)
-                pmm_free(frame);
-            return -ERROR_NOT_ENOUGH_MEMORY;
-        }
-        memset((void *)(uintptr_t)va, 0, PAGE_SIZE);
-        if (!(prot & VM_PROT_WRITE)) {
-            vmm_unmap(va);
-            vmm_map(va, frame, pte_for(prot));
-        }
-    }
-    return 0;
+    pager_make_room();
+    return pager_commit(addr, size, prot & VM_PROT_WRITE) ? 0 : -ERROR_NOT_ENOUGH_MEMORY;
 }
 
 static void vm_release(struct process *p, uint32_t base)
@@ -755,7 +776,7 @@ static uint32_t vm_committed_pages(struct process *p)
     uint32_t n = 0;
     for (int i = 0; i < VREGION_MAX; i++)
         for (uint32_t va = p->vm[i].base; p->vm[i].used && va - p->vm[i].base < p->vm[i].size; va += PAGE_SIZE)
-            n += vmm_translate(va, NULL);
+            n += pager_committed(va, NULL);
     return n;
 }
 
@@ -799,9 +820,11 @@ static int vm_op(struct process *p, uint32_t op, struct vmem_args *a)
             return 0;
         }
         for (uint32_t va = addr; va - addr < size; va += PAGE_SIZE)
-            if (!vmm_translate(va, NULL))
+            if (!pager_committed(va, NULL))
                 return -ERROR_INVALID_ADDRESS;      /* only committed pages */
-        a->old_prot = VM_PROT_READ | (vmm_writable(addr) ? VM_PROT_WRITE : 0);
+        bool w = false;
+        pager_committed(addr, &w);
+        a->old_prot = VM_PROT_READ | (w ? VM_PROT_WRITE : 0);
         return vm_commit(addr, size, a->prot);
     case VM_RELEASE:
         r = vm_region(p, addr);
@@ -828,11 +851,14 @@ static int vm_op(struct process *p, uint32_t op, struct vmem_args *a)
             a->old_prot = 0;
             return 0;
         }
-        bool committed = vmm_translate(page, NULL), writable = committed && vmm_writable(page);
+        bool writable = false, committed = pager_committed(page, &writable);
         uint32_t va = page;
-        while (va - r->base < r->size && vmm_translate(va, NULL) == committed &&
-               (!committed || vmm_writable(va) == writable))
+        for (;;) {
+            bool w = false, c = va - r->base < r->size && pager_committed(va, &w);
+            if (va - r->base >= r->size || c != committed || (committed && w != writable))
+                break;
             va += PAGE_SIZE;
+        }
         a->base = page;
         a->region_size = va - page;
         a->state = committed ? VM_STATE_COMMIT : VM_STATE_RESERVE;
@@ -893,6 +919,8 @@ static int thread_new(struct process *p, const struct thread_args *a, bool first
     }
     ut->tid = next_tid++;
     uint32_t tib = base + size - PAGE_SIZE;
+    pager_pin(tib);                                 /* the VMM touches it on the way out */
+    pager_pin(tib - PAGE_SIZE);                     /* ... and the start of the stack */
     struct user_tib *tb = (struct user_tib *)(uintptr_t)tib;
     tb->self = tib;
     tb->tid = (uint32_t)ut->tid;
@@ -1018,7 +1046,7 @@ static int spawn(const char *name, const char *args)
     bool first = !u.shared_on;
     struct module *prog = load_module(p, name, MOD_PROGRAM);
     bool ok = prog && resolve(p, prog, 0) &&
-              map_zeroed(USER_STACK_TOP - USER_STACK_SIZE, USER_STACK_SIZE) &&
+              pager_commit(USER_STACK_TOP - USER_STACK_SIZE, USER_STACK_SIZE, true) &&
               map_zeroed(USER_INFO, 2 * PAGE_SIZE) &&
               (!first || !(u.flags & UINFO_GRAPHICS) || shared_create());
     if (ok) {
@@ -1878,7 +1906,8 @@ void syscall_dispatch(struct regs *r)
             break;
         }
         uint32_t from = PAGE_ALIGN_UP(old), to = PAGE_ALIGN_UP(want);
-        if (to > from && !map_zeroed(from, to - from)) {
+        pager_make_room();
+        if (to > from && !pager_commit(from, to - from, true)) {    /* demand zero */
             unmap_free(from, to - from);
             r->eax = 0;
             break;
@@ -1979,7 +2008,14 @@ void syscall_dispatch(struct regs *r)
         break;
     }
     case SYS_NEW_SESSION: {
-        struct vm *vm = dos_new_session();
+        struct vm_settings set;
+        bool given = r->ebx != 0;
+        if (given) {
+            if (!user_range_ok(r->ebx, sizeof set)) { r->eax = (uint32_t)-1; break; }
+            memcpy(&set, (const void *)(uintptr_t)r->ebx, sizeof set);
+            if (!vmset_valid(&set)) { r->eax = (uint32_t)-1; break; }
+        }
+        struct vm *vm = dos_new_session(given ? &set : NULL);
         r->eax = vm ? (uint32_t)vm->id : (uint32_t)-1;
         break;
     }
@@ -2062,4 +2098,28 @@ void user_selftest(void)
         panic("Ring-3 code-write test: result %d (expected #PF).", rc);
     kprintf("  Ring 3: system calls work; CLI, kernel and code writes are refused.\n");
     klog("VMM: ring-3 self-test passed\n");
+}
+
+/* ---- for the kernel debugger (kdbg.c) ----------------------------------- */
+
+void user_dbg_list(void (*out)(const char *, ...))
+{
+    for (int i = 0; i < PROC_MAX; i++) {
+        struct process *p = &procs[i];
+        if (p->state == P_FREE) continue;
+        int nth = 0;
+        for (int t = 0; t < THREADS_PER_PROC; t++)
+            if (p->th[t].t) nth++;
+        out("pid %d %-12s %s, %d thread(s), heap to %08X, %u pages committed%s\n", p->pid, p->name,
+            p->state == P_RUNNING ? "running" : "ended", nth, p->heap_end, vm_committed_pages(p),
+            p == installed ? ", installed" : "");
+    }
+}
+
+void user_dbg_memory(void (*out)(const char *, ...))
+{
+    int n = 0;
+    for (int i = 0; i < PROC_MAX; i++)
+        if (procs[i].state != P_FREE) n++;
+    out("%d process(es)\n", n);
 }

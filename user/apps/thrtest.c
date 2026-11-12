@@ -533,6 +533,26 @@ static int deliberate(const char *what, const char *arg)
         uint32_t old;
         VirtualProtect(p, 4096, PAGE_READONLY, &old);
         p[0] = 1;
+    } else if (!strcmp(what, "swap")) {             /* more memory than there is: the swap file */
+        uint32_t mb = arg ? (uint32_t)atoi(arg) : 20, pages = mb * 256, bad = 0;
+        uint32_t *p = VirtualAlloc(NULL, mb << 20, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        if (!p) {
+            printf("THR: swap: no %u MB to commit\n", (unsigned)mb);
+            return 2;
+        }
+        for (uint32_t i = 0; i < pages; i++) {
+            p[i * 1024] = i * 2654435761u;
+            p[i * 1024 + 1023] = ~i;
+        }
+        for (uint32_t pass = 0; pass < 2; pass++)   /* forwards, then backwards */
+            for (uint32_t k = 0; k < pages; k++) {
+                uint32_t i = pass ? pages - 1 - k : k;
+                if (p[i * 1024] != i * 2654435761u || p[i * 1024 + 1023] != ~i || p[i * 1024 + 512] != 0)
+                    bad++;
+            }
+        printf("THR: swap: %u MB written and read back twice, %u bad pages\n", (unsigned)mb, (unsigned)bad);
+        VirtualFree(p, 0, MEM_RELEASE);
+        return bad ? 3 : 0;
     } else if (!strcmp(what, "exitthread")) {
         spawn(outlive, NULL);
         ExitThread(0);

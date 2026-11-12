@@ -7,6 +7,8 @@
 #include "v86.h"
 #include "vm.h"
 #include "user.h"
+#include "kdbg.h"
+#include "mm.h"
 
 struct idt_entry {
     uint16_t off_lo;
@@ -38,6 +40,9 @@ void idt_init(void)
     for (int i = 0; i < 48; i++)
         idt_set(i, isr_stub_table[i], IDT_INT_GATE32);
     idt_set(SYSCALL_VECTOR, isr_stub_table[48], IDT_USER_GATE32);
+    idt[8].off_lo = idt[8].off_hi = 0;          /* #DF: a task gate to the double-fault TSS */
+    idt[8].sel = DFTSS_SEL;
+    idt[8].flags = 0x85;
 
     static struct dtr idtr;
     idtr.limit = sizeof idt - 1;
@@ -65,26 +70,47 @@ void interrupt_dispatch(struct regs *r)
 {
     bool from_v86 = r->eflags & EFLAGS_VM;
     bool from_user = !from_v86 && (r->cs & 3) == 3;
-    if (from_v86)
+    /* ring 3 in a VM's thread: its DPMI client's protected-mode code */
+    bool from_dpmi = from_user && current && current->vm && dpmi_client(current->vm) && current->vm->active;
+    if (from_v86 || from_dpmi)
         vm_check("on entry from V86");
+
+    if (from_dpmi && (r->int_no < IRQ_BASE || r->int_no == SYSCALL_VECTOR)) {
+        if ((r->int_no == 1 || r->int_no == 3) && kdbg_trap(r))
+            return;
+        dpmi_trap(r);                   /* the DPMI host; the frame may now be V86 */
+        if (r->eflags & EFLAGS_VM) v86_deliver(r);
+        else                       dpmi_deliver(r);
+        dpmi_espfix(r);
+        vm_check("returning to a DPMI client");
+        return;
+    }
 
     if (r->int_no == SYSCALL_VECTOR) {
         if (!from_user)
             panic("System call from ring 0.");
+        current->in_syscall = true;
         syscall_dispatch(r);
+        current->in_syscall = false;
         sched_preempt();
         user_return(r);
         return;
     }
 
     if (r->int_no < IRQ_BASE) {
+        if ((r->int_no == 1 || r->int_no == 3) && kdbg_trap(r))
+            return;                     /* the kernel debugger's breakpoint or step */
         if (from_v86) {
             v86_exception(r);           /* the V86 monitor */
+            dpmi_espfix(r);             /* (a mode switch to a DPMI client) */
             vm_check("returning to V86 after a trap");
         } else if (from_user) {
-            user_fault(r);              /* kills the ring-3 process */
+            if (r->int_no != 14 || !pager_fault(r))     /* demand zero, the swap file */
+                user_fault(r);          /* kills the ring-3 process */
             user_return(r);
         } else {
+            if (r->int_no == 14 && pager_fault(r))      /* the VMM touched a program's page */
+                return;
             panic_exception(r);
         }
         return;
@@ -102,10 +128,14 @@ void interrupt_dispatch(struct regs *r)
         pic_eoi(irq);
         if (from_v86)
             v86_deliver(r);
+        else if (from_dpmi)
+            dpmi_deliver(r);
         sched_preempt();            /* after the EOI: may switch threads */
-        if (from_user)
+        if (from_user && !from_dpmi)
             user_return(r);
-        if (from_v86)
+        if (from_v86 || from_dpmi) {
+            dpmi_espfix(r);
             vm_check("returning to V86 after an IRQ");
+        }
     }
 }

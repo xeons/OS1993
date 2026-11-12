@@ -81,9 +81,15 @@ bool vmm_translate(uint32_t va, uint32_t *pa)
     return true;
 }
 
+/* The window onto the System VM's first megabyte + HMA follows its page
+ * table 0: identity when OS1993 started from real mode, the memory
+ * manager's map (UMBs, A20) when it started through VCPI. */
 void klow_init(void)
 {
-    for (uint32_t pa = 0; pa < KLOW_SIZE; pa += PAGE_SIZE)
-        if (vmm_map(KLOW_BASE + pa, pa, PTE_W) != 0)
+    for (uint32_t pa = 0; pa < KLOW_SIZE; pa += PAGE_SIZE) {
+        uint32_t pte = PTE(pa);
+        uint32_t frame = (pte & PTE_P) ? (pte & PAGE_MASK) : pa;
+        if (vmm_map(KLOW_BASE + pa, frame, PTE_W) != 0)
             panic("klow_init: cannot map %08X.", pa);
+    }
 }

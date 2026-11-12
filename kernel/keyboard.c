@@ -162,8 +162,11 @@ bool vkbd_port(uint16_t port)
 uint8_t vkbd_in(struct vm *vm, uint16_t port)
 {
     struct vkbd *k = &vm->kbd;
-    if (port == KBD_STATUS)
+    if (port == KBD_STATUS) {
+        if (!k->full && k->head == k->tail)
+            vm_idle_poll(vm);                   /* polling the controller for a key */
         return (uint8_t)(0x14 | (k->full ? 0x01 : 0x00));  /* sys flag, unlocked */
+    }
     uint8_t v = k->latch;
     if (k->full) {
         k->full = false;
